@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""deploylock — exclusive lock for commands that deploy the working tree.
+
+Ansible reads the checkout as it stands, so the tree is not just source, it is the
+artefact. Two overlapping runs, or a run started while another agent is mid-edit,
+ship a half-written tree to real hosts. The agent board makes that visible; only an
+atomic acquire prevents it (both parties can check a board, find it clear, and then
+both write — the check and the write have to be one indivisible step).
+
+Uses fcntl.flock, so the lock is held by the kernel against an open fd: it is
+released automatically when this process exits, crashes, or is killed. There is no
+such thing as a stale lock here.
+
+    deploylock ansible-playbook refresh.yml
+    deploylock --wait 600 ansible-playbook site.yml     # queue instead of failing
+    deploylock --status
+    deploylock --name prod ansible-playbook ...    # independent lock
+
+Not the right tool for a vault edit. `flock` dies with the process, and a
+decrypt -> edit -> re-encrypt -> commit cycle spans several separate commands with
+no process outliving them, so there is nothing for a kernel lock to live on. That
+one uses a lease instead: `agentboard vault take <file>` ... `agentboard vault free`.
+"""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+BOARD = os.environ.get("AGENT_BOARD_DIR", os.path.expanduser("~/agent-board"))
+LOCKS = os.path.join(BOARD, "locks")
+AGENTBOARD = os.path.join(BOARD, "bin", "agentboard")
+
+
+def owner_path(name):
+    return os.path.join(LOCKS, name + ".owner")
+
+
+def read_owner(name):
+    try:
+        with open(owner_path(name)) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def describe(info):
+    if not info:
+        return "held by an unknown process (no owner metadata)"
+    since = info.get("since", "?")
+    held = ""
+    try:
+        secs = int(time.time() - info.get("since_epoch", 0))
+        held = " (%dm%02ds ago)" % (secs // 60, secs % 60)
+    except Exception:
+        pass
+    return "held by pid %s since %s%s\n    agent:   %s\n    dir:     %s\n    command: %s" % (
+        info.get("pid", "?"), since, held,
+        info.get("agent", "?"), info.get("cwd", "?"), info.get("cmd", "?"),
+    )
+
+
+def board(*args):
+    """Best-effort note on the agent board; never fatal."""
+    try:
+        subprocess.run([AGENTBOARD] + list(args), timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def status(name):
+    path = os.path.join(LOCKS, name + ".lock")
+    if not os.path.exists(path):
+        print("lock %r: free (never taken)" % name)
+        return 0
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        print("lock %r: free" % name)
+        return 0
+    except OSError:
+        print("lock %r: %s" % (name, describe(read_owner(name))))
+        return 1
+    finally:
+        os.close(fd)
+
+
+def main(argv):
+    name, wait, i = "deploy", 0.0, 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--name":
+            name = argv[i + 1]; i += 2
+        elif a == "--wait":
+            wait = float(argv[i + 1]); i += 2
+        elif a == "--status":
+            return status(argv[i + 1] if i + 1 < len(argv) else name)
+        elif a in ("-h", "--help"):
+            print(__doc__); return 0
+        elif a == "--":
+            i += 1; break
+        else:
+            break
+    cmd = argv[i:]
+    if not cmd:
+        print(__doc__, file=sys.stderr)
+        return 2
+
+    os.makedirs(LOCKS, exist_ok=True)
+    fd = os.open(os.path.join(LOCKS, name + ".lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    deadline = time.time() + wait
+    announced = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.time() >= deadline:
+                print("deploylock: %r is %s" % (name, describe(read_owner(name))),
+                      file=sys.stderr)
+                print("\nWait for it (--wait 600) or coordinate with that session. "
+                      "Do not bypass it: overlapping Ansible runs deploy a mixed tree.",
+                      file=sys.stderr)
+                return 1
+            if not announced:
+                print("deploylock: %r busy, waiting up to %ds..." % (name, int(wait)),
+                      file=sys.stderr)
+                announced = True
+            time.sleep(2)
+
+    printable = " ".join(cmd)
+    try:
+        with open(owner_path(name), "w") as fh:
+            json.dump({
+                "pid": os.getpid(),
+                "cmd": printable,
+                "cwd": os.getcwd(),
+                "agent": os.environ.get("AGENT_BOARD_AGENT")
+                         or ("claude" if os.environ.get("CLAUDECODE") else "shell"),
+                "since": datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "since_epoch": int(time.time()),
+            }, fh)
+    except Exception:
+        pass
+
+    board("note", "HOLDING %s lock: %s" % (name, printable[:100]))
+    try:
+        return subprocess.call(cmd)
+    except FileNotFoundError:
+        print("deploylock: no such command: %s" % cmd[0], file=sys.stderr)
+        return 127
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        board("note", "released %s lock" % name)
+        try:
+            os.unlink(owner_path(name))
+        except Exception:
+            pass
+        # flock is released by the kernel when the fd closes / the process dies.
+        # The fd is deliberately inherited by the child: if this wrapper is killed
+        # while the deploy is still running, the lock stays held by the surviving
+        # child until the deploy itself ends, which is the semantics we want.
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

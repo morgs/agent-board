@@ -1,0 +1,25 @@
+# The board's whole point is that its state is machine-local and transient: it
+# describes agents alive on this machine right now. Committing any of it would
+# publish one machine's live claims and conflict on every pull.
+sessions/
+messages/
+read/
+paths/
+locks/
+wins/
+
+# Written by every install as the pre-edit undo. Once history is tracked, git is
+# the durable one; this stays local for the edit that is not committed yet.
+bin/agentboard.prev
+
+# Which set of names this machine's agents are given. A preference belonging to
+# whoever is sitting here, not to the repo.
+/theme
+
+# Theme packs written on this machine. They override what the repo ships, which is
+# only useful if a pull never argues with them.
+/themes.local/
+
+# Which repos on this machine are worked in which way. Describes a workspace, not
+# this tool — and naming a team's repos is exactly what should not ship.
+/workspace.local
