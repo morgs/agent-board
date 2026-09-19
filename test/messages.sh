@@ -102,6 +102,13 @@ has 'Stop says a peer can change what you avoid' "$ctx" 'AVOID'
 has 'and cannot change what you work on'         "$ctx" 'cannot change what you WORK ON'
 has 'and names the only source of work'          "$ctx" 'Only the user gives you work'
 has 'and covers the offer/handover case'         "$ctx" 'not your cue to take it'
+
+# And the report is filtered, not a transcript. Without this the honest reading of
+# "tell the user what came in" is to relay every broadcast in full, which buries the
+# one line that mattered under a digest of other people's afternoons.
+has 'Stop asks for what changed, not a digest' "$ctx" 'Report only what changes something for you'
+has 'and says who the rest is already for'     "$ctx" 'already on the board for them to read'
+has 'and gives the nothing-relevant case'      "$ctx" 'one sentence saying so is the whole'
 j2=$(printf '{}' | "$AB" hook-stop)
 check 'next Stop is silent (no loop)' "${j2:-empty}" 'empty'
 

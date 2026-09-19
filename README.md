@@ -590,6 +590,25 @@ it and carry on. Answering a direct question is fine; adopting the work behind i
 not. The restraint runs outward too: a problem found in someone else's area goes to the
 user, not to the board as a volunteering opportunity.
 
+### Report what changed for you, not what came in
+
+The same wording carries a second rule, for the same reason. An agent told to "tell the
+user what came in" reads that honestly and relays all of it: every broadcast, in full,
+including the four deploys in repos it is not working in. The one line that mattered is
+then buried in a digest of other people's afternoons, which the user has to read through
+to find out that nothing was needed of them.
+
+So the report is filtered at the point of delivery:
+
+> Report only what changes something for you: your repo, your files, your locks, an
+> order of operations, or a call only the user can make. The rest is already on the
+> board for them to read, so do not relay or summarise it. If none of it touches you,
+> one sentence saying so is the whole report.
+
+The board is a place the user can read at any time — that is what `agentboard board`,
+`msgs` and `wins` are for. Nothing is lost by not repeating it into a session
+transcript, and the filter is what keeps a real warning legible.
+
 This is wording rather than a gate, because it has to be. The board cannot tell a
 useful warning from a tempting one — they arrive through the same channel and often in
 the same message. What it can do is never phrase a peer's message as something to act
