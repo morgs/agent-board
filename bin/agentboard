@@ -84,7 +84,7 @@ DEPLOYLOCK="$BOARD/bin/deploylock"
 STALE_SECS="${AGENT_BOARD_STALE_SECS:-7200}"     # 2h without a heartbeat = presumed dead
 DONE_KEEP_SECS="${AGENT_BOARD_DONE_KEEP_SECS:-3600}"
 MSG_KEEP_SECS="${AGENT_BOARD_MSG_KEEP_SECS:-86400}"
-WIN_KEEP_DAYS="${AGENT_BOARD_WIN_KEEP_DAYS:-5}"  # today is what is shown; the rest is for looking back
+WIN_KEEP_DAYS="${AGENT_BOARD_WIN_KEEP_DAYS:-7}"  # today plus the seven days before it, so a weekly review sees a whole week
 DELIVER_ON_STOP="${AGENT_BOARD_DELIVER_ON_STOP:-1}"
 # Set only by the commands a human runs at a prompt. Everything the hooks print
 # lands in some agent's context window, where a banner, a colour escape and a
@@ -2429,7 +2429,7 @@ cmd_sweep() {
   env_live >/dev/null 2>&1           # same, for every dev environment lease
   # Wins outlive the sessions that logged them — that is the point of a tally —
   # but only for a few days. The board shows today; the rest is for looking back
-  # on Friday, and after that it is clutter nobody reads.
+  # at the weekly review, and after that it is clutter nobody reads.
   local cutoff; cutoff=$(date -v-"${WIN_KEEP_DAYS}"d +%F 2>/dev/null) || cutoff=""
   if [ -n "$cutoff" ]; then
     for f in "$WINS"/*.*; do

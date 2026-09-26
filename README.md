@@ -513,7 +513,8 @@ The board shows **today**, newest last so the tally reads the way the day happen
 with a count under it, and **yesterday underneath** — the morning after is when that
 list gets used, and reconstructing it from `wins --all` while standing up is exactly
 the friction that stops it happening. Yesterday's section disappears by itself when
-it is empty, which is most Mondays. Five days are kept on disk and `sweep` drops the
+it is empty, which is most Mondays. Today and the seven days before it are kept on disk, so a
+weekly review always sees a whole week, and `sweep` drops the
 rest — a win is not stale state to be cleared on sight, it is the one thing here
 worth looking back at, but only as far back as anybody actually looks.
 
