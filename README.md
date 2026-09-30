@@ -1,7 +1,7 @@
 # Agent board
 
 A machine-local, transient coordination board so that concurrently running coding
-agents (Claude Code, Codex, Grok, ...) can see each other's work before they edit,
+agents (Claude Code, Grok, ...) can see each other's work before they edit,
 commit, branch or deploy in the same repo.
 
 It is **advisory visibility, not a lock** — with two exceptions that cannot be
@@ -34,7 +34,7 @@ without it:
    assumes `~/.claude/settings.json.bak-agentboard`. Registration is by **path**, so
    later edits to `bin/agentboard` take effect immediately with no restart.
 3. **Tell the agents the protocol** — a section in `~/.claude/CLAUDE.md` for Claude
-   Code, and in `~/.codex/AGENTS.md` (or equivalent) for agents without hooks. The
+   Code, and in `~/.grok/AGENTS.md` (or equivalent) for agents without hooks. The
    hooks cover the mechanics; the instruction file is what makes an agent *use* the
    board, and it is where "stay in your lane" lives.
 4. **Route manual Ansible runs through the lock** — the `ansible-playbook()` function
@@ -229,7 +229,7 @@ inherit exactly the staleness problem that `intent` had.
 Two consequences:
 
 - **An agent without hooks has to say so.** `agentboard editing <path>...` records the
-  same claim by hand, through the same code path — see [Other agents](#other-agents-codex-grok-anything-without-hooks).
+  same claim by hand, through the same code path — see [Other agents](#other-agents-grok-anything-without-hooks).
 - **Unclaimed dirty files are reported as such**, rather than being silently ignored:
 
       NOT COVERED BY ANY CLAIM — dirty per git, claimed by no live agent:
@@ -362,7 +362,7 @@ which is where the `busy` / `idle` on each entry comes from:
 
 The name is read live rather than copied into the other session's file — one writer
 per file is the invariant that makes the board race-free. Agents without such a file
-(Codex, Grok) pass `claim --name <name>` instead.
+(Grok) pass `claim --name <name>` instead.
 
 The name is also the address: `agentboard tell mailer "..."`.
 
@@ -654,7 +654,7 @@ Consequences worth knowing:
 |---|---|
 | `busy` Claude session | nothing — the message lands at the end of its current turn |
 | `idle` Claude session | pokes it (below), so it does not sit unread until someone types at it |
-| not a Claude session (Codex, Grok) | says so — that agent collects with `agentboard inbox` |
+| not a Claude session (Grok) | says so — that agent collects with `agentboard inbox` |
 
 The poke is transport-agnostic, deliberately. Claude Code has a first-party channel
 between local sessions — the `ListAgents` / `SendMessage` tools, over the socket named
@@ -744,7 +744,7 @@ The `shared-main` file-overlap gate and the dev-environment gate instead **ask**
 `permissionDecision: "ask"`, which hands the decision to the user with the reason
 attached:
 
-    mailer (codex) also has uncommitted changes in roles/mail-sending/tasks/main.yml.
+    mailer (grok) also has uncommitted changes in roles/mail-sending/tasks/main.yml.
 
 Two agents in one file is sometimes genuinely fine and sometimes the start of a lost
 edit, and the board cannot tell which. A block would be wrong half the time; a silent
@@ -806,10 +806,10 @@ bypass, which does not take the lock at all:
 `deploylock` execs without a shell, so the wrapped call resolves to the real binary on
 `PATH` and never recurses back into the function.
 
-## Other agents (Codex, Grok, anything without hooks)
+## Other agents (Grok, anything without hooks)
 
 No hook system, so they do it by hand — write the protocol into that agent's own
-instruction file (`~/.codex/AGENTS.md` for Codex). The difference that matters is
+instruction file (`~/.grok/AGENTS.md` for Grok). The difference that matters is
 that **nothing observes their edits**, so in a `shared-main` repo they must declare:
 
     agentboard check                              # before touching anything
@@ -823,6 +823,14 @@ that **nothing observes their edits**, so in a `shared-main` repo they must decl
 declared claim and an observed one are indistinguishable downstream — and both lapse
 on commit. An agent that declares nothing still shows up in the union floor as *dirty
 but claimed by no live agent*, which is the safety net, not the plan.
+
+**Codex is not on the board, on purpose.** It has no board section in
+`~/.codex/AGENTS.md`, so it never claims, holds, reads its inbox or takes the deploy
+lock or vault lease. For the other agents, a Codex session is the same as an agent that
+declares nothing. Its dirty files show as claimed by no live agent, and nothing stops
+it running Ansible while the deploy lock is held. Keep Codex out of `deploy` and out
+of vault files while other agents are live. To put it back, copy the section from
+`~/.grok/AGENTS.md`, and change the name of the agent.
 
 ## Keeping it useful
 
@@ -940,7 +948,7 @@ The pieces are independent, so disable only what is in the way:
 - **The shell wrapper**: delete the `ansible-playbook()` function at the end of
   `~/.zshrc`. Original: `~/.zshrc.bak-agentboard`.
 - **Everything**: `rm -rf ~/agent-board`, then remove the sections from
-  `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`. Nothing else on the machine depends
+  `~/.claude/CLAUDE.md` and `~/.grok/AGENTS.md`. Nothing else on the machine depends
   on it; with the directory gone the shell wrapper falls back to running Ansible
   directly, and the hooks fail open.
 
@@ -951,6 +959,6 @@ The pieces are independent, so disable only what is in the way:
 | `~/.claude/settings.json` | the hook registrations — `SessionStart`, two `PreToolUse`, `PostToolUse`, `Stop`, `SessionEnd` |
 | `~/.claude/sessions/<pid>.json` | Claude's own metadata — read for `name` and `status`, never written |
 | `~/.claude/CLAUDE.md` | protocol for Claude Code |
-| `~/.codex/AGENTS.md` | manual protocol for Codex/Grok |
+| `~/.grok/AGENTS.md` | manual protocol for Grok |
 | `~/.zshrc` | `ansible-playbook()` lock wrapper |
 | `~/.claude/settings.json.bak-agentboard`, `~/.zshrc.bak-agentboard` | pre-change backups |
