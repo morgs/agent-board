@@ -148,6 +148,14 @@ def main(argv):
         pass
 
     board("note", "HOLDING %s lock: %s" % (name, printable[:100]))
+    # Some parent shells hand over non-blocking stdio and ansible refuses to
+    # start on it. The flag is on the shared file description, so the child
+    # inherits the fix.
+    for fd in (0, 1, 2):
+        try:
+            os.set_blocking(fd, True)
+        except OSError:
+            pass
     try:
         return subprocess.call(cmd)
     except FileNotFoundError:

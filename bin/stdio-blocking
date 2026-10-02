@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""stdio-blocking — put stdin/stdout/stderr back into blocking mode, then exec.
+
+Some parent shells (Claude Code's `!` prompt among them) hand their children
+non-blocking stdio, and ansible refuses to start on that ("Ansible requires
+blocking IO"). The flag lives on the shared open file description, so setting it
+here holds for the exec'd command too.
+
+    stdio-blocking ansible-playbook site.yml
+"""
+import os
+import sys
+
+for fd in (0, 1, 2):
+    try:
+        os.set_blocking(fd, True)
+    except OSError:
+        pass
+
+if len(sys.argv) < 2:
+    sys.exit("usage: stdio-blocking <command> [args...]")
+try:
+    os.execvp(sys.argv[1], sys.argv[1:])
+except FileNotFoundError:
+    sys.exit("stdio-blocking: no such command: %s" % sys.argv[1])
