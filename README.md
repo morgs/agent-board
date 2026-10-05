@@ -839,6 +839,12 @@ side by side. Locks are always taken in one order — gate, global, then hosts s
     # deploylock: reviewed    no shared hosts, but checked: may resolve without -l,
                               and its delegate_to lines are known to be safe
 
+A delegation that is safe to run in parallel can be marked on its own line instead,
+in the playbook or in the role, which covers every playbook that uses the role and
+leaves the rest of the scan in force:
+
+    delegate_to: "{{ dns_host }}"   # deploylock: safe
+
 Any directive also says "a run without `--limit` may still be one environment",
 which is what lets `-e target_host=...` playbooks resolve per-environment. The
 declaration belongs in the playbook, next to the plays it describes, rather than in

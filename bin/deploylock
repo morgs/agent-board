@@ -33,6 +33,10 @@ A playbook can carry directives in a comment, anywhere in the file:
                                          to one environment, and its delegate_to
                                          lines are known to be safe.
 
+A single delegate_to line, in a playbook or a role, can vouch for itself instead:
+
+    delegate_to: "{{ hub }}"   # deploylock: safe
+
 Without a directive, a run with no --limit is global, and so is a playbook (or one
 of its roles) with a delegate_to that points somewhere other than localhost.
 
@@ -83,7 +87,9 @@ VALUE_OPTS = {
 PROMPT_OPTS = {"-k", "--ask-pass", "-K", "--ask-become-pass", "--ask-vault-pass",
                "--ask-vault-password", "-J"}
 DIRECTIVE = re.compile(r"^\s*#\s*deploylock:\s*(.*?)\s*$")
-DELEGATE = re.compile(r"^\s*delegate_to:\s*(.+?)\s*$")
+DELEGATE = re.compile(r"^\s*delegate_to:\s*(.+?)\s*(#.*)?$")
+# A delegate_to line can vouch for itself: `delegate_to: x  # deploylock: safe`.
+SAFE_MARK = re.compile(r"#\s*deploylock:\s*safe\b")
 SAFE_DELEGATES = LOCAL | {"{{ inventory_hostname }}", "{{inventory_hostname}}"}
 POLL = 1.0
 
@@ -363,7 +369,8 @@ def remote_delegation(playbooks, roles, cwd):
             with open(f) as fh:
                 for n, line in enumerate(fh, 1):
                     m = DELEGATE.match(line)
-                    if m and m.group(1).strip("'\"") not in SAFE_DELEGATES:
+                    if m and m.group(1).strip("'\"") not in SAFE_DELEGATES \
+                            and not SAFE_MARK.search(m.group(2) or ""):
                         return "%s:%d delegates to %s" % (os.path.relpath(f, cwd), n,
                                                           m.group(1).strip("'\""))
         except OSError:

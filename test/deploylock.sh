@@ -103,6 +103,10 @@ want 'a group that expands to two is global'   'global lock — 2 target hosts' 
 want 'no --limit is global'                    'global lock — no --limit' "$(x ansible-playbook site.yml)"
 want 'an unresolvable limit is global'         'global lock — target could not be resolved' "$(x ansible-playbook site.yml -l nosuch)"
 want 'a role that delegates away is global'    'delegates to {{ hub }}' "$(x ansible-playbook delegating.yml -l app1)"
+printf -- '- name: enrol\n  delegate_to: "{{ hub }}"   # deploylock: safe\n' > roles/relay/tasks/main.yml
+want 'a delegate_to marked safe does not force global' 'environment lock on app1' \
+  "$(x ansible-playbook delegating.yml -l app1)"
+printf -- '- name: enrol\n  delegate_to: "{{ hub }}"\n  command: x\n' > roles/relay/tasks/main.yml
 want 'a playbook can pin itself global'        'declares deploylock: global' "$(x ansible-playbook pinned.yml -l app1)"
 want 'shared hosts lock beside the target'     'environment lock on dev1 (shared: backup1)' \
   "$(x ansible-playbook refresh.yml -e target_host=dev1)"
