@@ -65,7 +65,7 @@ MIT — see [`LICENSE`](./LICENSE).
       theme               one line: which pack of names this machine uses
       themes.local/       packs written here — gitignored, override the shipped ones
       workspace.local     which repos here are worked which way — gitignored
-      test/               three suites — run them after editing bin/
+      test/               four suites — run them after editing bin/
 
 Each session writes **only its own files**, named after the agent process pid. No
 shared file, so no write contention and no read-modify-write races. Reading the
@@ -772,23 +772,113 @@ the situation is understood and confirmed with the user, prefix the command:
 
 An Ansible repo is the exception to "advisory". Ansible reads the checkout as it
 stands, so the working tree is not just source, it is the artefact being shipped to
-every host in the inventory. Two agents can both read a clear board and *then* both
-write — the check and the write have to be one indivisible step, which is what a lock
-is and a board can never be.
+the hosts. Two agents can both read a clear board and *then* both write — the check
+and the write have to be one indivisible step, which is what a lock is and a board
+can never be.
 
     deploylock ansible-playbook refresh.yml -l staging
     deploylock --wait 600 ansible-playbook site.yml   # queue instead of failing
-    deploylock --status                               # who holds it, since when
-    deploylock --name prod ansible-playbook ...       # an independent lock
+    deploylock --explain ansible-playbook ...         # which lock it would take, and why
+    deploylock --global ansible-playbook ...          # skip resolution, lock everything
+    deploylock --status                               # every holder, since when
+    deploylock --name prod ansible-playbook ...       # an independent lock family
 
-Built on `fcntl.flock`, so the lock lives in the kernel against an open fd: it is
+### One environment, or everything
+
+The lock is reader-writer, so that work on different hosts does not queue behind
+one another:
+
+- **An environment run** touches exactly one host. It takes the global lock
+  (`locks/deploy.lock`) *shared* and that host's lock (`locks/deploy.<host>.lock`)
+  *exclusive*. Two of them on different hosts run in parallel; two on the same host
+  queue.
+- **A global run** is everything else. It takes the global lock *exclusive*, so it
+  waits for every environment run to finish and keeps new ones out while it runs.
+
+A queued global run holds `locks/deploy.gate`, and new environment runs wait behind
+it, so a steady stream of small deploys cannot starve a site-wide one.
+
+`deploylock` finds the target by asking Ansible: it runs the same command with
+`--list-hosts --list-tasks` added. That applies `-l`/`--limit`, `-e target_host=...`,
+groups, patterns, comma lists and `@file` limits against the real inventory —
+a dynamic one included — exactly as the run will, so there is no second parser to
+drift from Ansible's. It costs about a second; `site.yml` on a large inventory, a few.
+`ansible-playbook` is looked for next to the wrapped command, then on `PATH`, then in
+`./.venv/bin`, because an agent shell does not activate a checkout's virtualenv.
+
+**Global is the default whenever the target is not certain.** The run is global if:
+
+- it is not `ansible-playbook`, or names no playbook;
+- it has no `--limit` and the playbook has no `deploylock:` directive;
+- the limit resolves to more than one host, to none, or cannot be resolved at all;
+- the playbook, or a role in a play that still has hosts after the limit, has a
+  `delegate_to:` that points anywhere but localhost — and no directive.
+
+The reason is the asymmetry of the two mistakes. A run wrongly made global costs a
+wait. A run wrongly made per-environment deploys over another agent's run on a host
+nobody thought it touched: a group that grew a member, a play with no `-l` that runs
+on its own hosts, a task delegated to a shared server. Only the cheap mistake is
+allowed to happen by default. `--explain` says which way a command went and why.
+
+### Playbooks that use shared hosts
+
+Some playbooks target one host but do work on others: a database refresh that
+recovers a backup on the backup server and pushes files from a source host. Two of
+those in parallel compete for the shared hosts even though their targets differ.
+The playbook declares this in a comment, anywhere in the file:
+
+    # deploylock: shared backup_servers source_hosts:!disabled_hosts
+
+The patterns are expanded against the inventory; their hosts are locked by name
+beside the target and do not count as targets. Two refreshes then queue on the
+backup server, while a refresh and an unrelated deploy to a third host still run
+side by side. Locks are always taken in one order — gate, global, then hosts sorted
+— so two runs that share hosts cannot deadlock.
+
+    # deploylock: global      this playbook always takes the global lock
+    # deploylock: reviewed    no shared hosts, but checked: may resolve without -l,
+                              and its delegate_to lines are known to be safe
+
+Any directive also says "a run without `--limit` may still be one environment",
+which is what lets `-e target_host=...` playbooks resolve per-environment. The
+declaration belongs in the playbook, next to the plays it describes, rather than in
+a list here: whoever adds a shared host to a playbook is the one who knows.
+
+Delegation detection is best effort. It reads the playbook and the `tasks/` and
+`handlers/` of the roles `--list-tasks` reports; a role pulled in at runtime with
+`include_role` is not seen. If a playbook does that, give it a directive.
+
+### Holders
+
+Every lock records who holds it in a sidecar `locks/<lock>.owner`: the pid of the
+wrapper and of the command it runs, the command, the directory, the time, and the
+agent's board name (`person · session`, from `agentboard whoami --known`, or
+`AGENT_BOARD_AGENT`). A run that holds several hosts writes each one's owner as it
+gets it, so a run still queued for its second host shows as the holder of its first.
+
+    $ deploylock --status
+    lock 'deploy': shared by 2 environment runs
+      env staging-db: held by pid 4121 since 2026-10-05T14:02:11+0200 (3m10s ago)
+        agent:   Hawkeye · db-refresh
+        env:     staging-db
+        shared:  backup1
+        dir:     ~/code/deploy
+        command: ansible-playbook refresh.yml -e target_host=staging-db
+      env web-3: held by pid 4380 ...
+
+`deploylock --status --brief` prints one tab-separated line per holder for the
+board's locks panel.
+
+Built on `fcntl.flock`, so every lock lives in the kernel against an open fd: it is
 released automatically on exit, crash or `kill -9`. There is no stale-lock case to
-clean up. The fd is inherited by the child on purpose — if the wrapper is killed while
-the play is still running, the lock stays held until the deploy itself ends.
+clean up. The lock fds are passed to the command on purpose (Python closes every
+other fd in a child) — if the wrapper is killed while the play is still running, the
+locks stay held until the deploy itself ends.
 
-A `PreToolUse` hook refuses any un-wrapped `ansible-playbook` from an agent.
-`--syntax-check`, `--list-tasks`, `--list-hosts` and `--list-tags` are exempt (local
-parsing only); `--check` is not, since it still connects to hosts.
+A `PreToolUse` hook refuses any un-wrapped `ansible-playbook` from an agent; the
+wrapped form is accepted whichever lock it resolves to. `--syntax-check`,
+`--list-tasks`, `--list-hosts` and `--list-tags` are exempt (local parsing only);
+`--check` is not, since it still connects to hosts.
 
 ### Manual runs
 
@@ -869,18 +959,28 @@ exactly the failure this board exists to prevent.
 | `AGENT_BOARD_POKE_CMD` | unset | run as `<cmd> <pid> <name> <socket>` to wake an idle target |
 | `AGENT_BOARD_CC_SESSIONS` | `~/.claude/sessions` | where Claude's own session metadata is read from |
 | `AGENT_BOARD_OVERRIDE` | unset | set on a command to bypass the git/repo gate |
-| `AGENT_BOARD_AGENT` | auto | override the agent name recorded by `deploylock` |
+| `AGENT_BOARD_AGENT` | board name | override the holder name `deploylock` records (default: `agentboard whoami --known`) |
 
 ## Troubleshooting
 
 **"The lock is held but nothing is running."** It is held by something — flock lives in
 the kernel and cannot leak. Find the holder:
 
-    lsof ~/agent-board/locks/deploy.lock
+    lsof ~/agent-board/locks/deploy*.lock
 
-Most likely an `ansible-playbook` that outlived its wrapper (the fd is inherited on
-purpose). The lock frees the moment that process ends. `deploylock --status` reads
-sidecar metadata that a `kill -9` can leave behind, so trust `lsof` over it.
+`deploy.lock` is the global lock (every environment run holds it shared); each
+`deploy.<host>.lock` is one environment. Most likely an `ansible-playbook` that
+outlived its wrapper (the lock fds are passed to it on purpose). The lock frees the
+moment that process ends. `deploylock --status` reads sidecar metadata that a
+`kill -9` can leave behind, so trust `lsof` over it; `agentboard sweep` removes an
+owner file once neither its wrapper nor its command is alive. The `.lock` files
+themselves are never removed — unlinking one that another process has open splits
+the lock in two — and an empty file per host costs nothing.
+
+**"My run went global and I expected one environment."** `deploylock --explain
+<command>` prints the reason: no `--limit`, several hosts, an unresolvable target, or
+a `delegate_to` in a role. Narrow the limit, or declare the playbook's shared hosts
+with a `# deploylock:` directive.
 
 **The vault lease is held by a session that is gone.** It should clear itself: reading
 it checks the owner pid. `agentboard vault status` forces that read; `agentboard sweep`
@@ -904,7 +1004,7 @@ required section and is not selectable until it has one.
 **A phantom entry on the board.** `agentboard sweep`. If it survives that, its pid is
 genuinely alive — check with `ps -p <pid>`.
 
-**Something looks wrong after I edited `bin/agentboard`.** Run the tests:
+**Something looks wrong after I edited `bin/agentboard` or `bin/deploylock`.** Run the tests:
 
     ~/agent-board/test/policy-matrix.sh    # the three policies, the vault,
                                            # ansible and dev-env gates, override,
@@ -915,8 +1015,11 @@ genuinely alive — check with `ps -p <pid>`.
                                            # packs, injection purity, panels, wins
     ~/agent-board/test/messages.sh         # names, addressing, read-once
                                            # delivery, the Stop hook's JSON, poking
+    ~/agent-board/test/deploylock.sh       # environment vs global resolution,
+                                           # readers and writers, shared hosts,
+                                           # writer preference, kill -9, sweep
 
-All three build their own throwaway git repos and fake agents in a throwaway
+All four build their own throwaway git repos and fake agents in a throwaway
 `AGENT_BOARD_DIR`, so they neither read nor write the live board or the real
 checkouts. The tracked history is the real undo — `git -C ~/agent-board log bin/agentboard`,
 then `git checkout <rev> -- bin/agentboard`. `bin/agentboard.prev` is still written on

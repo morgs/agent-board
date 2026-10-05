@@ -1797,9 +1797,10 @@ cmd_win() {
 # 300-character win printed as one line is not something anybody can read aloud.
 # An agent cannot introduce itself by a name nobody told it. Claude sessions get
 # this injected at session start; Codex and anything else has to ask.
-cmd_whoami() {
+cmd_whoami() {   # --known: answer only if this process already has a session
   local me person name
-  me=$(ensure_file) || return 1
+  if [ "${1:-}" = --known ]; then me=$(find_file) || return 1
+  else me=$(ensure_file) || return 1; fi
   person=$(person_of "$me"); name=$(name_of "$me")
   if [ -n "$person" ] && [ -n "$name" ]; then printf '%s · %s\n' "$person" "$name"
   elif [ -n "$person" ]; then printf '%s\n' "$person"
@@ -2152,16 +2153,28 @@ locks_panel() {
   # 0 free, 1 held, anything else (127: a throwaway board has no bin/) is neither —
   # and reporting "held" because the binary is missing would be the worst of the three.
   dl="$BOARD/bin/deploylock"; [ -x "$dl" ] || dl=$(command -v deploylock 2>/dev/null)
-  if [ -n "$dl" ]; then out=$("$dl" --status 2>/dev/null); rc=$?; else rc=127; fi
+  if [ -n "$dl" ]; then out=$("$dl" --status --brief 2>/dev/null); rc=$?; else rc=127; fi
   if [ "$rc" = 1 ]; then
-    pid=$(printf '%s'   "$out" | sed -n 's/.*held by pid \([0-9]*\) .*/\1/p' | head -1)
-    since=$(printf '%s' "$out" | sed -n 's/.*since \([^ ]*\) .*/\1/p' | head -1)
-    agent=$(printf '%s' "$out" | sed -n 's/^ *agent: *//p' | head -1)
-    cmd=$(printf '%s'   "$out" | sed -n 's/^ *command: *//p' | head -1)
-    who=$(name_for_pid "${pid:-0}" "${agent:-unknown}")
-    printf '   %s●%s deploy   %s%s%s, %s\n' "$C_GRN" "$C_R" "$C_B" "$who" "$C_R" "$(ago "$since")"
-    printf '       %s%s%s\n' "$C_DIM" "$(clip 60 "$cmd")" "$C_R"
-    printf '       %sanything else ansible waits — deploylock --wait 600 <cmd>%s\n' "$C_DIM" "$C_R"
+    # One line per holder: the global run, or each environment run sharing it.
+    local scope kind=env
+    while IFS=$'\t' read -r scope agent since pid cmd; do
+      [ -n "$scope" ] || continue
+      case "$agent" in
+        *' · '*) who=$agent ;;
+        '')      who="unknown holder — lsof $LOCKS/deploy*.lock" ;;
+        *)       who=$(name_for_pid "${pid:-0}" "$agent") ;;
+      esac
+      [ "$scope" = global ] && kind=global
+      printf '   %s●%s deploy   %s%s%s%s\n' "$C_GRN" "$C_R" "$C_B" "$who" "$C_R" \
+        "${since:+, $(ago "$since")}"
+      printf '       %s%s%s\n' "$C_DIM" "$(clip 60 "$([ "$scope" = global ] && printf 'global' \
+        || printf 'env %s' "$scope")${cmd:+ — $cmd}")" "$C_R"
+    done <<< "$out"
+    if [ "$kind" = global ]; then
+      printf '       %sanything else ansible waits — deploylock --wait 600 <cmd>%s\n' "$C_DIM" "$C_R"
+    else
+      printf '       %sother hosts deploy alongside; multi-host runs wait%s\n' "$C_DIM" "$C_R"
+    fi
   elif [ "$rc" = 0 ]; then
     printf '   %s○ deploy   free — run ansible through deploylock%s\n' "$C_DIM" "$C_R"
   else
@@ -2385,7 +2398,7 @@ cmd_board() {
 
 cmd_sweep() {
   local nowe; nowe=$(now_e)
-  SW_S=0; SW_M=0; SW_R=0; SW_W=0
+  SW_S=0; SW_M=0; SW_R=0; SW_W=0; SW_L=0
   for f in "$SESS"/*.md; do
     [ -e "$f" ] || continue
     local st pid ep age
@@ -2427,6 +2440,19 @@ cmd_sweep() {
   done
   vault_owner >/dev/null 2>&1        # clears the lease if its owner has gone
   env_live >/dev/null 2>&1           # same, for every dev environment lease
+  # deploylock removes its own owner files; only a SIGKILL leaves one behind, and
+  # then --status names a holder that is gone. Drop it once neither the wrapper nor
+  # the command it ran is alive. The .lock files stay: unlinking one that another
+  # process has open splits the lock in two, and an empty file costs nothing.
+  for f in "$LOCKS"/*.owner "$LOCKS"/*.owner.tmp; do
+    [ -e "$f" ] || continue
+    local op oc
+    op=$(sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p' "$f")
+    oc=$(sed -n 's/.*"child": *\([0-9][0-9]*\).*/\1/p' "$f")
+    { [ -n "$op" ] && kill -0 "$op" 2>/dev/null; } && continue
+    { [ -n "$oc" ] && kill -0 "$oc" 2>/dev/null; } && continue
+    rm -f "$f"; SW_L=$((SW_L+1))
+  done
   # Wins outlive the sessions that logged them — that is the point of a tally —
   # but only for a few days. The board shows today; the rest is for looking back
   # at the weekly review, and after that it is clutter nobody reads.
@@ -2497,7 +2523,7 @@ cmd_watch() {
 cmd_sweep_report() {
   AB_RICH=1; setup_colour
   cmd_sweep
-  if [ $(( SW_S + SW_M + SW_R + SW_W )) -eq 0 ]; then
+  if [ $(( SW_S + SW_M + SW_R + SW_W + SW_L )) -eq 0 ]; then
     printf 'Nothing to sweep — the board is already telling the truth.\n'
     return 0
   fi
@@ -2505,6 +2531,7 @@ cmd_sweep_report() {
   [ "$SW_S" -gt 0 ] && printf ' %s session(s)' "$SW_S"
   [ "$SW_M" -gt 0 ] && printf ' %s message(s)' "$SW_M"
   [ "$SW_R" -gt 0 ] && printf ' %s read-record(s)' "$SW_R"
+  [ "$SW_L" -gt 0 ] && printf ' %s orphaned deploy-lock owner(s)' "$SW_L"
   [ "$SW_W" -gt 0 ] && printf ' %s day(s) of wins past %s' "$SW_W" "$WIN_KEEP_DAYS"
   printf '. %sThe board forgets so you do not have to.%s\n' "$C_DIM" "$C_R"
   return 0
@@ -2941,7 +2968,7 @@ case "$sub" in
   list)       cmd_list "$@" || printf 'No other live agent sessions.\n' ;;
   board)      cmd_board ;;
   env)        cmd_env "$@" ;;
-  whoami)     cmd_whoami ;;
+  whoami)     cmd_whoami "$@" ;;
   theme)      cmd_theme "$@" ;;
   workspace)  cmd_workspace "$@" ;;
   win)        cmd_win "$@" ;;

@@ -481,7 +481,7 @@ h=$("$AB" win --help 2>/dev/null)
 want 'it says how to write one'      'excitement' "$h"
 want 'and what does not count'       'started work on X' "$h"
 want 'it names where a win surfaces' 'standup' "$h"
-want 'and how long one is kept'      'Kept 5 days' "$h"
+want 'and how long one is kept'      'Kept 7 days' "$h"
 want 'the short flag works too'      'usage: agentboard win' "$("$AB" win -h 2>/dev/null)"
 want 'help credits the caller by person' \
   "$("$AB" mine | xargs -I{} sed -n 's/^person: //p' {})" "$h"

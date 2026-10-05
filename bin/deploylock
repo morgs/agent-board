@@ -1,20 +1,51 @@
 #!/usr/bin/env python3
-"""deploylock — exclusive lock for commands that deploy the working tree.
+"""deploylock — reader-writer lock for commands that deploy the working tree.
 
 Ansible reads the checkout as it stands, so the tree is not just source, it is the
-artefact. Two overlapping runs, or a run started while another agent is mid-edit,
-ship a half-written tree to real hosts. The agent board makes that visible; only an
-atomic acquire prevents it (both parties can check a board, find it clear, and then
-both write — the check and the write have to be one indivisible step).
+artefact. Two overlapping runs against the same host, or a run started while another
+agent is mid-edit, ship a half-written tree to real hosts. The agent board makes that
+visible; only an atomic acquire prevents it (both parties can check a board, find it
+clear, and then both write — the check and the write have to be one indivisible step).
 
-Uses fcntl.flock, so the lock is held by the kernel against an open fd: it is
-released automatically when this process exits, crashes, or is killed. There is no
-such thing as a stale lock here.
+Two kinds of hold:
 
-    deploylock ansible-playbook refresh.yml
+  environment  The run touches exactly one host. It takes the global lock SHARED and
+               that host's lock EXCLUSIVE (locks/deploy.<host>.lock). Runs on
+               different hosts go in parallel; runs on the same host queue.
+  global       Anything else: several hosts, no --limit, a target that cannot be
+               resolved for certain, or a command that is not ansible-playbook. It
+               takes the global lock EXCLUSIVE, so it waits for every environment
+               run to finish and keeps new ones out while it runs.
+
+The target comes from asking ansible-playbook itself (--list-hosts --list-tasks with
+the same arguments), so -l/--limit, -e target_host=..., groups, patterns and comma
+lists resolve against the real inventory exactly as the run will.
+
+A playbook can carry directives in a comment, anywhere in the file:
+
+    # deploylock: global                 always take the global lock
+    # deploylock: shared <pattern> ...   hosts in these patterns are services the
+                                         playbook uses beside its target (a backup
+                                         server, a source host). They are locked by
+                                         name as well, and do not count as targets.
+    # deploylock: reviewed               no shared hosts, but the playbook has been
+                                         checked: a run without --limit may resolve
+                                         to one environment, and its delegate_to
+                                         lines are known to be safe.
+
+Without a directive, a run with no --limit is global, and so is a playbook (or one
+of its roles) with a delegate_to that points somewhere other than localhost.
+
+Uses fcntl.flock, so every lock is held by the kernel against an open fd: it is
+released when this process and the command it runs have exited, crashed or been
+killed. There is no such thing as a stale lock here.
+
+    deploylock ansible-playbook refresh.yml -l host1
     deploylock --wait 600 ansible-playbook site.yml     # queue instead of failing
-    deploylock --status
-    deploylock --name prod ansible-playbook ...    # independent lock
+    deploylock --explain ansible-playbook ...           # which lock, and why; runs nothing
+    deploylock --global ansible-playbook ...            # skip resolution, lock everything
+    deploylock --status [--brief]
+    deploylock --name prod ansible-playbook ...         # independent lock family
 
 Not the right tool for a vault edit. `flock` dies with the process, and a
 decrypt -> edit -> re-encrypt -> commit cycle spans several separate commands with
@@ -22,8 +53,11 @@ no process outliving them, so there is nothing for a kernel lock to live on. Tha
 one uses a lease instead: `agentboard vault take <file>` ... `agentboard vault free`.
 """
 import fcntl
+import glob
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -33,72 +67,491 @@ BOARD = os.environ.get("AGENT_BOARD_DIR", os.path.expanduser("~/agent-board"))
 LOCKS = os.path.join(BOARD, "locks")
 AGENTBOARD = os.path.join(BOARD, "bin", "agentboard")
 
+LOCAL = {"localhost", "127.0.0.1", "::1"}
+# ansible-playbook options that consume the next argument, so it is not mistaken
+# for a playbook.
+VALUE_OPTS = {
+    "-l", "--limit", "-e", "--extra-vars", "-i", "--inventory", "--inventory-file",
+    "-t", "--tags", "--skip-tags", "-u", "--user", "-f", "--forks", "-c",
+    "--connection", "-T", "--timeout", "--private-key", "--key-file", "-M",
+    "--module-path", "--vault-id", "--vault-password-file", "--vault-pass-file",
+    "--start-at-task", "--become-method", "--become-user", "--become-password-file",
+    "--connection-password-file", "--ssh-common-args", "--sftp-extra-args",
+    "--scp-extra-args", "--ssh-extra-args", "-P", "--poll", "-B",
+}
+# Resolution runs with no terminal; a prompt would hang it or fail it.
+PROMPT_OPTS = {"-k", "--ask-pass", "-K", "--ask-become-pass", "--ask-vault-pass",
+               "--ask-vault-password", "-J"}
+DIRECTIVE = re.compile(r"^\s*#\s*deploylock:\s*(.*?)\s*$")
+DELEGATE = re.compile(r"^\s*delegate_to:\s*(.+?)\s*$")
+SAFE_DELEGATES = LOCAL | {"{{ inventory_hostname }}", "{{inventory_hostname}}"}
+POLL = 1.0
 
-def owner_path(name):
-    return os.path.join(LOCKS, name + ".owner")
+
+# ---------------------------------------------------------------- lock files
+
+def safe(key):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", key)
 
 
-def read_owner(name):
+def lock_path(name, key=None):
+    return os.path.join(LOCKS, "%s.lock" % name if key is None
+                        else "%s.%s.lock" % (name, safe(key)))
+
+
+def owner_path(name, key=None):
+    return lock_path(name, key)[:-len(".lock")] + ".owner"
+
+
+def gate_path(name):
+    # Writer preference: a queued global run holds the gate, so a stream of
+    # environment runs cannot keep slipping in ahead of it forever.
+    return os.path.join(LOCKS, "%s.gate" % name)
+
+
+def read_owner(path):
     try:
-        with open(owner_path(name)) as fh:
+        with open(path) as fh:
             return json.load(fh)
     except Exception:
         return {}
 
 
-def describe(info):
-    if not info:
-        return "held by an unknown process (no owner metadata)"
-    since = info.get("since", "?")
-    held = ""
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def owner_alive(info):
+    return bool(info) and (alive(info.get("pid")) or alive(info.get("child")))
+
+
+def env_keys(name):
+    """Every per-environment lock file that has ever been taken, as keys."""
+    pre, out = os.path.join(LOCKS, name + "."), []
+    for p in sorted(glob.glob(pre + "*.lock")):
+        out.append(p[len(pre):-len(".lock")])
+    return out
+
+
+def try_lock(fd, mode):
+    try:
+        fcntl.flock(fd, mode | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def probe(path, mode):
+    """True if the lock could be taken in `mode` right now. Releases at once."""
+    if not os.path.exists(path):
+        return True
+    fd = os.open(path, os.O_RDWR)
+    try:
+        if try_lock(fd, mode):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return True
+        return False
+    finally:
+        os.close(fd)
+
+
+# ---------------------------------------------------------------- describing holders
+
+def ago(info):
     try:
         secs = int(time.time() - info.get("since_epoch", 0))
-        held = " (%dm%02ds ago)" % (secs // 60, secs % 60)
+        return " (%dm%02ds ago)" % (secs // 60, secs % 60)
+    except Exception:
+        return ""
+
+
+def describe(info, lockfile):
+    if not info:
+        return ("held by an unknown process (no owner metadata)\n"
+                "    find it: lsof %s" % lockfile)
+    lines = ["held by pid %s since %s%s" % (info.get("pid", "?"), info.get("since", "?"),
+                                            ago(info)),
+             "    agent:   %s" % info.get("agent", "?")]
+    if info.get("mode") == "env":
+        lines.append("    env:     %s" % info.get("target", "?"))
+        extra = [k for k in info.get("keys", []) if k != info.get("target")]
+        if extra:
+            lines.append("    shared:  %s" % ", ".join(extra))
+        if info.get("waiting"):
+            lines.append("    (still queued for the rest of its locks)")
+    lines += ["    dir:     %s" % info.get("cwd", "?"),
+              "    command: %s" % info.get("cmd", "?")]
+    return "\n".join(lines)
+
+
+def holders(name):
+    """-> (global state, global owner, env owners one per run, env keys held by unknowns)"""
+    gpath = lock_path(name)
+    if not os.path.exists(gpath):
+        gstate = "never"
+    elif probe(gpath, fcntl.LOCK_EX):
+        gstate = "free"
+    elif probe(gpath, fcntl.LOCK_SH):
+        gstate = "shared"
+    else:
+        gstate = "exclusive"
+    gowner = read_owner(owner_path(name)) if gstate == "exclusive" else {}
+
+    runs, unknown = {}, []
+    for key in env_keys(name):
+        info = read_owner(owner_path(name, key))
+        if owner_alive(info):
+            runs.setdefault(info.get("pid"), info)
+        elif not probe(lock_path(name, key), fcntl.LOCK_EX):
+            unknown.append(key)
+    return gstate, gowner, list(runs.values()), unknown
+
+
+def status(name, brief=False):
+    gstate, gowner, runs, unknown = holders(name)
+    busy = gstate == "exclusive" or runs or unknown
+    if brief:
+        # One line per holder, tab separated, for the board's locks panel:
+        # scope, who, since (ISO), pid, command
+        if gstate == "exclusive":
+            print("\t".join(["global", gowner.get("agent", ""), gowner.get("since", ""),
+                             str(gowner.get("pid", "")), gowner.get("cmd", "")]))
+        for r in runs:
+            print("\t".join([r.get("target") or "?", r.get("agent", ""),
+                             r.get("since", ""), str(r.get("pid", "")), r.get("cmd", "")]))
+        for k in unknown:
+            print("\t".join([k, "", "", "", ""]))
+        return 1 if busy else 0
+
+    if gstate == "never" and not busy:
+        print("lock %r: free (never taken)" % name)
+        return 0
+    if not busy:
+        print("lock %r: free" % name)
+        return 0
+    if gstate == "exclusive":
+        print("lock %r: global, %s" % (name, describe(gowner, lock_path(name))))
+    else:
+        n = len(runs) + len(unknown)
+        print("lock %r: shared by %d environment run%s" % (name, n, "" if n == 1 else "s"))
+    for r in runs:
+        t = r.get("target") or "?"
+        print("  env %s: %s" % (t, describe(r, lock_path(name, t))))
+    for k in unknown:
+        print("  env %s: %s" % (k, describe({}, lock_path(name, k))))
+    return 1
+
+
+# ---------------------------------------------------------------- resolving the target
+
+def find_tool(cmd0, tool, cwd):
+    if os.sep in cmd0:
+        cand = os.path.join(os.path.dirname(os.path.abspath(os.path.join(cwd, cmd0))), tool)
+        if os.access(cand, os.X_OK):
+            return cand
+    found = shutil.which(tool)
+    if found:
+        return found
+    # A deploy checkout often keeps ansible in its own virtualenv, which a
+    # non-interactive agent shell does not activate.
+    cand = os.path.join(cwd, ".venv", "bin", tool)
+    return cand if os.access(cand, os.X_OK) else None
+
+
+def parse_args(args):
+    playbooks, inventory, has_limit, cleaned = [], [], False, []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in PROMPT_OPTS:
+            i += 1
+            continue
+        cleaned.append(a)
+        if a in ("-l", "--limit") or a.startswith("--limit=") or \
+                (a.startswith("-l") and not a.startswith("--") and len(a) > 2):
+            has_limit = True
+        if a in ("-i", "--inventory", "--inventory-file") and i + 1 < len(args):
+            inventory += [a, args[i + 1]]
+        elif a.startswith("--inventory=") or \
+                (a.startswith("-i") and not a.startswith("--") and len(a) > 2):
+            inventory.append(a)
+        if a in VALUE_OPTS:
+            if i + 1 < len(args):
+                cleaned.append(args[i + 1])
+            i += 2
+            continue
+        if not a.startswith("-"):
+            playbooks.append(a)
+        i += 1
+    return playbooks, inventory, has_limit, cleaned
+
+
+def directives(paths):
+    out = []
+    for p in paths:
+        try:
+            with open(p) as fh:
+                for line in fh:
+                    m = DIRECTIVE.match(line)
+                    if m:
+                        out.append(m.group(1).split())
+        except OSError:
+            pass
+    return out
+
+
+def list_playbook(pb_bin, cleaned, cwd):
+    """Hosts across all plays, and the roles of plays that still have hosts after the
+    limit, from ansible-playbook's own resolution. A role in a play the limit empties
+    never runs, so its delegate_to cannot matter."""
+    r = subprocess.run([pb_bin] + cleaned + ["--list-hosts", "--list-tasks"], cwd=cwd,
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        tail = (r.stderr.strip() or r.stdout.strip()).splitlines()[-1:] or ["no output"]
+        raise RuntimeError("ansible-playbook --list-hosts failed: %s" % tail[0][:200])
+    hosts, roles, lines = set(), set(), r.stdout.splitlines()
+    i, live = 0, False
+    while i < len(lines):
+        if re.match(r"^\s+play #\d+", lines[i]):
+            live = False
+        m = re.match(r"^\s+hosts \((\d+)\):", lines[i])
+        if m:
+            n = int(m.group(1))
+            play_hosts = {l.strip() for l in lines[i + 1:i + 1 + n]}
+            hosts |= play_hosts
+            live = bool(play_hosts - LOCAL)
+            i += 1 + n
+            continue
+        m = re.match(r"^\s{6,}([A-Za-z0-9_.-]+) : ", lines[i])
+        if m and live:
+            roles.add(m.group(1))
+        i += 1
+    return hosts, roles
+
+
+def expand(ansible_bin, pattern, inventory, cwd):
+    r = subprocess.run([ansible_bin, pattern, "--list-hosts"] + inventory, cwd=cwd,
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError("could not expand shared pattern %r" % pattern)
+    out = [l.strip() for l in r.stdout.splitlines()[1:] if l.strip()]
+    if not out:
+        raise RuntimeError("shared pattern %r matches no hosts" % pattern)
+    return out
+
+
+def remote_delegation(playbooks, roles, cwd):
+    """First delegate_to that leaves the controller, in the playbooks or their roles.
+
+    Best effort: roles come from --list-tasks, so a role pulled in at runtime by
+    include_role is not seen. A playbook that does that wants a directive."""
+    files = list(playbooks)
+    bases = {os.path.dirname(os.path.abspath(p)) for p in playbooks} | {cwd}
+    for role in sorted(roles):
+        for base in bases:
+            d = os.path.join(base, "roles", role)
+            if os.path.isdir(d):
+                for sub in ("tasks", "handlers"):
+                    files += sorted(glob.glob(os.path.join(d, sub, "**", "*.y*ml"),
+                                              recursive=True))
+    for f in files:
+        try:
+            with open(f) as fh:
+                for n, line in enumerate(fh, 1):
+                    m = DELEGATE.match(line)
+                    if m and m.group(1).strip("'\"") not in SAFE_DELEGATES:
+                        return "%s:%d delegates to %s" % (os.path.relpath(f, cwd), n,
+                                                          m.group(1).strip("'\""))
+        except OSError:
+            pass
+    return None
+
+
+def resolve(cmd, cwd):
+    """-> (target or None, shared keys, reason). None means take the global lock."""
+    if os.path.basename(cmd[0]) != "ansible-playbook":
+        return None, [], "not an ansible-playbook run"
+    playbooks, inventory, has_limit, cleaned = parse_args(cmd[1:])
+    if not playbooks:
+        return None, [], "no playbook on the command line"
+    paths = [os.path.join(cwd, p) for p in playbooks]
+    dirs = directives(paths)
+    words = [w for d in dirs for w in d]
+    if "global" in words:
+        return None, [], "the playbook declares deploylock: global"
+    if not has_limit and not dirs:
+        return None, [], "no --limit, and the playbook has no deploylock directive"
+
+    pb_bin = find_tool(cmd[0], "ansible-playbook", cwd)
+    ansible_bin = find_tool(cmd[0], "ansible", cwd)
+    if not pb_bin:
+        return None, [], "ansible-playbook not found to resolve the target"
+    try:
+        hosts, roles = list_playbook(pb_bin, cleaned, cwd)
+        shared = set()
+        for d in dirs:
+            if d and d[0] == "shared":
+                if not ansible_bin:
+                    return None, [], "ansible not found to expand shared hosts"
+                for pat in d[1:]:
+                    shared.update(expand(ansible_bin, pat, inventory, cwd))
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+        return None, [], "target could not be resolved (%s)" % e
+
+    targets = sorted(hosts - LOCAL - shared)
+    if not targets:
+        return None, [], "no target host matched"
+    if len(targets) > 1:
+        more = ", ".join(targets[:4]) + (", ..." if len(targets) > 4 else "")
+        return None, [], "%d target hosts: %s" % (len(targets), more)
+    if not dirs:
+        why = remote_delegation(paths, roles, cwd)
+        if why:
+            return None, [], why + " (declare it with a deploylock directive)"
+    return targets[0], sorted(shared - {targets[0]}), "one target host"
+
+
+# ---------------------------------------------------------------- acquiring
+
+def acquire(fd, mode, deadline, wait, label, why_busy):
+    announced = False
+    while True:
+        if try_lock(fd, mode):
+            return True
+        if time.time() >= deadline:
+            print("deploylock: %s is %s" % (label, why_busy()), file=sys.stderr)
+            print("\nWait for it (--wait 600) or coordinate with that session. "
+                  "Do not bypass it: overlapping Ansible runs deploy a mixed tree.",
+                  file=sys.stderr)
+            return False
+        if not announced:
+            print("deploylock: %s busy, waiting up to %ds..." % (label, int(wait)),
+                  file=sys.stderr)
+            announced = True
+        time.sleep(POLL)
+
+
+def open_lock(path):
+    return os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+
+
+def global_busy(name):
+    def why():
+        gstate, gowner, runs, unknown = holders(name)
+        if gstate == "exclusive":
+            return "held by a global run, " + describe(gowner, lock_path(name))
+        parts = ["shared by environment runs:"]
+        for r in runs:
+            t = r.get("target") or "?"
+            parts.append("  env %s: %s" % (t, describe(r, lock_path(name, t))))
+        for k in unknown:
+            parts.append("  env %s: %s" % (k, describe({}, lock_path(name, k))))
+        return "\n".join(parts)
+    return why
+
+
+def env_busy(name, key):
+    def why():
+        return describe(read_owner(owner_path(name, key)), lock_path(name, key))
+    return why
+
+
+def whoami():
+    """The board name (person · session), so --status can say which agent it is."""
+    agent = os.environ.get("AGENT_BOARD_AGENT")
+    if agent:
+        return agent
+    try:
+        r = subprocess.run([AGENTBOARD, "whoami", "--known"], capture_output=True,
+                           text=True, timeout=5, stdin=subprocess.DEVNULL)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
     except Exception:
         pass
-    return "held by pid %s since %s%s\n    agent:   %s\n    dir:     %s\n    command: %s" % (
-        info.get("pid", "?"), since, held,
-        info.get("agent", "?"), info.get("cwd", "?"), info.get("cmd", "?"),
-    )
+    return "claude" if os.environ.get("CLAUDECODE") else "shell (%s)" % os.environ.get(
+        "USER", "?")
 
 
 def board(*args):
     """Best-effort note on the agent board; never fatal."""
     try:
-        subprocess.run([AGENTBOARD] + list(args), timeout=5,
+        subprocess.run([AGENTBOARD] + list(args), timeout=5, stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
 
-def status(name):
-    path = os.path.join(LOCKS, name + ".lock")
-    if not os.path.exists(path):
-        print("lock %r: free (never taken)" % name)
-        return 0
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        print("lock %r: free" % name)
-        return 0
-    except OSError:
-        print("lock %r: %s" % (name, describe(read_owner(name))))
-        return 1
-    finally:
-        os.close(fd)
+def write_owner(paths, info):
+    for p in paths:
+        try:
+            with open(p + ".tmp", "w") as fh:
+                json.dump(info, fh)
+            os.replace(p + ".tmp", p)
+        except Exception:
+            pass
+
+
+def take(name, keys, wait, info):
+    """Acquire in a fixed order — gate, global, then keys sorted — so two runs that
+    share keys cannot deadlock. Returns the fds to hold, or None on timeout. On
+    failure the fds are left open; the caller exits and the kernel drops them.
+
+    Each key's owner is written as soon as that key is held, so a run still queued
+    for its second key shows up as the holder of its first, not as an unknown."""
+    deadline = time.time() + wait
+    gfd = open_lock(lock_path(name))
+    gate = open_lock(gate_path(name))
+    if keys:
+        if not try_lock(gate, fcntl.LOCK_SH) and not acquire(
+                gate, fcntl.LOCK_SH, deadline, wait,
+                "%r (a global run is queued ahead)" % name, global_busy(name)):
+            return None
+        ok = acquire(gfd, fcntl.LOCK_SH, deadline, wait, repr(name), global_busy(name))
+    else:
+        if not acquire(gate, fcntl.LOCK_EX, deadline, wait,
+                       "%r (another global run is queued)" % name, global_busy(name)):
+            return None
+        ok = acquire(gfd, fcntl.LOCK_EX, deadline, wait, repr(name), global_busy(name))
+    os.close(gate)
+    if not ok:
+        return None
+    held = [gfd]
+    for k in keys:
+        fd = open_lock(lock_path(name, k))
+        held.append(fd)
+        if not acquire(fd, fcntl.LOCK_EX, deadline, wait, "%r env %s" % (name, k),
+                       env_busy(name, k)):
+            for done in keys[:keys.index(k)]:
+                try:
+                    os.unlink(owner_path(name, done))
+                except OSError:
+                    pass
+            return None
+        write_owner([owner_path(name, k)], dict(info, waiting=True))
+    return held
 
 
 def main(argv):
-    name, wait, i = "deploy", 0.0, 0
+    name, wait, force_global, explain, i = "deploy", 0.0, False, False, 0
     while i < len(argv):
         a = argv[i]
         if a == "--name":
             name = argv[i + 1]; i += 2
         elif a == "--wait":
             wait = float(argv[i + 1]); i += 2
+        elif a == "--global":
+            force_global = True; i += 1
+        elif a == "--explain":
+            explain = True; i += 1
         elif a == "--status":
-            return status(argv[i + 1] if i + 1 < len(argv) else name)
+            rest = argv[i + 1:]
+            brief = "--brief" in rest
+            rest = [r for r in rest if r != "--brief"]
+            return status(rest[0] if rest else name, brief)
         elif a in ("-h", "--help"):
             print(__doc__); return 0
         elif a == "--":
@@ -110,44 +563,46 @@ def main(argv):
         print(__doc__, file=sys.stderr)
         return 2
 
+    cwd = os.getcwd()
+    if force_global:
+        target, shared, reason = None, [], "--global"
+    else:
+        target, shared, reason = resolve(cmd, cwd)
+    keys = sorted([target] + shared) if target else []
+    if target:
+        plan = "environment lock on %s%s — %s" % (
+            target, " (shared: %s)" % ", ".join(shared) if shared else "", reason)
+    else:
+        plan = "global lock — %s" % reason
+    if explain:
+        print(plan)
+        return 0
+    print("deploylock: %s" % plan, file=sys.stderr)
+
     os.makedirs(LOCKS, exist_ok=True)
-    fd = os.open(os.path.join(LOCKS, name + ".lock"), os.O_RDWR | os.O_CREAT, 0o644)
-    deadline = time.time() + wait
-    announced = False
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except OSError:
-            if time.time() >= deadline:
-                print("deploylock: %r is %s" % (name, describe(read_owner(name))),
-                      file=sys.stderr)
-                print("\nWait for it (--wait 600) or coordinate with that session. "
-                      "Do not bypass it: overlapping Ansible runs deploy a mixed tree.",
-                      file=sys.stderr)
-                return 1
-            if not announced:
-                print("deploylock: %r busy, waiting up to %ds..." % (name, int(wait)),
-                      file=sys.stderr)
-                announced = True
-            time.sleep(2)
-
     printable = " ".join(cmd)
-    try:
-        with open(owner_path(name), "w") as fh:
-            json.dump({
-                "pid": os.getpid(),
-                "cmd": printable,
-                "cwd": os.getcwd(),
-                "agent": os.environ.get("AGENT_BOARD_AGENT")
-                         or ("claude" if os.environ.get("CLAUDECODE") else "shell"),
-                "since": datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "since_epoch": int(time.time()),
-            }, fh)
-    except Exception:
-        pass
+    info = {
+        "pid": os.getpid(),
+        "cmd": printable,
+        "cwd": cwd,
+        "agent": whoami(),
+        "mode": "env" if target else "global",
+        "target": target,
+        "keys": keys,
+        "reason": reason,
+        "since": datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "since_epoch": int(time.time()),
+    }
+    held = take(name, keys, wait, info)
+    if held is None:
+        return 1
+    info["since"] = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+    info["since_epoch"] = int(time.time())
+    owners = [owner_path(name, k) for k in keys] if target else [owner_path(name)]
+    write_owner(owners, info)
 
-    board("note", "HOLDING %s lock: %s" % (name, printable[:100]))
+    board("note", "HOLDING %s lock (%s): %s" % (
+        name, "env " + target if target else "global", printable[:100]))
     # Some parent shells hand over non-blocking stdio and ansible refuses to
     # start on it. The flag is on the shared file description, so the child
     # inherits the fix.
@@ -156,24 +611,36 @@ def main(argv):
             os.set_blocking(fd, True)
         except OSError:
             pass
+    proc = None
     try:
-        return subprocess.call(cmd)
+        # The lock fds go to the child on purpose: if this wrapper is killed while
+        # the deploy is still running, the locks stay held by the deploy until it
+        # ends. Python closes every other fd in the child by default.
+        proc = subprocess.Popen(cmd, pass_fds=held)
+        info["child"] = proc.pid
+        write_owner(owners, info)
+        return proc.wait()
     except FileNotFoundError:
         print("deploylock: no such command: %s" % cmd[0], file=sys.stderr)
         return 127
     except KeyboardInterrupt:
+        # ansible got the same SIGINT from the terminal and is shutting down;
+        # let it finish that rather than killing it mid-task.
+        if proc:
+            try:
+                proc.wait(timeout=30)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                proc.kill()
         return 130
     finally:
         board("note", "released %s lock" % name)
-        try:
-            os.unlink(owner_path(name))
-        except Exception:
-            pass
-        # flock is released by the kernel when the fd closes / the process dies.
-        # The fd is deliberately inherited by the child: if this wrapper is killed
-        # while the deploy is still running, the lock stays held by the surviving
-        # child until the deploy itself ends, which is the semantics we want.
-        os.close(fd)
+        for p in owners:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+        for fd in held:
+            os.close(fd)
 
 
 if __name__ == "__main__":
