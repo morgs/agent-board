@@ -70,7 +70,7 @@ fake_writes() {   # fake_writes <pid> <repo> <relpath>
   printf '%s\t%s\n' "$2" "$3" >> "$AGENT_BOARD_DIR/paths/$1"
 }
 
-fake_hold() { sed -i '' "s|^hold: .*|hold: $2|" "$AGENT_BOARD_DIR/sessions/$1.md"; }
+fake_hold() { sed -i.bak "s|^hold: .*|hold: $2|" "$AGENT_BOARD_DIR/sessions/$1.md"; }
 
 pass=0; fail=0
 run() {   # run <cwd> <command> <expected exit>

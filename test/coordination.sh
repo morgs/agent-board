@@ -14,6 +14,7 @@ T=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/agentboard-coord.XXXXXX")" && pwd -P)
 AGENT_BOARD_DIR="$T/board"
 AGENT_BOARD_CC_SESSIONS="$T/cc"
 mkdir -p "$AGENT_BOARD_DIR" "$AGENT_BOARD_CC_SESSIONS"
+daysago() { date -v-"$1"d +%F 2>/dev/null || date -d "-$1 days" +%F; }
 # The policies under test are configuration now, not a case statement, so the suite
 # states them itself rather than relying on whatever this machine happens to use.
 cat > "$AGENT_BOARD_DIR/workspace.local" <<'WS'
@@ -62,7 +63,7 @@ fake() {   # fake <dir> <scope> -> pid
 }
 fake_named() {   # fake_named <dir> <name> -> pid
   local p; p=$(fake "$1" '-')
-  sed -i '' "s|^name: .*|name: $2|" "$AGENT_BOARD_DIR/sessions/$p.md"
+  sed -i.bak "s|^name: .*|name: $2|" "$AGENT_BOARD_DIR/sessions/$p.md"
   printf '%s' "$p"
 }
 fake_writes() {   # fake_writes <pid> <repo> <relpath>
@@ -97,11 +98,11 @@ echo
 echo 'hold / release — the whole branch-pr protocol'
 PO=$(fake_named "$O" peer-app)
 want 'a live peer that is not changing it does not take it' 'free — branch and PR' "$(cd "$O" && "$AB" check)"
-sed -i '' "s|^hold: .*|hold: $O|" "$AGENT_BOARD_DIR/sessions/$PO.md"
+sed -i.bak "s|^hold: .*|hold: $O|" "$AGENT_BOARD_DIR/sessions/$PO.md"
 want 'a peer holding it makes the checkout TAKEN'  'TAKEN by ' "$(cd "$O" && "$AB" check)"
 want 'and says which peer'                        'peer-app (codex)' "$(cd "$O" && "$AB" check)"
 want 'and names the remedy'                        'git worktree add -b'    "$(cd "$O" && "$AB" check)"
-sed -i '' "s|^hold: .*|hold: -|" "$AGENT_BOARD_DIR/sessions/$PO.md"
+sed -i.bak "s|^hold: .*|hold: -|" "$AGENT_BOARD_DIR/sessions/$PO.md"
 want 'released, it is free again'                  'free — branch and PR'   "$(cd "$O" && "$AB" check)"
 fake_writes "$PO" "$O" addons/widgets/__init__.py
 want 'a peer with uncommitted work holds it implicitly' 'peer-app (codex)' "$(cd "$O" && "$AB" check)"
@@ -420,7 +421,7 @@ want 'same-minute wins stay chronological' 'first' "$(printf '%s' "$("$AB" wins)
 # swept on sight — it is the point of keeping a tally — so it survives until it is
 # old. The days in between are kept for `wins --all` and stay off the board.
 printf '10:00:00	someone	ancient\n'      > "$AGENT_BOARD_DIR/wins/2020-01-01.9992"
-printf '10:00:00	someone	threedaysago\n' > "$AGENT_BOARD_DIR/wins/$(date -v-3d +%F).9993"
+printf '10:00:00	someone	threedaysago\n' > "$AGENT_BOARD_DIR/wins/$(daysago 3).9993"
 "$AB" sweep >/dev/null
 wantnot 'sweep drops wins past the keep window' 'ancient' "$("$AB" wins --all)"
 want    'but keeps the ones inside it'          'threedaysago' "$("$AB" wins --all)"
@@ -463,13 +464,13 @@ printf '%s\n' "09:00:00	Aa	zebra first" "09:00:00	Aa	apple second" \
 want 'same-second wins keep their order' 'zebra first' "$(printf '%s' "$("$AB" wins)" | sed -n '2p')"
 
 # Yesterday under today, because the morning after is when it gets read out.
-printf '09:12:00\tFitzwilliam\tthe cutover landed\n' > "$AGENT_BOARD_DIR/wins/$(date -v-1d +%F).9995"
+printf '09:12:00\tFitzwilliam\tthe cutover landed\n' > "$AGENT_BOARD_DIR/wins/$(daysago 1).9995"
 b=$(cd "$D" && "$AB" board 2>&1)
 want 'yesterday gets its own section'   'yesterday ·' "$b"
 want 'with yesterday in it'             'the cutover landed' "$b"
 want 'and a count to read out'          '1 yesterday' "$b"
 want 'today is still above it'          'wins today' "$b"
-rm -f "$AGENT_BOARD_DIR/wins/$(date -v-1d +%F).9995"
+rm -f "$AGENT_BOARD_DIR/wins/$(daysago 1).9995"
 wantnot 'an empty yesterday shows nothing' 'yesterday ·' "$(cd "$D" && "$AB" board 2>&1)"
 
 echo
@@ -555,7 +556,7 @@ want 'an unbudgeted board keeps them all' 'win number 0,' "$(cd "$D" && COLUMNS=
 # Yesterday yields to today rather than competing for the room, which lands the
 # right way round on its own: at standup today is empty, so yesterday is in full.
 printf '09:12:00	Arabella	the cutover landed
-' > "$AGENT_BOARD_DIR/wins/$(date -v-1d +%F).9997"
+' > "$AGENT_BOARD_DIR/wins/$(daysago 1).9997"
 want 'a crowded pane collapses yesterday' 'agentboard wins yesterday' \
   "$(cd "$D" && AB_LINES=$((hd+10)) COLUMNS=78 "$AB" board 2>&1)"
 rm -f "$AGENT_BOARD_DIR/wins/$(date +%F).9996"
@@ -567,7 +568,7 @@ want 'which has a short form too'           'the cutover landed' "$("$AB" wins -
 # This listing stopped being a debugging aid the moment the pane started eliding:
 # it is now what the day gets read out from, so it wraps like the board does.
 printf '08:00:00\tCuthbert\t%s\n' "$(printf 'a win long enough that nobody could read it aloud from one line %s' 'and then some more words to be sure it wraps twice over')" \
-  > "$AGENT_BOARD_DIR/wins/$(date -v-1d +%F).9998"
+  > "$AGENT_BOARD_DIR/wins/$(daysago 1).9998"
 o=$(COLUMNS=78 "$AB" wins -y)
 if [ "$(printf '%s\n' "$o" | wc -l | tr -d ' ')" -gt 3 ]; then
   pass=$((pass+1)); echo "  ok    a long win is wrapped, not one line"
@@ -579,10 +580,10 @@ if [ "$(printf '%s\n' "$o" | sed 's/[^ -~]//g' | awk 'length>78' | wc -l | tr -d
 else fail=$((fail+1)); echo "  FAIL  a line ran past the width"; fi
 # "2026-09-16" is the wrong answer to "which day was that".
 want 'the day is named, not just dated'  'yesterday)' "$o"
-want 'with a weekday to place it'        "$(date -v-1d '+%a')" "$o"
+want 'with a weekday to place it'        "$(date -v-1d '+%a' 2>/dev/null || date -d '-1 day' '+%a')" "$o"
 want 'and a count for the standup'       '·' "$o"
 want '--all labels its days too'         'yesterday)' "$("$AB" wins --all)"
-rm -f "$AGENT_BOARD_DIR/wins/$(date -v-1d +%F).9998"
+rm -f "$AGENT_BOARD_DIR/wins/$(daysago 1).9998"
 
 echo
 # An agent cannot introduce itself by a name nobody told it, and the person is the

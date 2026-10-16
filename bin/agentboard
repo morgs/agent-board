@@ -95,7 +95,8 @@ mkdir -p "$SESS" "$MSGS" "$READ" "$PATHSD" "$LOCKS" "$WINS" 2>/dev/null
 now_h() { date +%Y-%m-%dT%H:%M:%S%z; }
 ago() {   # ago <iso8601> -> "4m" / "3h" / "2d", or "" if it will not parse
   local t s
-  t=$(date -j -f '%Y-%m-%dT%H:%M:%S%z' "$1" +%s 2>/dev/null) || return 0
+  t=$(date -j -f '%Y-%m-%dT%H:%M:%S%z' "$1" +%s 2>/dev/null) \
+    || t=$(date -d "$1" +%s 2>/dev/null) || return 0
   [ -n "$t" ] || return 0
   s=$(( $(date +%s) - t ))
   if   [ "$s" -lt 60 ]    ; then printf 'just now'
@@ -257,6 +258,14 @@ ini_section() {   # ini_section <file> <section> [1 = keep comments]
 }
 
 blank() { [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ]; }
+
+# BSD date (macOS) and GNU date (Linux) spell date arithmetic differently.
+days_ago() {   # days_ago <n> -> YYYY-MM-DD, n days before today
+  date -v-"$1"d +%F 2>/dev/null || date -d "-$1 days" +%F 2>/dev/null
+}
+day_fmt() {   # day_fmt <YYYY-MM-DD> <format>
+  date -j -f '%Y-%m-%d' "$1" "$2" 2>/dev/null || date -d "$1" "$2" 2>/dev/null
+}
 
 # A pack is only usable if it has both halves. An incomplete one is still listed —
 # so it can be fixed rather than silently ignored — but is never selectable, which
@@ -1720,9 +1729,9 @@ wins_for() {   # wins_for [YYYY-MM-DD] -> "HH:MM:SS<TAB>who<TAB>what", oldest fi
 # what you pass back to the command — but it is the weekday that makes it land.
 day_label() {   # day_label <YYYY-MM-DD> -> "Wed 16 Sep (yesterday)"
   local d=$1 lbl pretty
-  pretty=$(date -j -f '%Y-%m-%d' "$d" '+%a %-d %b' 2>/dev/null) || pretty="$d"
+  pretty=$(day_fmt "$d" '+%a %-d %b') || pretty="$d"
   if [ "$d" = "$(date +%F)" ]; then lbl=" (today)"
-  elif [ "$d" = "$(date -v-1d +%F 2>/dev/null)" ]; then lbl=" (yesterday)"
+  elif [ "$d" = "$(days_ago 1)" ]; then lbl=" (yesterday)"
   else lbl=""; fi
   printf '%s%s' "$pretty" "$lbl"
 }
@@ -2115,7 +2124,7 @@ cmd_wins() {
         printf '\n'
       done
       return 0 ;;
-    yesterday|-y) d=$(date -v-1d +%F 2>/dev/null) || d=$(date +%F) ;;
+    yesterday|-y) d=$(days_ago 1) || d=$(date +%F) ;;
     today) d=$(date +%F) ;;
     '') d=$(date +%F) ;;
   esac
@@ -2260,7 +2269,7 @@ nlines() { [ -n "$1" ] || { printf '0'; return 0; }; printf '%s\n' "$1" | wc -l 
 wins_panel() {   # wins_panel [line budget; 0 or empty = no limit]
   local budget=${1:-0} lim=0 avail fixed n y yn ysum=0 today tl keep kept dropped used ylines yl
   n=$(wins_for | grep -c . || true)
-  y=$(date -v-1d +%F 2>/dev/null) || y=""
+  y=$(days_ago 1) || y=""
   yn=0; [ -n "$y" ] && yn=$(wins_for "$y" | grep -c . || true)
   [ "$budget" -gt 0 ] && lim=1
 
@@ -2456,7 +2465,7 @@ cmd_sweep() {
   # Wins outlive the sessions that logged them — that is the point of a tally —
   # but only for a few days. The board shows today; the rest is for looking back
   # at the weekly review, and after that it is clutter nobody reads.
-  local cutoff; cutoff=$(date -v-"${WIN_KEEP_DAYS}"d +%F 2>/dev/null) || cutoff=""
+  local cutoff; cutoff=$(days_ago "$WIN_KEEP_DAYS") || cutoff=""
   if [ -n "$cutoff" ]; then
     for f in "$WINS"/*.*; do
       [ -e "$f" ] || continue

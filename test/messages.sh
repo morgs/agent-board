@@ -173,7 +173,7 @@ out=$("$AB" tell dozing 'wake up again' 2>&1)
 has 'falls back to SendMessage form' "$out" 'SendMessage({to: "dozing"'
 has 'and says to poke, not duplicate' "$out" 'the board already holds the text'
 # a busy target needs no poke
-sed -i '' 's/"status":"idle"/"status":"busy"/' "$STUBJSON"
+sed -i.bak 's/"status":"idle"/"status":"busy"/' "$STUBJSON"
 out=$("$AB" tell dozing 'no poke needed' 2>&1)
 has 'busy target is not poked' "$out" 'end of its current turn'
 rm -f "$STUBJSON"
