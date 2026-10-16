@@ -697,6 +697,15 @@ want 'to the new one'                  'comms check' "$tm"
 n_before=$(ls "$AGENT_BOARD_DIR/sessions" | wc -l | tr -d ' ')
 want 'help explains what a switch does' 'renames every live agent' "$("$AB" theme --help)"
 want 'and asking registers nobody' "$n_before" "$(ls "$AGENT_BOARD_DIR/sessions" | wc -l | tr -d ' ')"
+# A pin holds a role's person across restarts, outside the theme's pool.
+myname=$(sed -n 's/^name: //p' "$mine")
+printf '# role pins\n%s = Bertie-Pinned\n' "$myname" > "$AGENT_BOARD_DIR/persons.local"
+"$AB" heartbeat
+want 'a pinned session takes its person'      'Bertie-Pinned' "$(person_now)"
+"$AB" heartbeat
+want 'and keeps it, though not in the pool'   'Bertie-Pinned' "$(person_now)"
+rm -f "$AGENT_BOARD_DIR/persons.local"; "$AB" heartbeat
+want 'unpinned, it is drawn from the pool again' 'yes' "$(in_pool "$(person_now)" "$WODE")"
 
 # A local pack is the escape hatch from our taste in names, so it has to work
 # without touching the shipped file: written to disk, selectable, and overriding a

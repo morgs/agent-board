@@ -65,6 +65,7 @@ MIT — see [`LICENSE`](./LICENSE).
       locks/              the deploy lock, and the vault lease
       theme               one line: which pack of names this machine uses
       themes.local/       packs written here — gitignored, override the shipped ones
+      persons.local       session names pinned to a person — gitignored
       workspace.local     which repos here are worked which way — gitignored
       machines.local      the other machines this board talks to — gitignored
       remote/<label>/     each peer's board as last synced — rewritten, never edited
@@ -418,6 +419,16 @@ them — the tally is a record of what happened, not of who is here now. The set
 is one line in `$AGENT_BOARD_DIR/theme`, machine-local like the rest; an unknown
 value reads as the default rather than failing, so a typo cannot stop sessions
 registering.
+
+**A role can keep its person.** A long-running session that is restarted now and then
+— a nightly sweep, an assistant you address by name — would draw a new person each
+time. `$AGENT_BOARD_DIR/persons.local` pins one, by session name, one per line:
+
+    nightly-sweep = Friday
+
+The pinned person need not be in the theme, nobody else is drawn it, and if another
+live session already has it the pin waits rather than making two. It is
+machine-local and gitignored, like the theme.
 
 **A pack does not have to be one we ship.** `agentboard theme --new <name>` writes a
 skeleton to `$AGENT_BOARD_DIR/themes.local/<name>.theme`, which is gitignored — so

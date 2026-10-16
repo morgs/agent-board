@@ -377,12 +377,34 @@ person_taken() {   # among live sessions only — a retired person is free to re
   return 1
 }
 
+# A pin keeps a long-running role's person across restarts: a session named
+# "nightly-sweep" is always the same person, wherever the theme's draw would land.
+# One "<session name> = <person>" per line in persons.local, machine-local like the
+# theme. A pinned person need not be in the theme, and nobody else draws it.
+PERSONS_FILE="$BOARD/persons.local"
+pinned_person() {   # pinned_person <session name> -> its person, or nothing
+  [ -n "$1" ] && [ -f "$PERSONS_FILE" ] || return 0
+  awk -v n="$1" '
+    /^[[:space:]]*(#|$)/ { next }
+    { i = index($0, "="); if (!i) next
+      k = substr($0, 1, i-1); v = substr($0, i+1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      if (k == n && v != "") { print v; exit } }' "$PERSONS_FILE"
+}
+is_pinned_person() {   # is_pinned_person <person>
+  [ -f "$PERSONS_FILE" ] || return 1
+  awk -v p="$1" '/^[[:space:]]*(#|$)/ { next }
+    { i = index($0, "="); if (!i) next; v = substr($0, i+1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); if (v == p) f = 1 }
+    END { exit !f }' "$PERSONS_FILE"
+}
+
 auto_person() {   # auto_person <pid> -> a person no live session is using
   local pid=$1 i=0 cand
   local -a P=($(person_pool))
   while [ "$i" -lt 96 ]; do
     cand="${P[$(( ( ${pid:-0} / 7 + i ) % ${#P[@]} ))]}"
-    person_taken "$cand" || { printf '%s' "$cand"; return 0; }
+    is_pinned_person "$cand" || person_taken "$cand" || { printf '%s' "$cand"; return 0; }
     i=$((i+1))
   done
   printf 'Anon'
@@ -467,8 +489,10 @@ touch_updated() {
     # written only by its own agent, so everyone re-names on their own next hook
     # event. Nothing has to reach into anyone else's file, and nothing is left
     # half-renamed if a session dies mid-switch.
-    local person; person=$(person_of "$1")
-    if [ -z "$person" ] || ! person_in_theme "$person"; then
+    local person pin; person=$(person_of "$1"); pin=$(pinned_person "$(name_of "$1")")
+    if [ -n "$pin" ] && [ "$person" != "$pin" ] && ! person_taken "$pin"; then
+      set_field "$1" person "$pin"
+    elif [ -z "$person" ] || { [ "$person" != "$pin" ] && ! person_in_theme "$person"; }; then
       set_field "$1" person "$(auto_person "$pid")"
     fi
     status=$(cc_meta "$pid" status) && [ -n "$status" ] && set_field "$1" state "$status"
