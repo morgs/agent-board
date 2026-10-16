@@ -10,6 +10,7 @@ not meant to be run by hand, except `conf` to see what it read.
   agentboard-peer export               this board as JSON, on stdout
   agentboard-peer import --origin L    a peer's export, on stdin, into remote/L/
   agentboard-peer relay [--once]       pull from and push to every peer, forever
+  agentboard-peer hub-env take|free|sync ...   a dev env lease, on the hub
 
 Nothing here runs unless $AGENT_BOARD_DIR/machines.local exists. Its format:
 
@@ -320,6 +321,70 @@ def remote_cmd(peer, *argv):
         qb, qb, " ".join(shlex.quote(a) for a in argv))
 
 
+def remote_ab(peer, *argv):
+    b = peer["board"]
+    qb = '"$HOME"/' + shlex.quote(b[2:]) if b.startswith("~/") else shlex.quote(b)
+    return "AGENT_BOARD_DIR=%s %s/bin/agentboard %s" % (
+        qb, qb, " ".join(shlex.quote(a) for a in argv))
+
+
+def find_hub(c):
+    hubs = [p for p in c["peers"] if p["hub"]]
+    if len(hubs) > 1:
+        die("machines.local names more than one hub")
+    if hubs and not hubs[0].get("ssh"):
+        die("the hub %s has no ssh target" % hubs[0]["label"])
+    return hubs[0] if hubs else None
+
+
+def hub_sync_argv(c):
+    """Renew every lease this machine holds on the hub; the hub drops the rest."""
+    me = c["local"]["label"]
+    env = dict(os.environ, AGENT_BOARD_DIR=BOARD)
+    p = subprocess.run([AGENTBOARD, "_env_hubbed"], env=env, capture_output=True,
+                       text=True, timeout=30, stdin=subprocess.DEVNULL)
+    keep = []
+    for line in p.stdout.splitlines():
+        f = line.split("\t")
+        if len(f) == 2 and f[1].isdigit():
+            keep.append("%s=%s:%s" % (f[0], me, f[1]))
+    return ["_env_hub", "sync", me, str(c["relay"]["lease"])] + keep
+
+
+def cmd_hub_env(args):
+    """take <name> <pid> <who> <for> | free <name> <pid> | sync.
+    Exit 0 done, 1 held by someone else (their record on stdout), 3 hub unreachable."""
+    try:
+        c = need_conf()
+        hub = find_hub(c)
+    except SystemExit:   # a config that cannot be read is not "held by someone"
+        sys.exit(3)
+    if not hub:
+        return
+    me = c["local"]["label"]
+    sub = args[0] if args else ""
+    if sub == "take" and len(args) >= 5:
+        argv = ["_env_hub", "take", args[1], "%s:%s" % (me, args[2]),
+                "%s@%s" % (args[3], me), str(c["relay"]["lease"]), args[4]]
+    elif sub == "free" and len(args) >= 3:
+        argv = ["_env_hub", "free", args[1], "%s:%s" % (me, args[2])]
+    elif sub == "sync":
+        argv = hub_sync_argv(c)
+    else:
+        die("usage: agentboard-peer hub-env take <name> <pid> <who> <for> | free <name> <pid> | sync")
+    try:
+        r = subprocess.run(ssh_base(hub) + [remote_ab(hub, *argv)], capture_output=True,
+                           text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print("ssh to %s: %s" % (hub["label"], e), file=sys.stderr)
+        sys.exit(3)
+    sys.stdout.write(r.stdout)
+    if r.returncode in (0, 1):
+        sys.exit(r.returncode)
+    print(last_line(r.stderr) or "ssh exit %d" % r.returncode, file=sys.stderr)
+    sys.exit(3)
+
+
 def status_write(label, **kv):
     d = os.path.join(REMOTE, label)
     os.makedirs(d, exist_ok=True)
@@ -361,6 +426,13 @@ def sync_one(c, peer):
         if push.returncode != 0:
             raise RuntimeError("push failed (rc %d): %s" % (
                 push.returncode, last_line(push.stderr)))
+        if peer["hub"]:
+            ren = subprocess.run(base + [remote_ab(peer, *hub_sync_argv(c))],
+                                 capture_output=True, text=True, timeout=60,
+                                 stdin=subprocess.DEVNULL)
+            if ren.returncode != 0:
+                raise RuntimeError("lease renewal failed (rc %d): %s" % (
+                    ren.returncode, last_line(ren.stderr)))
         status_write(lab, last_ok=int(time.time()), error="")
         return "%s ok — %s | %s" % (lab, imp.stdout.strip(), push.stdout.strip())
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
@@ -397,7 +469,7 @@ def main():
         return
     cmd, args = sys.argv[1], sys.argv[2:]
     fn = {"conf": cmd_conf, "export": cmd_export, "import": cmd_import,
-          "relay": cmd_relay}.get(cmd)
+          "relay": cmd_relay, "hub-env": cmd_hub_env}.get(cmd)
     if not fn:
         die("unknown command %s" % cmd, 2)
     fn(args)

@@ -213,6 +213,125 @@ out=$(ab "$B" relay --once 2>&1); rc=$?
 check 'a board that reaches no peer has nothing to relay' "$rc" 1
 
 echo
+echo 'a deploy on the peer holds the hub too'
+dl() { AGENT_BOARD_DIR="$1" AGENT_BOARD_AGENT="$2" "$1/bin/deploylock" "${@:3}"; }
+until_gone() { for _ in $(seq 100); do [ -e "$1" ] || return 0; sleep 0.1; done; return 1; }
+until_there() { for _ in $(seq 100); do [ -e "$1" ] && return 0; sleep 0.1; done; return 1; }
+dl "$A" lamp sleep 3 >/dev/null 2>&1 & ja=$!
+until_there "$B/locks/deploy.owner"
+out=$(dl "$B" anvil true 2>&1); rc=$?
+check 'a run on the hub is refused while the peer deploys' "$rc" 1
+has   'and names the holder with its machine' "$out" 'lamp@alpha'
+has   'the peer status shows the hub'  "$(dl "$A" lamp --status 2>&1)" 'on the hub beta'
+wait "$ja"; check 'the peer run itself succeeded' "$?" 0
+until_gone "$B/locks/deploy.owner"
+out=$(dl "$B" anvil true 2>&1); rc=$?
+check 'when it ends, the hub is free' "$rc" 0
+
+dl "$B" anvil sleep 3 >/dev/null 2>&1 & jb=$!
+until_there "$B/locks/deploy.owner"
+rm -f "$T/ran"
+out=$(dl "$A" lamp touch "$T/ran" 2>&1); rc=$?
+check 'a run on the peer is refused while the hub deploys' "$rc" 1
+has   'and says the hub holds it' "$out" 'held on the hub beta'
+[ -e "$T/ran" ] && bad 'the refused command ran anyway' || ok 'and the command did not run'
+out=$(dl "$A" lamp true 2>&1); rc=$?
+check 'the refusal left no local lock behind' "$(dl "$A" lamp --status --brief >/dev/null 2>&1; echo $?)" 0
+wait "$jb"
+
+# The wrapper dies, the deploy does not: the deploy keeps both locks.
+dl "$A" lamp sleep 2 >/dev/null 2>&1 & ja=$!
+until_there "$B/locks/deploy.owner"
+kill -9 "$ja"; wait "$ja" 2>/dev/null
+out=$(dl "$B" anvil true 2>&1); rc=$?
+check 'a killed wrapper leaves the hub held by its deploy' "$rc" 1
+for _ in $(seq 60); do dl "$B" anvil true >/dev/null 2>&1 && break; sleep 0.1; done
+check 'and the deploy ending frees it' "$(dl "$B" anvil true >/dev/null 2>&1; echo $?)" 0
+
+# A dropped link: the hub's side of the session ends.
+dl "$A" lamp sleep 3 >/dev/null 2>&1 & ja=$!
+until_there "$B/locks/deploy.owner"
+hp=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$B/locks/deploy.owner")
+kill "$hp"
+until_gone "$B/locks/deploy.owner"
+out=$(dl "$B" anvil true 2>&1); rc=$?
+check 'a dropped link frees the hub' "$rc" 0
+wait "$ja"
+
+rm -f "$T/ran"
+out=$(AGENT_BOARD_SSH="$T/stub/ssh-down" dl "$A" lamp touch "$T/ran" 2>&1); rc=$?
+check 'an unreachable hub fails closed' "$rc" 1
+has   'and says so' "$out" 'could not be reached'
+[ -e "$T/ran" ] && bad 'the command ran with no hub' || ok 'and the command did not run'
+out=$(AGENT_BOARD_OVERRIDE=1 AGENT_BOARD_SSH="$T/stub/ssh-down" dl "$A" lamp touch "$T/ran" 2>&1); rc=$?
+check 'AGENT_BOARD_OVERRIDE=1 skips the hub' "$rc" 0
+cp "$A/machines.local" "$T/m.bak"; printf '[local]\nlabel = Not A Label\n' > "$A/machines.local"
+out=$(dl "$A" lamp true 2>&1); rc=$?
+check 'a machines.local that cannot be read fails closed' "$rc" 1
+cp "$T/m.bak" "$A/machines.local"
+
+echo
+echo 'a dev env lease taken on the peer is taken on the hub'
+# The test script itself is the caller's session on both boards, so leases live
+# exactly as long as this run.
+ab "$A" claim --pid $$ --agent codex --cwd "$T" --name tester >/dev/null
+ab "$B" claim --pid $$ --agent codex --cwd "$T" --name local >/dev/null
+lease() { printf '%s/locks/env/%s.lease/owner' "$1" "$2"; }
+out=$(cd "$T" && ab "$A" env take sandbox --for 'overlay test' 2>&1); rc=$?
+check 'the peer takes a box'               "$rc" 0
+has   'and the hub records it for the peer' "$(cat "$(lease "$B" sandbox)" 2>/dev/null)" "pid: alpha:$$"
+has   'with an expiry'                      "$(cat "$(lease "$B" sandbox)" 2>/dev/null)" 'expires: '
+has   'the local copy knows the hub has it' "$(cat "$(lease "$A" sandbox)" 2>/dev/null)" 'hub: beta'
+out=$(cd "$T" && ab "$B" env take sandbox 2>&1); rc=$?
+check 'the hub refuses it to a local agent' "$rc" 1
+has   'and names the peer holder'           "$out" 'tester@alpha'
+
+out=$(cd "$T" && ab "$B" env take testbed --for 'hub side' 2>&1)
+out=$(cd "$T" && ab "$A" env take testbed 2>&1); rc=$?
+check 'the peer cannot take a box the hub holds' "$rc" 1
+has   'and is told where it is held'      "$out" 'IN USE on beta'
+[ -e "$(lease "$A" testbed)" ] && bad 'a refused take left a local lease' || ok 'and keeps no local lease'
+relay >/dev/null 2>&1
+out=$(ab "$A" env status 2>&1)
+has   'the peer sees the hub lease after a sync' "$out" 'testbed'
+check 'and its own lease once, not twice' "$(printf '%s\n' "$out" | grep -c sandbox)" 1
+payload=$(printf '{"cwd":"%s","tool_name":"Bash","tool_input":{"command":"deploylock ansible-playbook refresh.yml -l testbed"}}' "$T")
+printf '%s' "$payload" | (cd "$T" && AGENT_BOARD_DIR="$A" "$AB" hook-pretool) >/dev/null 2>&1; rc=$?
+check 'the peer gate stops a playbook against the hub-held box' "$rc" 2
+
+# Renewal: the relay keeps a live peer lease from expiring.
+sed -i.bak "s/^expires: .*/expires: $(( $(date +%s) + 5 ))/" "$(lease "$B" sandbox)"
+relay >/dev/null 2>&1
+exp=$(sed -n 's/^expires: //p' "$(lease "$B" sandbox)")
+[ "${exp:-0}" -gt $(( $(date +%s) + 100 )) ] && ok 'each sync renews the peer lease' || bad "not renewed: expires $exp"
+
+out=$(cd "$T" && ab "$A" env free sandbox 2>&1)
+[ -e "$(lease "$B" sandbox)" ] && bad 'free left the hub lease' || ok 'free on the peer frees the hub'
+
+# The peer session dies: the next sync drops its lease on the hub.
+(cd "$T" && ab "$A" env take sandbox >/dev/null 2>&1)
+sed -i.bak "s/^pid: .*/pid: 999999/" "$(lease "$A" sandbox)"
+sed -i.bak "s/^taken: .*/taken: 1/" "$(lease "$B" sandbox)"
+relay >/dev/null 2>&1
+[ -e "$(lease "$B" sandbox)" ] && bad 'a dead peer session kept its hub lease' || ok 'a dead peer session loses its hub lease at the next sync'
+
+# The peer goes quiet: the lease expires on the hub with no one renewing it.
+(cd "$T" && ab "$A" env take sandbox >/dev/null 2>&1)
+sed -i.bak "s/^expires: .*/expires: $(( $(date +%s) - 1 ))/" "$(lease "$B" sandbox)"
+out=$(cd "$T" && ab "$B" env take sandbox 2>&1); rc=$?
+check 'an unrenewed peer lease expires on the hub' "$rc" 0
+(cd "$T" && ab "$B" env free sandbox >/dev/null 2>&1); rm -rf "$A/locks/env/sandbox.lease"
+
+out=$(cd "$T" && AGENT_BOARD_SSH="$T/stub/ssh-down" ab "$A" env take sandbox 2>&1); rc=$?
+check 'an unreachable hub refuses the lease' "$rc" 1
+has   'and says why' "$out" 'could not be reached'
+[ -e "$(lease "$A" sandbox)" ] && bad 'and left a local lease' || ok 'and keeps no local lease'
+out=$(cd "$T" && AGENT_BOARD_OVERRIDE=1 AGENT_BOARD_SSH="$T/stub/ssh-down" ab "$A" env take sandbox 2>&1); rc=$?
+check 'AGENT_BOARD_OVERRIDE=1 takes it here only' "$rc" 0
+(cd "$T" && ab "$A" env free sandbox >/dev/null 2>&1)
+(cd "$T" && ab "$B" env free testbed >/dev/null 2>&1)
+
+echo
 echo 'with no machines.local, the board is on its own'
 mv "$A/machines.local" "$A/machines.off"
 out=$(ab "$A" list 2>&1)

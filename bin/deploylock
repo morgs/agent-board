@@ -51,6 +51,16 @@ killed. There is no such thing as a stale lock here.
     deploylock --status [--brief]
     deploylock --name prod ansible-playbook ...         # independent lock family
 
+Across machines. When machines.local names a peer as the hub (see agentboard-peer),
+a run here takes its locks here first and then the same locks on the hub, over ssh,
+and starts only when both are held. The hub side is `deploylock --hold`: it holds
+until its stdin closes, which happens when the run ends, the wrapper dies or the
+connection drops. If the hub cannot be reached the run fails closed;
+AGENT_BOARD_OVERRIDE=1 skips the hub, and is for after you have agreed it is safe.
+On the hub itself, or with no machines.local, nothing changes.
+
+    deploylock --hold [--name N] [--wait S] [--keys a,b]  # hub side; info on stdin
+
 Not the right tool for a vault edit. `flock` dies with the process, and a
 decrypt -> edit -> re-encrypt -> commit cycle spans several separate commands with
 no process outliving them, so there is nothing for a kernel lock to live on. That
@@ -61,7 +71,10 @@ import glob
 import json
 import os
 import re
+import select
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -70,6 +83,7 @@ from datetime import datetime
 BOARD = os.environ.get("AGENT_BOARD_DIR", os.path.expanduser("~/agent-board"))
 LOCKS = os.path.join(BOARD, "locks")
 AGENTBOARD = os.path.join(BOARD, "bin", "agentboard")
+PEERCMD = os.path.join(BOARD, "bin", "agentboard-peer")
 
 LOCAL = {"localhost", "127.0.0.1", "::1"}
 # ansible-playbook options that consume the next argument, so it is not mistaken
@@ -542,8 +556,145 @@ def take(name, keys, wait, info):
     return held
 
 
+# ---------------------------------------------------------------- the hub, across machines
+
+def hub_peer():
+    """-> (hub peer, this machine's label), or (None, None) when there is no hub to
+    ask: no machines.local, or this machine is the hub. A config that cannot be
+    read raises, so a typo fails closed rather than quietly skipping the hub."""
+    if not os.path.exists(os.path.join(BOARD, "machines.local")):
+        return None, None
+    try:
+        r = subprocess.run([PEERCMD, "conf"], capture_output=True, text=True,
+                           timeout=10, stdin=subprocess.DEVNULL)
+        c = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        c = None
+    if not c:
+        raise RuntimeError("machines.local could not be read (agentboard-peer conf)")
+    hubs = [p for p in c.get("peers", []) if p.get("hub")]
+    if not hubs:
+        return None, None
+    if len(hubs) > 1:
+        raise RuntimeError("machines.local names more than one hub")
+    if not hubs[0].get("ssh"):
+        raise RuntimeError("the hub %s has no ssh target" % hubs[0]["label"])
+    return hubs[0], c["local"]["label"]
+
+
+def hub_ssh(hub, *argv):
+    ssh = os.environ.get("AGENT_BOARD_SSH", "ssh")
+    cp = os.path.join(os.path.expanduser("~/.ssh"), "ab-%C")
+    b = hub.get("board") or "~/agent-board"
+    qb = '"$HOME"/' + shlex.quote(b[2:]) if b.startswith("~/") else shlex.quote(b)
+    remote = "AGENT_BOARD_DIR=%s %s/bin/deploylock %s" % (
+        qb, qb, " ".join(shlex.quote(a) for a in argv))
+    # ServerAlive: a dead link ends the session, and with it the hub's hold.
+    return [ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+            "-o", "ControlMaster=auto", "-o", "ControlPath=" + cp,
+            "-o", "ControlPersist=120", hub["ssh"], remote]
+
+
+def hold_on_hub(hub, me, name, keys, wait, info):
+    """Take the same locks on the hub. -> (process holding them, None) or (None, why).
+    The process's stdin is the hold: closing it, or dying, releases the hub."""
+    argv = ["--hold", "--name", name, "--wait", str(int(max(wait, 0)))]
+    if keys:
+        argv += ["--keys", ",".join(keys)]
+    try:
+        proc = subprocess.Popen(hub_ssh(hub, *argv), stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE)
+    except OSError as e:
+        return None, "could not run ssh (%s)" % e
+    # The owner record goes on stdin, not in argv, so the hub's process list shows
+    # no command line of ours.
+    sent = dict(info, agent="%s@%s" % (info.get("agent", "?"), me), origin=me,
+                cmd=info.get("cmd", "")[:200])
+    try:
+        proc.stdin.write((json.dumps(sent) + "\n").encode())
+        proc.stdin.flush()
+        ready, _, _ = select.select([proc.stdout], [], [], max(wait, 0) + 30)
+        line = proc.stdout.readline().decode(errors="replace").strip() if ready else ""
+    except OSError:
+        line = ""
+    if line == "HELD":
+        return proc, None
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    rc = proc.wait()
+    if rc == 1:
+        return None, "the same lock is held on the hub %s (above)" % hub["label"]
+    return None, "the hub %s could not be reached (ssh exit %s)" % (hub["label"], rc)
+
+
+def hold(name, keys, wait):
+    """Hub side of a run on another machine: take the locks, say HELD, and keep them
+    until stdin closes."""
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, lambda *_: sys.exit(0))
+    line = sys.stdin.readline()
+    try:
+        info = json.loads(line) if line.strip() else {}
+    except ValueError:
+        info = {}
+    info.pop("child", None)
+    info.update(pid=os.getpid(), mode="env" if keys else "global", keys=keys,
+                since=datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
+                since_epoch=int(time.time()))
+    if not keys:
+        info["target"] = None
+    elif info.get("target") not in keys:
+        info["target"] = keys[0]
+    os.makedirs(LOCKS, exist_ok=True)
+    held = take(name, keys, wait, info)
+    if held is None:
+        return 1
+    owners = [owner_path(name, k) for k in keys] if keys else [owner_path(name)]
+    write_owner(owners, info)
+    try:
+        sys.stdout.write("HELD\n")
+        sys.stdout.flush()
+        while sys.stdin.buffer.read(4096):
+            pass
+    except (OSError, KeyboardInterrupt):
+        pass
+    finally:
+        for p in owners:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        for fd in held:
+            os.close(fd)
+    return 0
+
+
+def hub_status(name):
+    try:
+        hub, _ = hub_peer()
+    except RuntimeError as e:
+        print("hub: %s" % e)
+        return
+    if not hub:
+        return
+    try:
+        r = subprocess.run(hub_ssh(hub, "--status", name), capture_output=True,
+                           text=True, timeout=20, stdin=subprocess.DEVNULL)
+        out = r.stdout.strip() if r.returncode in (0, 1) else \
+            "could not be reached (ssh exit %d)" % r.returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        out = "could not be reached (%s)" % e
+    print("on the hub %s:" % hub["label"])
+    for l in out.splitlines():
+        print("  " + l)
+
+
 def main(argv):
     name, wait, force_global, explain, i = "deploy", 0.0, False, False, 0
+    holding, hold_keys = False, []
     while i < len(argv):
         a = argv[i]
         if a == "--name":
@@ -554,17 +705,26 @@ def main(argv):
             force_global = True; i += 1
         elif a == "--explain":
             explain = True; i += 1
+        elif a == "--hold":
+            holding = True; i += 1
+        elif a == "--keys":
+            hold_keys = sorted(k for k in argv[i + 1].split(",") if k); i += 2
         elif a == "--status":
             rest = argv[i + 1:]
             brief = "--brief" in rest
             rest = [r for r in rest if r != "--brief"]
-            return status(rest[0] if rest else name, brief)
+            rc = status(rest[0] if rest else name, brief)
+            if not brief:   # --brief feeds the board, which must never wait on ssh
+                hub_status(rest[0] if rest else name)
+            return rc
         elif a in ("-h", "--help"):
             print(__doc__); return 0
         elif a == "--":
             i += 1; break
         else:
             break
+    if holding:
+        return hold(name, hold_keys, wait)
     cmd = argv[i:]
     if not cmd:
         print(__doc__, file=sys.stderr)
@@ -600,9 +760,28 @@ def main(argv):
         "since": datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
         "since_epoch": int(time.time()),
     }
+    start = time.time()
     held = take(name, keys, wait, info)
     if held is None:
         return 1
+    hub_proc = None
+    if os.environ.get("AGENT_BOARD_OVERRIDE") == "1":
+        print("deploylock: AGENT_BOARD_OVERRIDE=1 — not asking the hub", file=sys.stderr)
+    else:
+        try:
+            hub, me = hub_peer()
+        except RuntimeError as e:
+            hub, me, why = None, None, str(e)
+        else:
+            why = None
+        if hub:
+            hub_proc, why = hold_on_hub(hub, me, name, keys,
+                                        wait - (time.time() - start), info)
+        if why:
+            print("deploylock: not deploying — %s.\nA run on another machine could "
+                  "overlap this one. AGENT_BOARD_OVERRIDE=1 skips the hub, once you "
+                  "have agreed that is safe." % why, file=sys.stderr)
+            return 1
     info["since"] = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
     info["since_epoch"] = int(time.time())
     owners = [owner_path(name, k) for k in keys] if target else [owner_path(name)]
@@ -623,7 +802,9 @@ def main(argv):
         # The lock fds go to the child on purpose: if this wrapper is killed while
         # the deploy is still running, the locks stay held by the deploy until it
         # ends. Python closes every other fd in the child by default.
-        proc = subprocess.Popen(cmd, pass_fds=held)
+        # The hub's hold goes along too, so the hub stays locked while the deploy runs.
+        keep = held + ([hub_proc.stdin.fileno()] if hub_proc else [])
+        proc = subprocess.Popen(cmd, pass_fds=keep)
         info["child"] = proc.pid
         write_owner(owners, info)
         return proc.wait()
@@ -648,6 +829,12 @@ def main(argv):
                 pass
         for fd in held:
             os.close(fd)
+        if hub_proc:
+            try:
+                hub_proc.stdin.close()
+                hub_proc.wait(timeout=15)
+            except (OSError, subprocess.TimeoutExpired):
+                hub_proc.kill()
 
 
 if __name__ == "__main__":

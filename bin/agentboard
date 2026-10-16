@@ -759,11 +759,21 @@ env_ok_name() {   # a name that is safe as a path segment and as a word in a reg
 env_owner() {   # env_owner <name> -> owner record of a LIVE lease, else clears it
   local d; d=$(env_dir "$1")
   [ -d "$d" ] || return 1
-  local pid; pid=$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)
-  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-    rm -rf "$d" 2>/dev/null
-    return 1
-  fi
+  local pid exp; pid=$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)
+  case "$pid" in
+    *:*)   # held here for a peer, whose pid this machine cannot see: it lives
+           # while the peer's relay keeps renewing it
+      exp=$(sed -n 's/^expires: //p' "$d/owner" 2>/dev/null | head -1 | tr -dc 0-9)
+      if [ -z "$exp" ] || [ "$exp" -le "$(now_e)" ]; then
+        rm -rf "$d" 2>/dev/null
+        return 1
+      fi ;;
+    *)
+      if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        rm -rf "$d" 2>/dev/null
+        return 1
+      fi ;;
+  esac
   cat "$d/owner" 2>/dev/null
 }
 
@@ -775,7 +785,7 @@ env_i_hold() {   # env_i_hold <name>
   [ -n "$mypid" ] && [ "$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)" = "$mypid" ]
 }
 
-env_live() {   # -> "name<TAB>pid<TAB>holder<TAB>purpose<TAB>since" per live lease
+env_live_local() {   # -> "name<TAB>pid<TAB>holder<TAB>purpose<TAB>since" per live lease
   local d n rec pid who what since
   [ -d "$ENVLEASES" ] || return 0
   for d in "$ENVLEASES"/*.lease; do
@@ -788,6 +798,25 @@ env_live() {   # -> "name<TAB>pid<TAB>holder<TAB>purpose<TAB>since" per live lea
     since=$(printf '%s' "$rec" | sed -n 's/^since: //p' | head -1)
     printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$pid" "${who:--}" "${what:--}" "${since:--}"
   done
+}
+
+env_live() { env_live_local; env_hub_live; }
+
+env_hub_live() {   # the hub's leases, from its mirror — read only, never over ssh
+  local hub me n pid who what since
+  hub=$(hub_label); [ -n "$hub" ] || return 0
+  peer_fresh "$hub" && [ -f "$REMOTED/$hub/envs.tsv" ] || return 0
+  me=$(local_label)
+  while IFS=$'\t' read -r n pid who what since; do
+    [ -n "$n" ] || continue
+    [ -d "$(env_dir "$n")" ] && continue      # ours, or held here: the local record wins
+    case "$pid" in
+      "$me":*) continue ;;                    # ours, already listed from the local copy
+      *:*)     ;;
+      *)       pid="$hub:$pid"; who="$who@$hub" ;;
+    esac
+    printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$pid" "${who:--}" "${what:--}" "${since:--}"
+  done < "$REMOTED/$hub/envs.tsv"
 }
 
 env_free_mine() {   # every lease this session holds — called on session end
@@ -925,6 +954,107 @@ the next read. `agentboard env status` says who is testing where.
 EOF
 }
 
+# A lease taken on a machine that is not the hub is taken on the hub as well, over
+# ssh, and only counts once the hub agrees: two machines testing on one box is the
+# whole failure this prevents. The local copy carries `hub:` so the relay renews it
+# while this session lives. A hook never calls these — they may wait on the network.
+env_take_on_hub() {   # env_take_on_hub <name> <pid> <who> <for>
+  local hub out rc
+  hub=$(hub_label); [ -n "$hub" ] || return 0
+  if [ -n "${AGENT_BOARD_OVERRIDE:-}" ]; then
+    printf 'AGENT_BOARD_OVERRIDE is set — %s is leased here only, not on %s.\n' "$1" "$hub" >&2
+    return 0
+  fi
+  out=$("$PEERCMD" hub-env take "$1" "$2" "$3" "$4" 2>&1); rc=$?
+  if [ "$rc" = 0 ]; then
+    printf 'hub: %s\n' "$hub" >> "$(env_dir "$1")/owner"
+    return 0
+  fi
+  if [ "$rc" = 1 ]; then
+    { printf '%s is IN USE on %s:\n' "$1" "$hub"; printf '%s\n' "$out" | sed 's/^/  /'
+      printf 'Wait, test somewhere else, or ask:  agentboard tell <name> "..."\n'; } >&2
+  else
+    { printf 'not taken: the hub %s could not be reached — %s\n' "$hub" "$(printf '%s' "$out" | tail -1)"
+      printf 'A lease here alone would not stop an agent on another machine.\n'
+      printf 'AGENT_BOARD_OVERRIDE=1 takes it here only, once you have agreed that is safe.\n'; } >&2
+  fi
+  return 1
+}
+
+env_free_on_hub() {   # env_free_on_hub <name> <pid> — best effort; the relay's sync is the backstop
+  [ -n "$(hub_label)" ] || return 0
+  "$PEERCMD" hub-env free "$1" "$2" >/dev/null 2>&1 \
+    || printf '(the hub could not be told; it lets the lease go within its expiry)\n' >&2
+  return 0
+}
+
+cmd__env_hubbed() {   # live local leases that are also held on the hub: name<TAB>pid
+  local d n
+  for d in "$ENVLEASES"/*.lease; do
+    [ -d "$d" ] || continue
+    grep -q '^hub: ' "$d/owner" 2>/dev/null || continue
+    n=$(basename "$d" .lease)
+    env_owner "$n" >/dev/null 2>&1 || continue
+    printf '%s\t%s\n' "$n" "$(sed -n 's/^pid: //p' "$d/owner" | head -1)"
+  done
+  return 0
+}
+
+cmd__env_hub() {   # the hub's side of a peer's lease: take | free | sync
+  local sub=${1:-} name owner who secs what d cur n taken now
+  now=$(now_e)
+  case "$sub" in
+    take)
+      name=${2:-} owner=${3:-} who=${4:--} secs=${5:-} what=${6:--}
+      env_ok_name "$name" || return 2
+      printf '%s' "$owner" | grep -Eq '^[a-z][a-z0-9_-]{0,31}:[0-9]+$' || return 2
+      case "$secs" in ''|*[!0-9]*) return 2 ;; esac
+      d=$(env_dir "$name")
+      env_owner "$name" >/dev/null 2>&1
+      mkdir -p "$ENVLEASES" 2>/dev/null
+      if mkdir "$d" 2>/dev/null; then
+        printf 'pid: %s\nname: %s\nfor: %s\nsince: %s\ntaken: %s\nexpires: %s\n' \
+          "$owner" "$who" "$what" "$(now_h)" "$now" "$((now + secs))" > "$d/owner"
+        return 0
+      fi
+      cur=$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)
+      if [ "$cur" = "$owner" ]; then
+        sed -i.bak "s/^expires: .*/expires: $((now + secs))/" "$d/owner"; rm -f "$d/owner.bak"
+        return 0
+      fi
+      env_owner "$name"
+      return 1 ;;
+    free)
+      name=${2:-} owner=${3:-}
+      env_ok_name "$name" || return 2
+      d=$(env_dir "$name")
+      cur=$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)
+      [ -n "$owner" ] && [ "$cur" = "$owner" ] && rm -rf "$d"
+      return 0 ;;
+    sync)   # sync <label> <secs> [name=label:pid ...]: renew those, drop the label's others
+      local label=${2:-} keep
+      secs=${3:-}
+      printf '%s' "$label" | grep -Eq '^[a-z][a-z0-9_-]{0,31}$' || return 2
+      case "$secs" in ''|*[!0-9]*) return 2 ;; esac
+      shift 3; keep=" $* "
+      for d in "$ENVLEASES"/*.lease; do
+        [ -d "$d" ] || continue
+        n=$(basename "$d" .lease)
+        cur=$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)
+        case "$cur" in "$label":*) ;; *) continue ;; esac
+        case "$keep" in
+          *" $n=$cur "*)
+            sed -i.bak "s/^expires: .*/expires: $((now + secs))/" "$d/owner"; rm -f "$d/owner.bak" ;;
+          *)   # gone on the peer — unless so new that this sync was sent before it
+            taken=$(sed -n 's/^taken: //p' "$d/owner" 2>/dev/null | head -1 | tr -dc 0-9)
+            [ $((now - ${taken:-0})) -ge 60 ] && rm -rf "$d" ;;
+        esac
+      done
+      return 0 ;;
+  esac
+  return 2
+}
+
 cmd_env() {
   local sub=${1:-status} name me mypid who rec pid what n p w f
   shift 2>/dev/null
@@ -945,6 +1075,8 @@ cmd_env() {
       if mkdir "$(env_dir "$name")" 2>/dev/null; then
         printf 'pid: %s\nname: %s\nfor: %s\nsince: %s\n' \
           "$mypid" "${who:--}" "${what:--}" "$(now_h)" > "$(env_dir "$name")/owner"
+        env_take_on_hub "$name" "$mypid" "${who:--}" "${what:--}" || {
+          rm -rf "$(env_dir "$name")"; return 1; }
         cmd_note "took the $name dev env${what:+ for $what}"
         printf '%s is yours%s.\n' "$name" "${what:+ for $what}"
         printf 'Free it as soon as you are done testing:  agentboard env free %s\n' "$name"
@@ -957,14 +1089,17 @@ cmd_env() {
     free)
       name=${1:-}
       if [ -z "$name" ]; then
-        local freed=""
+        local freed="" hubbed=""
         while IFS=$'\t' read -r n p w f; do
           [ -n "$n" ] || continue
-          env_i_hold "$n" && freed="$freed, $n"
+          env_i_hold "$n" || continue
+          freed="$freed, $n"
+          grep -q '^hub: ' "$(env_dir "$n")/owner" 2>/dev/null && hubbed="$hubbed $n:$p"
         done <<EOF
 $(env_live)
 EOF
         env_free_mine
+        for n in $hubbed; do env_free_on_hub "${n%%:*}" "${n##*:}"; done
         if [ -n "$freed" ]; then
           printf 'released%s.\n' "${freed#,}"
           cmd_note "released dev env lease(s):${freed#,}"
@@ -975,7 +1110,10 @@ EOF
       fi
       [ -d "$(env_dir "$name")" ] || { printf '%s is already free.\n' "$name"; return 0; }
       if env_i_hold "$name" || [ -n "${AGENT_BOARD_OVERRIDE:-}" ]; then
+        p=$(sed -n 's/^pid: //p' "$(env_dir "$name")/owner" 2>/dev/null | head -1)
+        w=$(grep -c '^hub: ' "$(env_dir "$name")/owner" 2>/dev/null)
         rm -rf "$(env_dir "$name")"; cmd_note "released the $name dev env"
+        [ "${w:-0}" -gt 0 ] && env_free_on_hub "$name" "$p"
         printf '%s released.\n' "$name"; return 0
       fi
       { printf 'not yours to release:\n'; env_owner "$name" | sed 's/^/  /'; } >&2
@@ -1530,6 +1668,25 @@ peer_conf() {   # peer_conf <section> <key> -> first value of key in that sectio
     | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" | sed 's/[[:space:]]*$//' | head -1
 }
 
+hub_label() {   # the [peer] marked hub = yes, if this machine is not the hub itself
+  peers_on || return 0
+  awk '
+    function flush() { if (sec == "peer" && hub) print lab }
+    /^[[:space:]]*\[[A-Za-z0-9_-]+\][[:space:]]*$/ {
+      flush(); sec = $0; gsub(/[^A-Za-z0-9_-]/, "", sec); sec = tolower(sec)
+      lab = ""; hub = 0; next
+    }
+    { sub(/#.*/, "") }
+    sec == "peer" && /^[[:space:]]*label[[:space:]]*=/ {
+      v = $0; sub(/^[^=]*=/, "", v); gsub(/[[:space:]]/, "", v); lab = v
+    }
+    sec == "peer" && /^[[:space:]]*hub[[:space:]]*=/ {
+      v = tolower($0); sub(/^[^=]*=/, "", v); gsub(/[[:space:]]/, "", v)
+      hub = (v == "yes" || v == "true" || v == "1" || v == "on")
+    }
+    END { flush() }' "$MACHINES" | head -1
+}
+
 peer_stale_secs() { local v; v=$(peer_conf relay stale); printf '%s' "${v:-120}"; }
 
 peer_labels() {   # every [peer] label in machines.local
@@ -1621,9 +1778,8 @@ cmd__export() {
       done
     fi
   done
-  env_live | while IFS=$'\t' read -r e pid w f st; do
+  env_live_local | while IFS=$'\t' read -r e pid w f st; do
     [ -n "$e" ] || continue
-    case "$pid" in *:*) continue ;; esac   # a lease held here for a peer is the peer's to show
     printf 'E\t%s\t%s\t%s\t%s\t%s\n' "$e" "$pid" "$w" "$f" "$st"
   done
   if vault_owner >/dev/null 2>&1; then
@@ -3234,6 +3390,8 @@ case "$sub" in
   export|import|relay)
               [ -x "$PEERCMD" ] || { printf 'agentboard-peer not found next to agentboard\n' >&2; exit 1; }
               exec "$PEERCMD" "$sub" "$@" ;;
+  _env_hub)    cmd__env_hub "$@" ;;
+  _env_hubbed) cmd__env_hubbed ;;
   _export)    cmd__export ;;
   _resolve)   cmd__resolve "$@" ;;
   _poke)      cmd__poke "$@" ;;
