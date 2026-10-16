@@ -1955,8 +1955,12 @@ render_msg() {
                  [ "$label" = "to " ] && label="to pid $to"
                else label="to pid $to"; fi ;;
   esac
+  # From the epoch, in local time: a message from a peer carries the sender's zone.
+  local t hm; t=$(get_field "$f" epoch)
+  hm=$(date -r "$t" +%H:%M 2>/dev/null || date -d "@$t" +%H:%M 2>/dev/null) \
+    || hm=$(get_field "$f" time | cut -dT -f2 | cut -c1-5)
   printf '%s %s [%s] %s\n' \
-    "$(get_field "$f" time | cut -dT -f2 | cut -c1-5)" \
+    "$hm" \
     "$from" \
     "$label" \
     "$(msg_body "$f" | tr '\n' ' ' | sed 's/  */ /g; s/ *$//')"
