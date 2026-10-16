@@ -57,6 +57,7 @@ MIT — see [`LICENSE`](./LICENSE).
     ~/agent-board/
       bin/agentboard      the only interface — use it, don't hand-edit files
       bin/deploylock      hard lock wrapper for Ansible runs
+      bin/agentboard-peer export, import and relay, for more than one machine
       sessions/<pid>.md   one file per live agent session, owned by that session
       paths/<pid>         files that session has been seen to edit, owned by it
       messages/<id>.md    one file per message, owned by the sender
@@ -65,7 +66,9 @@ MIT — see [`LICENSE`](./LICENSE).
       theme               one line: which pack of names this machine uses
       themes.local/       packs written here — gitignored, override the shipped ones
       workspace.local     which repos here are worked which way — gitignored
-      test/               four suites — run them after editing bin/
+      machines.local      the other machines this board talks to — gitignored
+      remote/<label>/     each peer's board as last synced — rewritten, never edited
+      test/               five suites — run them after editing bin/
 
 Each session writes **only its own files**, named after the agent process pid. No
 shared file, so no write contention and no read-modify-write races. Reading the
@@ -928,6 +931,70 @@ it running Ansible while the deploy lock is held. Keep Codex out of `deploy` and
 of vault files while other agents are live. To put it back, copy the section from
 `~/.grok/AGENTS.md`, and change the name of the agent.
 
+## More than one machine
+
+With no `machines.local`, a board knows only its own machine. With one, boards on
+several machines share a view, carry messages, and agree on the deploy lock and the
+dev env leases. It needs nothing beyond `ssh` and python3 on every machine, and it
+works when only one machine can reach the others.
+
+    # machines.local on the machine that can reach the others
+    [local]
+    label = laptop
+
+    [peer]
+    label = server
+    ssh   = server            # an ssh destination; keys, no prompts (BatchMode)
+    board = ~/agent-board     # the default
+    hub   = yes               # this peer holds the shared locks
+
+    [relay]
+    interval = 30             # seconds between syncs
+    stale    = 120            # a mirror older than this is not shown as live
+    lease    = 300            # how long a peer's env lease lives unrenewed
+
+    # machines.local on the server: it reaches no one, so no ssh line
+    [local]
+    label = server
+
+    [peer]
+    label = laptop
+
+**The relay** is `agentboard relay`, a plain loop that you start the way you start
+any long-running process (launchd, systemd, a terminal). Each pass it pulls every
+reachable peer's `agentboard export` into `remote/<label>/` here, and pushes this
+board's export into `remote/<this label>/` there, so one machine drives both
+directions. Only the machine that owns a session decides whether it is live; a peer
+never checks a remote pid. `agentboard relay --once` runs one pass, and
+`agentboard peers` shows when each peer last synced and the last error.
+
+**The view.** `list` and `board` show a peer's agents as `name@label`, with
+the sync age. A mirror older than `stale` is shown as "not seen since", never as
+live. Wins and file claims cross as a view only: each machine has its own
+checkouts, so two edits of one file meet at `git push`, not in one tree.
+
+**Messages** cross with their id unchanged and an `origin:` line, and a message that
+already has an origin is never sent back, so nothing echoes. `tell name` resolves a
+name that is live only on a peer; a name live on two machines must be written
+`name@label`. Person names are issued unique across the mirrors. To wake an idle
+target on its own machine, set `poke` under `[local]` there — it is called like
+`AGENT_BOARD_POKE_CMD`.
+
+**The hub** holds the hard locks, so put it on the machine that is always on.
+- `deploylock` on another machine takes its lock locally and then the same lock on
+  the hub, through `deploylock --hold` over ssh, and starts the run only when it has
+  both. The hub holds until the run ends or the connection drops. If the hub cannot
+  be reached, the run **fails closed**.
+- `env take` on another machine is taken on the hub too, owned there as
+  `<label>:<pid>` with an expiry. Each relay pass renews it while the session lives,
+  so a machine that goes to sleep lets its boxes go within `lease` seconds.
+- `AGENT_BOARD_OVERRIDE=1` skips the hub for one command, once you have agreed that is
+  safe. On the hub itself nothing changes.
+
+A view can be one `interval` old; the locks are not, because they are taken on the
+hub at the moment they are needed. Hooks never use the network: they read the
+mirrors.
+
 ## Keeping it useful
 
 Claim at task level, not per file edit — `scope` is read by humans. File claims are
@@ -939,8 +1006,9 @@ exactly the failure this board exists to prevent.
 
 ## What it does not do
 
-- **It is per-machine.** Nothing here coordinates with CI, with a teammate's laptop,
-  or with anything running on a server.
+- **It is per-machine unless you list the other machines.** With a `machines.local`
+  it coordinates with the machines in it, and nothing else: not CI, not a machine
+  that is not listed.
 - **`branch-pr` repos stay checkout-level.** Two agents in different corners of such a
   repo still exclude each other, deliberately: the branch is repo-wide even when the
   edits are not. Only `shared-main` repos are file-level, because only there does
@@ -965,6 +1033,7 @@ exactly the failure this board exists to prevent.
 | `AGENT_BOARD_POKE_CMD` | unset | run as `<cmd> <pid> <name> <socket>` to wake an idle target |
 | `AGENT_BOARD_CC_SESSIONS` | `~/.claude/sessions` | where Claude's own session metadata is read from |
 | `AGENT_BOARD_OVERRIDE` | unset | set on a command to bypass the git/repo gate |
+| `AGENT_BOARD_SSH` | `ssh` | the ssh client the relay, `deploylock` and `env take` use to reach a peer |
 | `AGENT_BOARD_AGENT` | board name | override the holder name `deploylock` records (default: `agentboard whoami --known`) |
 
 ## Troubleshooting
