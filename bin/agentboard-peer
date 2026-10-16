@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""agentboard-peer — carry the board between machines.
+
+Each machine keeps its own board. This moves a view of it to the others, and
+moves messages both ways, so one roster shows every live agent and a `tell`
+reaches an agent on another machine. It is driven by `agentboard relay` and is
+not meant to be run by hand, except `conf` to see what it read.
+
+  agentboard-peer conf                 the parsed machines.local
+  agentboard-peer export               this board as JSON, on stdout
+  agentboard-peer import --origin L    a peer's export, on stdin, into remote/L/
+  agentboard-peer relay [--once]       pull from and push to every peer, forever
+
+Nothing here runs unless $AGENT_BOARD_DIR/machines.local exists. Its format:
+
+  [local]
+  label = laptop                 # how this machine is named to the others
+  poke  = /path/to/poke-cmd      # optional, as AGENT_BOARD_POKE_CMD
+
+  [peer]                         # one section per peer
+  label = server
+  ssh   = server                 # anything `ssh` accepts as a destination; leave it
+                                 # out for a peer that reaches us but we cannot reach
+  board = ~/agent-board          # the peer's board dir (default ~/agent-board)
+  hub   = yes                    # this peer holds the shared locks
+
+  [relay]
+  interval = 30                  # seconds between syncs
+  stale    = 120                 # a mirror older than this is not shown as live
+  lease    = 300                 # how long a remote env lease lives unrenewed
+
+The only dependencies are python3 (standard library) and ssh.
+"""
+
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+BOARD = os.environ.get("AGENT_BOARD_DIR") or os.path.expanduser("~/agent-board")
+HERE = os.path.dirname(os.path.abspath(__file__))
+AGENTBOARD = os.path.join(HERE, "agentboard")
+MSGS = os.path.join(BOARD, "messages")
+REMOTE = os.path.join(BOARD, "remote")
+MSG_KEEP = int(os.environ.get("AGENT_BOARD_MSG_KEEP_SECS", "86400"))
+LABEL_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+def last_line(text):
+    lines = (text or "").strip().splitlines()
+    return lines[-1] if lines else ""
+
+
+def die(msg, rc=1):
+    print("agentboard-peer: " + msg, file=sys.stderr)
+    sys.exit(rc)
+
+
+# --- config ------------------------------------------------------------------
+
+def conf():
+    """machines.local as {'local': {...}, 'peers': [{...}], 'relay': {...}}, or None."""
+    path = os.path.join(BOARD, "machines.local")
+    if not os.path.isfile(path):
+        return None
+    out = {"local": {}, "peers": [], "relay": {}}
+    cur = None
+    with open(path) as fh:
+        for raw in fh:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            m = re.match(r"^\[([A-Za-z0-9_-]+)\]$", line)
+            if m:
+                sec = m.group(1).lower()
+                if sec == "peer":
+                    cur = {}
+                    out["peers"].append(cur)
+                elif sec in ("local", "relay"):
+                    cur = out[sec]
+                else:
+                    cur = None
+                continue
+            if cur is None or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            cur[k.strip().lower()] = v.strip()
+    lab = out["local"].get("label", "")
+    if not LABEL_RE.match(lab):
+        die("machines.local: [local] needs a label matching %s" % LABEL_RE.pattern)
+    for p in out["peers"]:
+        if not LABEL_RE.match(p.get("label", "")):
+            die("machines.local: every [peer] needs a label matching %s" % LABEL_RE.pattern)
+        p.setdefault("board", "~/agent-board")
+        p["hub"] = p.get("hub", "").lower() in ("1", "yes", "true", "on")
+    r = out["relay"]
+    for k, d in (("interval", 30), ("stale", 120), ("lease", 300)):
+        try:
+            r[k] = int(r.get(k, d))
+        except ValueError:
+            die("machines.local: [relay] %s must be a number" % k)
+    return out
+
+
+def need_conf():
+    c = conf()
+    if c is None:
+        die("no machines.local in %s — nothing to relay" % BOARD)
+    return c
+
+
+# --- export --------------------------------------------------------------------
+
+def board_lines():
+    """The live state, as only this machine can judge it: `agentboard _export`."""
+    env = dict(os.environ, AGENT_BOARD_DIR=BOARD)
+    p = subprocess.run([AGENTBOARD, "_export"], env=env, capture_output=True,
+                       text=True, timeout=60)
+    return [l.split("\t") for l in p.stdout.splitlines() if l]
+
+
+def read_fields(path):
+    """A board file: `key: value` lines, a blank line, then the body."""
+    head, body = {}, []
+    with open(path, errors="replace") as fh:
+        lines = fh.read().split("\n")
+    i = 0
+    while i < len(lines) and lines[i] != "":
+        k, _, v = lines[i].partition(": ")
+        head[k] = v
+        i += 1
+    body = "\n".join(lines[i + 1:]).rstrip("\n")
+    return head, body
+
+
+def cmd_export(_args):
+    c = need_conf()
+    me = c["local"]["label"]
+    peers = {p["label"] for p in c["peers"]}
+    out = {"label": me, "epoch": int(time.time()), "sessions": [], "claims": [],
+           "envs": [], "vault": [], "wins": [], "messages": []}
+    for f in board_lines():
+        kind, rest = f[0], f[1:]
+        if kind == "S" and len(rest) >= 8:
+            keys = ("pid", "person", "name", "agent", "state", "repo", "branch", "scope")
+            out["sessions"].append(dict(zip(keys, rest)))
+        elif kind == "P" and len(rest) >= 3:
+            out["claims"].append(dict(zip(("pid", "repo", "path"), rest)))
+        elif kind == "E" and len(rest) >= 5:
+            out["envs"].append(dict(zip(("env", "pid", "holder", "for", "since"), rest)))
+        elif kind == "V" and len(rest) >= 4:
+            out["vault"].append(dict(zip(("pid", "holder", "file", "since"), rest)))
+        elif kind == "W" and len(rest) >= 4:
+            out["wins"].append(dict(zip(("day", "time", "who", "what"), rest)))
+    # Only messages written here travel: one that arrived from a peer already has
+    # an origin, and sending it on again is how a two-way relay loops.
+    cutoff = time.time() - MSG_KEEP
+    if os.path.isdir(MSGS):
+        for name in sorted(os.listdir(MSGS)):
+            if not name.endswith(".md"):
+                continue
+            try:
+                head, body = read_fields(os.path.join(MSGS, name))
+            except OSError:
+                continue
+            if head.get("origin"):
+                continue
+            try:
+                if int(head.get("epoch", "0")) < cutoff:
+                    continue
+            except ValueError:
+                continue
+            to = head.get("to", "")
+            if to != "*" and to.rpartition("@")[2] not in peers:
+                continue
+            out["messages"].append({"id": name, "head": head, "body": body})
+    json.dump(out, sys.stdout)
+    sys.stdout.write("\n")
+
+
+# --- import --------------------------------------------------------------------
+
+def atomic_write(path, text):
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def clean(v):
+    """One TSV cell: no tabs or newlines can reach the bash side."""
+    return re.sub(r"[\t\r\n]+", " ", str(v if v is not None else "")).strip() or "-"
+
+
+def resolve_local(name):
+    env = dict(os.environ, AGENT_BOARD_DIR=BOARD)
+    p = subprocess.run([AGENTBOARD, "_resolve", name], env=env, capture_output=True,
+                       text=True, timeout=30)
+    pid = p.stdout.strip()
+    return pid if p.returncode == 0 and pid.isdigit() else None
+
+
+def poke_local(pid):
+    env = dict(os.environ, AGENT_BOARD_DIR=BOARD)
+    subprocess.run([AGENTBOARD, "_poke", pid], env=env, capture_output=True, timeout=30)
+
+
+def cmd_import(args):
+    c = need_conf()
+    me = c["local"]["label"]
+    origin = None
+    if len(args) >= 2 and args[0] == "--origin":
+        origin = args[1]
+    if not origin or not LABEL_RE.match(origin) or origin == me:
+        die("usage: agentboard-peer import --origin <label>   (not this machine's own)")
+    try:
+        data = json.load(sys.stdin)
+    except ValueError as e:
+        die("import: not a board export (%s)" % e)
+    d = os.path.join(REMOTE, origin)
+    os.makedirs(os.path.join(d, "wins"), exist_ok=True)
+
+    claims = {}
+    for cl in data.get("claims", []):
+        claims.setdefault(str(cl.get("pid")), []).append(cl)
+    rows = []
+    for s in data.get("sessions", []):
+        pid = str(s.get("pid", ""))
+        rows.append("\t".join(clean(s.get(k)) for k in
+                              ("pid", "person", "name", "agent", "state", "repo",
+                               "branch", "scope")) + "\t%d" % len(claims.get(pid, [])))
+    atomic_write(os.path.join(d, "sessions.tsv"), "".join(r + "\n" for r in rows))
+    atomic_write(os.path.join(d, "claims.tsv"), "".join(
+        "\t".join(clean(cl.get(k)) for k in ("pid", "repo", "path")) + "\n"
+        for cl in data.get("claims", [])))
+    atomic_write(os.path.join(d, "envs.tsv"), "".join(
+        "\t".join(clean(e.get(k)) for k in ("env", "pid", "holder", "for", "since")) + "\n"
+        for e in data.get("envs", [])))
+    atomic_write(os.path.join(d, "vault.tsv"), "".join(
+        "\t".join(clean(v.get(k)) for k in ("pid", "holder", "file", "since")) + "\n"
+        for v in data.get("vault", [])))
+    wd = os.path.join(d, "wins")
+    days = {}
+    for w in data.get("wins", []):
+        day = str(w.get("day", ""))
+        if re.match(r"^\d{4}-\d\d-\d\d$", day):
+            days.setdefault(day, []).append(w)
+    for name in os.listdir(wd):
+        if name.split(".")[0] not in days:
+            os.remove(os.path.join(wd, name))
+    for day, ws in days.items():
+        atomic_write(os.path.join(wd, "%s.%s" % (day, origin)), "".join(
+            "%s\t%s@%s\t%s\n" % (clean(w.get("time")), clean(w.get("who")), origin,
+                                 clean(w.get("what"))) for w in ws))
+
+    # Messages: keep the sender's id, so a message that is carried twice is
+    # written once, and resolve the address to a pid here, where it is local.
+    os.makedirs(MSGS, exist_ok=True)
+    cutoff = time.time() - MSG_KEEP + 60   # never resurrect one the sweep has dropped
+    new = 0
+    pokes = []
+    for m in data.get("messages", []):
+        mid = os.path.basename(str(m.get("id", "")))
+        if not re.match(r"^[0-9]+\.[0-9]+\.[0-9]+\.md$", mid):
+            continue
+        dest = os.path.join(MSGS, mid)
+        if os.path.exists(dest):
+            continue
+        head = m.get("head", {})
+        try:
+            if int(head.get("epoch", "0")) < cutoff:
+                continue
+        except ValueError:
+            continue
+        to = head.get("to", "")
+        if to != "*":
+            name, _, where = to.rpartition("@")
+            if where != me:
+                continue
+            pid = resolve_local(name)
+            to = pid if pid else "unknown:" + name
+            if pid:
+                pokes.append(pid)
+        lines = ["from_pid: %s" % clean(head.get("from_pid")),
+                 "from_name: %s" % clean(head.get("from_name")),
+                 "from_agent: %s" % clean(head.get("from_agent")),
+                 "to: %s" % clean(to),
+                 "repo: %s" % clean(head.get("repo")),
+                 "epoch: %s" % clean(head.get("epoch")),
+                 "time: %s" % clean(head.get("time")),
+                 "origin: %s" % origin]
+        atomic_write(dest, "\n".join(lines) + "\n\n" + str(m.get("body", "")) + "\n")
+        new += 1
+    atomic_write(os.path.join(d, "synced"), "%d\n" % int(time.time()))
+    for pid in dict.fromkeys(pokes):
+        poke_local(pid)
+    print("imported %s: %d session(s), %d new message(s)"
+          % (origin, len(rows), new))
+
+
+# --- relay ---------------------------------------------------------------------
+
+def ssh_base(peer):
+    ssh = os.environ.get("AGENT_BOARD_SSH", "ssh")
+    cp = os.path.join(os.path.expanduser("~/.ssh"), "ab-%C")
+    return [ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+            "-o", "ControlMaster=auto", "-o", "ControlPath=" + cp,
+            "-o", "ControlPersist=120", peer["ssh"]]
+
+
+def remote_cmd(peer, *argv):
+    """A command line for the peer's shell; a leading ~/ in its board path stays
+    unquoted so that shell, not this one, expands it."""
+    b = peer["board"]
+    qb = '"$HOME"/' + shlex.quote(b[2:]) if b.startswith("~/") else shlex.quote(b)
+    return "AGENT_BOARD_DIR=%s %s/bin/agentboard-peer %s" % (
+        qb, qb, " ".join(shlex.quote(a) for a in argv))
+
+
+def status_write(label, **kv):
+    d = os.path.join(REMOTE, label)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "relay.json")
+    try:
+        with open(path) as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        st = {}
+    st.update(kv)
+    atomic_write(path, json.dumps(st) + "\n")
+
+
+def sync_one(c, peer):
+    me = c["local"]["label"]
+    lab = peer["label"]
+    now = int(time.time())
+    status_write(lab, last_attempt=now)
+    base = ssh_base(peer)
+    try:
+        pull = subprocess.run(base + [remote_cmd(peer, "export")], capture_output=True,
+                              text=True, timeout=60, stdin=subprocess.DEVNULL)
+        if pull.returncode != 0:
+            raise RuntimeError("pull failed (rc %d): %s" % (
+                pull.returncode, last_line(pull.stderr)))
+        env = dict(os.environ, AGENT_BOARD_DIR=BOARD)
+        imp = subprocess.run([os.path.abspath(__file__), "import", "--origin", lab],
+                             input=pull.stdout, capture_output=True, text=True,
+                             timeout=60, env=env)
+        if imp.returncode != 0:
+            raise RuntimeError("import failed: " + imp.stderr.strip())
+        exp = subprocess.run([os.path.abspath(__file__), "export"], capture_output=True,
+                             text=True, timeout=60, env=env)
+        if exp.returncode != 0:
+            raise RuntimeError("export failed: " + exp.stderr.strip())
+        push = subprocess.run(base + [remote_cmd(peer, "import", "--origin", me)],
+                              input=exp.stdout, capture_output=True, text=True,
+                              timeout=60)
+        if push.returncode != 0:
+            raise RuntimeError("push failed (rc %d): %s" % (
+                push.returncode, last_line(push.stderr)))
+        status_write(lab, last_ok=int(time.time()), error="")
+        return "%s ok — %s | %s" % (lab, imp.stdout.strip(), push.stdout.strip())
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+        status_write(lab, error=str(e)[:300])
+        return "%s FAILED — %s" % (lab, e)
+
+
+def cmd_relay(args):
+    c = need_conf()
+    once = "--once" in args
+    if not any(p.get("ssh") for p in c["peers"]):
+        die("machines.local lists no [peer] with an ssh target — the peers relay to us")
+    while True:
+        c = need_conf()   # re-read, so an edit takes effect without a restart
+        for peer in (p for p in c["peers"] if p.get("ssh")):
+            print("%s %s" % (time.strftime("%H:%M:%S"), sync_one(c, peer)), flush=True)
+        if once:
+            return
+        time.sleep(c["relay"]["interval"])
+
+
+def cmd_conf(_args):
+    c = conf()
+    if c is None:
+        print("no machines.local — this board is on its own")
+        return
+    json.dump(c, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__.strip())
+        return
+    cmd, args = sys.argv[1], sys.argv[2:]
+    fn = {"conf": cmd_conf, "export": cmd_export, "import": cmd_import,
+          "relay": cmd_relay}.get(cmd)
+    if not fn:
+        die("unknown command %s" % cmd, 2)
+    fn(args)
+
+
+if __name__ == "__main__":
+    main()

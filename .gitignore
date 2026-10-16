@@ -23,3 +23,12 @@ bin/agentboard.prev
 # Which repos on this machine are worked in which way. Describes a workspace, not
 # this tool — and naming a team's repos is exactly what should not ship.
 /workspace.local
+
+# Which other machines this board talks to, and how to reach them. Host names and
+# SSH targets describe one site's network, so they never ship.
+/machines.local
+
+# Mirrors of the peers' boards, rewritten by every relay pass.
+/remote/
+
+__pycache__/

@@ -81,6 +81,9 @@ PATHSD="$BOARD/paths"
 LOCKS="$BOARD/locks"
 WINS="$BOARD/wins"
 DEPLOYLOCK="$BOARD/bin/deploylock"
+PEERCMD="$BOARD/bin/agentboard-peer"
+MACHINES="$BOARD/machines.local"   # optional: the peers this board is mirrored with
+REMOTED="$BOARD/remote"            # their mirrors, written by the relay
 STALE_SECS="${AGENT_BOARD_STALE_SECS:-7200}"     # 2h without a heartbeat = presumed dead
 DONE_KEEP_SECS="${AGENT_BOARD_DONE_KEEP_SECS:-3600}"
 MSG_KEEP_SECS="${AGENT_BOARD_MSG_KEEP_SECS:-86400}"
@@ -249,8 +252,8 @@ all_themes() {   # built-ins first, then local packs that are not overriding one
 # them, which only [art] does, because a # in a banner is a pixel.
 ini_section() {   # ini_section <file> <section> [1 = keep comments]
   awk -v want="$2" -v keep="${3:-}" '
-    /^[[:space:]]*\[[A-Za-z-]+\][[:space:]]*$/ {
-      cur = $0; gsub(/[^A-Za-z-]/, "", cur); cur = tolower(cur)
+    /^[[:space:]]*\[[A-Za-z0-9_-]+\][[:space:]]*$/ {
+      cur = $0; gsub(/[^A-Za-z0-9_-]/, "", cur); cur = tolower(cur)
       on = (cur == want); next
     }
     on { if (keep == "") sub(/#.*/, ""); print }
@@ -370,6 +373,7 @@ person_taken() {   # among live sessions only — a retired person is free to re
     is_live "$f" || continue
     [ "$(person_of "$f")" = "$want" ] && return 0
   done
+  peers_on && peer_rows | awk -F'\t' -v w="$want" '$3==w {f=1} END {exit !f}' && return 0
   return 1
 }
 
@@ -391,6 +395,7 @@ name_taken() {   # name_taken <name> — among live sessions, the only ones addr
     is_live "$f" || continue
     [ "$(name_of "$f")" = "$want" ] && return 0
   done
+  peers_on && peer_rows | awk -F'\t' -v w="$want" '$4==w {f=1} END {exit !f}' && return 0
   return 1
 }
 
@@ -1484,8 +1489,195 @@ cmd_list() {
     out="$out$(print_entry "$f")"$'\n'
     n=$((n+1))
   done
+  if peers_on; then
+    local l row fb=""
+    [ -n "$filter_repo" ] && fb=$(basename "$filter_repo")
+    for l in $(peer_labels); do
+      out="$out$(peer_status_line "$l")"$'\n'
+      while IFS= read -r row; do
+        [ -n "$row" ] || continue
+        [ -n "$fb" ] && [ "$(printf '%s' "$row" | cut -f7)" != "$fb" ] && continue
+        out="$out$(print_peer_entry "$row")"$'\n'
+        n=$((n+1))
+      done <<< "$(peer_rows | awk -F'\t' -v l="$l" '$1==l')"
+    done
+  fi
   [ "$n" -eq 0 ] && return 1
   printf '%s' "$out"
+  return 0
+}
+
+
+# --- peers on other machines -------------------------------------------------
+# Optional. With no machines.local every function here is a no-op and the board
+# is exactly the single-machine board. With one, a relay (agentboard relay) keeps
+# a mirror of each peer's board in remote/<label>/, and the roster, name checks
+# and `tell` read it. Liveness over there is the peer's judgement, carried in its
+# export: a pid from another machine means nothing to kill -0 here. What this side
+# does judge is the mirror's own age — a mirror the relay has not refreshed is
+# shown as "not seen since", never as live agents.
+peers_on() { [ -f "$MACHINES" ]; }
+
+local_label() {
+  peers_on || return 0
+  ini_section "$MACHINES" local | sed -n 's/^[[:space:]]*label[[:space:]]*=[[:space:]]*//p' \
+    | tr -d '[:space:]' | head -1
+}
+
+peer_conf() {   # peer_conf <section> <key> -> first value of key in that section
+  peers_on || return 0
+  ini_section "$MACHINES" "$1" \
+    | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" | sed 's/[[:space:]]*$//' | head -1
+}
+
+peer_stale_secs() { local v; v=$(peer_conf relay stale); printf '%s' "${v:-120}"; }
+
+peer_labels() {   # every [peer] label in machines.local
+  peers_on || return 0
+  ini_section "$MACHINES" peer | sed -n 's/^[[:space:]]*label[[:space:]]*=[[:space:]]*//p' \
+    | tr -d '[:space:]' | grep .
+}
+
+peer_age() {   # peer_age <label> -> seconds since that mirror was refreshed, or nothing
+  local t; t=$(head -1 "$REMOTED/$1/synced" 2>/dev/null | tr -dc 0-9)
+  [ -n "$t" ] && printf '%s' "$(( $(now_e) - t ))"
+}
+
+peer_fresh() {   # peer_fresh <label>
+  local a; a=$(peer_age "$1"); [ -n "$a" ] && [ "$a" -lt "$(peer_stale_secs)" ]
+}
+
+secs_h() {   # secs_h <n> -> "20s" / "4m" / "3h"
+  if   [ "$1" -lt 60 ];   then printf '%ss' "$1"
+  elif [ "$1" -lt 3600 ]; then printf '%sm' "$(( $1 / 60 ))"
+  else                         printf '%sh' "$(( $1 / 3600 ))"; fi
+}
+
+# label<TAB>pid<TAB>person<TAB>name<TAB>agent<TAB>state<TAB>repo<TAB>branch<TAB>scope<TAB>claims
+# for every agent in a fresh mirror. A stale mirror contributes nothing.
+peer_rows() {
+  local l
+  peers_on || return 0
+  for l in $(peer_labels); do
+    peer_fresh "$l" || continue
+    [ -f "$REMOTED/$l/sessions.tsv" ] || continue
+    awk -F'\t' -v l="$l" 'NF>=9 {print l "\t" $0}' "$REMOTED/$l/sessions.tsv"
+  done
+}
+
+peer_status_line() {   # peer_status_line <label> -> one line on how fresh that mirror is
+  local l=$1 a n t
+  a=$(peer_age "$l")
+  if [ -z "$a" ]; then printf '  %s%s: never synced — is the relay running?%s\n' "$C_DIM" "$l" "$C_R"; return; fi
+  if peer_fresh "$l"; then
+    n=$(grep -c . "$REMOTED/$l/sessions.tsv" 2>/dev/null || true)
+    printf '  %s%s: %s agent(s), synced %s ago%s\n' "$C_DIM" "$l" "${n:-0}" "$(secs_h "$a")" "$C_R"
+  else
+    t=$(head -1 "$REMOTED/$l/synced" 2>/dev/null | tr -dc 0-9)
+    printf '  %s%s: not seen since %s — its agents are not shown%s\n' "$C_DIM" "$l" \
+      "$(date -r "$t" +%H:%M 2>/dev/null || date -d "@$t" +%H:%M 2>/dev/null)" "$C_R"
+  fi
+}
+
+print_peer_entry() {   # print_peer_entry <peer_rows line>
+  local l pid person name agent state repo branch scope claims dot extra=""
+  IFS=$'\t' read -r l pid person name agent state repo branch scope claims <<< "$1"
+  case "$state" in
+    busy) dot="${C_GRN}●${C_R}" ;; idle) dot="${C_YEL}◐${C_R}" ;; *) dot="${C_DIM}○${C_R}" ;;
+  esac
+  [ "$state" = '-' ] && state=""
+  [ "${claims:-0}" -gt 0 ] 2>/dev/null && extra="  ${claims} uncommitted"
+  printf '%s ' "$dot"
+  [ "$person" != '-' ] && printf '%s%s%s %s·%s ' "$C_CYA" "$person" "$C_R" "$C_DIM" "$C_R"
+  [ "$name" != '-' ] && printf '%s%s@%s%s ' "$C_B" "$name" "$l" "$C_R"
+  printf '(%s%s)' "${agent:-unknown}" "${state:+, $state}"
+  if [ "$repo" != '-' ]; then printf '  %s%s @ %s%s%s\n' "$C_CYA" "$repo" "$branch" "$C_R" "$extra"
+  else printf '\n'; fi
+  [ "$scope" != '-' ] && printf '    %s\n' "$scope"
+  return 0
+}
+
+# What `agentboard-peer export` reads. Only this machine can say which of its
+# sessions are live, so the judgement is made here, with the same helpers the
+# roster uses, and the relay just carries the result.
+#   S pid person name agent state repo branch scope   one per live session
+#   P pid repo path                                   its uncommitted file claims
+#   E env pid holder for since                        a dev env lease held here
+#   V pid holder file since                           the vault lease, if held
+#   W day time who what                               today's and yesterday's wins
+cmd__export() {
+  local f pid repo rb st sc p e w day
+  for f in "$SESS"/*.md; do
+    [ -e "$f" ] || continue
+    is_live "$f" || continue
+    pid=$(get_field "$f" pid); repo=$(get_field "$f" repo)
+    rb=""; [ -n "$repo" ] && rb=$(basename "$repo")
+    st=$(state_of "$f"); sc=$(get_field "$f" scope)
+    printf 'S\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$pid" "$(person_of "$f")" "$(name_of "$f")" \
+      "$(get_field "$f" agent)" "$st" "${rb:--}" "$(get_field "$f" branch)" "$sc" | tr -s '\r' ' '
+    if [ -n "$repo" ]; then
+      live_paths "$pid" "$repo" | while IFS= read -r p; do
+        [ -n "$p" ] && printf 'P\t%s\t%s\t%s\n' "$pid" "$rb" "$p"
+      done
+    fi
+  done
+  env_live | while IFS=$'\t' read -r e pid w f st; do
+    [ -n "$e" ] || continue
+    case "$pid" in *:*) continue ;; esac   # a lease held here for a peer is the peer's to show
+    printf 'E\t%s\t%s\t%s\t%s\t%s\n' "$e" "$pid" "$w" "$f" "$st"
+  done
+  if vault_owner >/dev/null 2>&1; then
+    printf 'V\t%s\t%s\t%s\t%s\n' "$(vault_owner_field pid)" "$(vault_owner_field name)" \
+      "$(vault_owner_field file)" "$(vault_owner_field since)"
+  fi
+  for day in "$(days_ago 1)" "$(date +%F)"; do
+    for w in "$WINS/$day".*; do
+      [ -e "$w" ] || continue
+      awk -F'\t' -v d="$day" 'NF>=3 {print "W\t" d "\t" $1 "\t" $2 "\t" $3}' "$w"
+    done
+  done
+  return 0
+}
+
+cmd__resolve() {   # local names only: the relay asks on behalf of a peer
+  local want=${1:-}
+  [ -n "$want" ] || return 1
+  resolve_local "$want" 2>/dev/null
+}
+
+cmd__poke() {   # wake an idle local target of a message a peer sent — quiet, best effort
+  local pid=${1:-} name st
+  [ -n "$pid" ] && [ -f "$SESS/$pid.md" ] || return 0
+  st=$(cc_meta "$pid" status) || st=""
+  [ "$st" = idle ] || return 0
+  [ -n "$(poke_cmd)" ] || return 0
+  name=$(name_of "$SESS/$pid.md")
+  poke_target "$pid" "$name" >/dev/null 2>&1
+  return 0
+}
+
+# A poke command can be set per machine in machines.local, which is where the
+# relay's environment finds it: launchd and systemd do not read a shell profile.
+poke_cmd() {
+  if [ -n "${AGENT_BOARD_POKE_CMD:-}" ]; then printf '%s' "$AGENT_BOARD_POKE_CMD"; return; fi
+  local v; v=$(peer_conf local poke)
+  [ -n "$v" ] && printf '%s' "${v/#\~/$HOME}"
+}
+
+cmd_peers() {   # what this board is mirrored with, and how fresh each mirror is
+  if ! peers_on; then
+    printf 'no machines.local — this board is on its own.\n'
+    return 0
+  fi
+  local l err
+  printf 'this machine: %s\n' "$(local_label)"
+  for l in $(peer_labels); do
+    peer_status_line "$l"
+    err=$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("error",""))
+except Exception: pass' "$REMOTED/$l/relay.json" 2>/dev/null)
+    [ -n "$err" ] && printf '    last relay error: %s\n' "$err"
+  done
   return 0
 }
 
@@ -1500,12 +1692,42 @@ cmd_list() {
 
 msg_body() { sed -n '/^$/,$p' "$1" | sed '1{/^$/d;}'; }
 
-# A name is how I address an agent; a pid is the unambiguous fallback.
-resolve_target() {   # <name|pid> -> pid on stdout, or 1 with a reason on stderr
-  local want=$1 f pid name hits=""
+# A name is how I address an agent; a pid is the unambiguous fallback. An agent on
+# a peer resolves to "name@label", which the relay carries and the peer resolves.
+resolve_target() {   # <name|pid|name@label> -> pid or name@label, or 1 with a reason
+  local want=$1 here="" there="" n
   case "$want" in
     ''|'*') printf '*'; return 0 ;;
   esac
+  if peers_on; then
+    case "$want" in
+      *@*)
+        local who=${want%@*} where=${want##*@}
+        if [ "$where" = "$(local_label)" ]; then resolve_local "$who"; return; fi
+        peer_labels | grep -qx "$where" || {
+          printf 'no peer called "%s" in machines.local\n' "$where" >&2; return 1; }
+        peer_fresh "$where" || {
+          printf '%s has not synced recently — the message would wait for it\n' "$where" >&2; return 1; }
+        there=$(peer_rows | awk -F'\t' -v l="$where" -v w="$who" -v lw="$(lc "$who")" \
+          '$1==l && ($4==w || tolower($3)==lw) {print $1}')
+        [ -n "$there" ] || { printf 'no live agent "%s" on %s\n' "$who" "$where" >&2; return 1; }
+        printf '%s@%s' "$who" "$where"; return 0 ;;
+    esac
+    printf '%s' "$want" | grep -Eq '^[0-9]+$' || \
+      there=$(peer_rows | awk -F'\t' -v w="$want" -v lw="$(lc "$want")" \
+        '$4==w || tolower($3)==lw {print $1}' | sort -u)
+  fi
+  [ -z "$there" ] && { resolve_local "$want"; return; }
+  here=$(resolve_local "$want" 2>/dev/null) || here=""
+  n=$(printf '%s\n' "$there" | grep -c .)
+  if [ -z "$here" ] && [ "$n" -eq 1 ]; then printf '%s@%s' "$want" "$there"; return 0; fi
+  printf '"%s" is live on more than one machine (%s%s) — say which: %s@<machine>\n' \
+    "$want" "${here:+here, }" "$(printf '%s' "$there" | tr '\n' ' ' | sed 's/ $//')" "$want" >&2
+  return 1
+}
+
+resolve_local() {   # <name|pid> -> pid on stdout, or 1 with a reason on stderr
+  local want=$1 f pid name hits=""
   if printf '%s' "$want" | grep -Eq '^[0-9]+$'; then
     [ -f "$SESS/$want.md" ] || { printf 'no live agent with pid %s\n' "$want" >&2; return 1; }
     printf '%s' "$want"; return 0
@@ -1558,8 +1780,9 @@ EOF
 render_msg() {
   local f=$1 from
   from=$(get_field "$f" from_name)
-  case "$from" in ''|'-') from=$(get_field "$f" from_agent) ;;
-                  *) from="$from ($(get_field "$f" from_agent))" ;; esac
+  local origin; origin=$(get_field "$f" origin)
+  case "$from" in ''|'-') from=$(get_field "$f" from_agent)${origin:+@$origin} ;;
+                  *) from="$from${origin:+@$origin} ($(get_field "$f" from_agent))" ;; esac
   # The recipient label is relative to whoever is reading: "to you" only when it
   # really is addressed to me, otherwise name the target — `msgs` shows other
   # people's mail too, including my own outbound.
@@ -1569,6 +1792,8 @@ render_msg() {
   case "$to" in
     '*')       label='all' ;;
     "$mypid")  label='to you' ;;
+    *@*)       label="to $to" ;;
+    unknown:*) label="to ${to#unknown:} (no such agent here)" ;;
     *)         if [ -f "$SESS/$to.md" ]; then
                  label="to $(name_of "$SESS/$to.md")"
                  [ "$label" = "to " ] && label="to pid $to"
@@ -1623,9 +1848,10 @@ poke_target() {   # poke_target <pid> <name>
   esac
 
   # idle: it will not run a hook until something drives it
-  if [ -n "${AGENT_BOARD_POKE_CMD:-}" ]; then
-    if "$AGENT_BOARD_POKE_CMD" "$pid" "$name" "$sock" >/dev/null 2>&1; then
-      printf '%s was idle — poked it via %s.\n' "$name" "$(basename "$AGENT_BOARD_POKE_CMD")"
+  local pcmd; pcmd=$(poke_cmd)
+  if [ -n "$pcmd" ]; then
+    if "$pcmd" "$pid" "$name" "$sock" >/dev/null 2>&1; then
+      printf '%s was idle — poked it via %s.\n' "$name" "$(basename "$pcmd")"
       cmd_note "poked $name (idle) after messaging it"
     else
       printf '%s is idle and the poke command failed — it will see this when it next runs.\n' "$name"
@@ -1646,6 +1872,13 @@ cmd_tell() {
   local to; to=$(resolve_target "$target") || return 1
   post_msg "$to" "$@" >/dev/null
   cmd_note "told $target: $*"
+  case "$to" in
+    *@*)
+      local iv; iv=$(peer_conf relay interval)
+      printf 'sent to %s — the relay carries it on its next sync (within %ss), and wakes it there if it is idle.\n' \
+        "$to" "${iv:-30}"
+      return 0 ;;
+  esac
   local canon=""
   [ -f "$SESS/$to.md" ] && { canon=$(person_of "$SESS/$to.md"); \
     [ -n "$canon" ] && canon="$canon · $(name_of "$SESS/$to.md")"; }
@@ -1674,7 +1907,8 @@ cmd_inbox() {
   for f in "$MSGS"/*.md; do
     [ -e "$f" ] || continue
     id=$(basename "$f")
-    [ "$(get_field "$f" from_pid)" = "$mypid" ] && continue    # not my own words
+    # not my own words — unless it came from a peer, whose pids are not ours
+    [ -z "$(get_field "$f" origin)" ] && [ "$(get_field "$f" from_pid)" = "$mypid" ] && continue
     [ "$(get_field "$f" epoch)" -ge "$floor" ] 2>/dev/null || continue
     to=$(get_field "$f" to)
     [ "$to" = '*' ] || [ "$to" = "$mypid" ] || continue
@@ -1721,7 +1955,7 @@ win_file() { printf '%s/%s.%s' "$WINS" "${1:-$(date +%F)}" "${2:-$$}"; }
 # of whoever logged them, which is not the order they happened.
 wins_for() {   # wins_for [YYYY-MM-DD] -> "HH:MM:SS<TAB>who<TAB>what", oldest first
   local d=${1:-$(date +%F)} f
-  for f in "$WINS/$d".*; do [ -e "$f" ] || continue; cat "$f"; done 2>/dev/null \
+  for f in "$WINS/$d".* "$REMOTED"/*/wins/"$d".*; do [ -e "$f" ] || continue; cat "$f"; done 2>/dev/null \
     | sort -t"$(printf '\t')" -k1,1 -s
 }
 
@@ -2465,6 +2699,16 @@ cmd_sweep() {
   # Wins outlive the sessions that logged them — that is the point of a tally —
   # but only for a few days. The board shows today; the rest is for looking back
   # at the weekly review, and after that it is clutter nobody reads.
+  # A peer's mirror outlives a sleeping laptop by design ("not seen since"), but not
+  # a peer that was dropped from machines.local or has been gone for the keep window.
+  local rd rt
+  for rd in "$REMOTED"/*/; do
+    [ -d "$rd" ] || continue
+    rt=$(head -1 "$rd/synced" 2>/dev/null | tr -dc 0-9)
+    if ! peers_on || [ $(( nowe - ${rt:-0} )) -gt $(( WIN_KEEP_DAYS * 86400 )) ]; then
+      rm -rf "$rd"
+    fi
+  done
   local cutoff; cutoff=$(days_ago "$WIN_KEEP_DAYS") || cutoff=""
   if [ -n "$cutoff" ]; then
     for f in "$WINS"/*.*; do
@@ -2986,6 +3230,13 @@ case "$sub" in
   sweep)      cmd_sweep_report ;;
   mine)       find_file && echo || { printf 'no session file\n'; exit 1; } ;;
   say)        cmd_say "$@" ;;
+  peers)      cmd_peers ;;
+  export|import|relay)
+              [ -x "$PEERCMD" ] || { printf 'agentboard-peer not found next to agentboard\n' >&2; exit 1; }
+              exec "$PEERCMD" "$sub" "$@" ;;
+  _export)    cmd__export ;;
+  _resolve)   cmd__resolve "$@" ;;
+  _poke)      cmd__poke "$@" ;;
   tell)       cmd_tell "$@" ;;
   inbox)      cmd_inbox "$@" || printf 'no new messages\n' ;;
   msgs)       cmd_msgs "$@" ;;
