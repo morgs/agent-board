@@ -447,10 +447,13 @@ def cmd_relay(args):
         die("machines.local lists no [peer] with an ssh target — the peers relay to us")
     while True:
         c = need_conf()   # re-read, so an edit takes effect without a restart
+        failed = False
         for peer in (p for p in c["peers"] if p.get("ssh")):
-            print("%s %s" % (time.strftime("%H:%M:%S"), sync_one(c, peer)), flush=True)
-        if once:
-            return
+            line = sync_one(c, peer)
+            failed = failed or " FAILED — " in line
+            print("%s %s" % (time.strftime("%H:%M:%S"), line), flush=True)
+        if once:   # a scheduler or a test can tell a failed sync from a good one
+            sys.exit(1 if failed else 0)
         time.sleep(c["relay"]["interval"])
 
 

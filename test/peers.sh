@@ -198,8 +198,9 @@ cat > "$T/stub/ssh-down" <<'EOF'
 echo "ssh: connect to host beta-host: Connection refused" >&2; exit 255
 EOF
 chmod +x "$T/stub/ssh-down"
-out=$(AGENT_BOARD_SSH="$T/stub/ssh-down" ab "$A" relay --once 2>&1)
+out=$(AGENT_BOARD_SSH="$T/stub/ssh-down" ab "$A" relay --once 2>&1); rc=$?
 has 'relay says it failed'   "$out" 'beta FAILED'
+[ "$rc" = 1 ] && ok 'and --once exits 1' || bad 'and --once exits 1' "rc=$rc"
 has 'peers shows the error'  "$(ab "$A" peers)" 'Connection refused'
 
 echo
