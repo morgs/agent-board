@@ -706,6 +706,15 @@ want 'a pinned session takes its person'      'Bertie-Pinned' "$(person_now)"
 want 'and keeps it, though not in the pool'   'Bertie-Pinned' "$(person_now)"
 rm -f "$AGENT_BOARD_DIR/persons.local"; "$AB" heartbeat
 want 'unpinned, it is drawn from the pool again' 'yes' "$(in_pool "$(person_now)" "$WODE")"
+# The first write already carries the pin, or the session-start greeting names
+# a drawn person and the pin lands only a turn later.
+printf 'early-role = Bertie-Early\n' > "$AGENT_BOARD_DIR/persons.local"
+{ trap - EXIT; exec sleep 3000; } </dev/null >/dev/null 2>&1 &
+ep=$!; disown "$ep" 2>/dev/null; FAKES+=("$ep")
+"$AB" claim --pid "$ep" --agent codex --name early-role --cwd "$O" >/dev/null
+want 'a named session takes its pin at claim' 'Bertie-Early' \
+  "$(sed -n 's/^person: //p' "$AGENT_BOARD_DIR/sessions/$ep.md")"
+rm -f "$AGENT_BOARD_DIR/persons.local"
 
 # A local pack is the escape hatch from our taste in names, so it has to work
 # without touching the shipped file: written to disk, selectable, and overriding a

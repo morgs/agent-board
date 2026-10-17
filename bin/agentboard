@@ -410,6 +410,14 @@ auto_person() {   # auto_person <pid> -> a person no live session is using
   printf 'Anon'
 }
 
+# A new session file takes its pin at once when the name is already known (a
+# resumed or named session), so its first greeting carries the right person.
+claim_person() {   # claim_person <pid> <session name>
+  local pin; pin=$(pinned_person "$2")
+  if [ -n "$pin" ] && ! person_taken "$pin"; then printf '%s' "$pin"
+  else auto_person "$1"; fi
+}
+
 name_taken() {   # name_taken <name> — among live sessions, the only ones addressable
   local want=$1 f
   for f in "$SESS"/*.md; do
@@ -1234,7 +1242,7 @@ cmd_claim() {
 agent: ${agent:-unknown}
 name: ${name:--}
 name_source: ${name_src:--}
-person: $(auto_person "$pid")
+person: $(claim_person "$pid" "$name")
 pid: $pid
 session: ${session:--}
 started: $(now_h)
