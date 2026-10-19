@@ -797,6 +797,17 @@ def main(argv):
             os.set_blocking(fd, True)
         except OSError:
             pass
+    env = None
+    if os.sep not in cmd[0] and not shutil.which(cmd[0]):
+        # The same virtualenv fallback find_tool uses: an agent shell that never
+        # activated the deploy checkout's .venv would otherwise resolve the target
+        # and then fail to start the command it just locked for.
+        venv_bin = os.path.join(cwd, ".venv", "bin")
+        cand = os.path.join(venv_bin, cmd[0])
+        if os.access(cand, os.X_OK):
+            cmd = [cand] + cmd[1:]
+            env = dict(os.environ, VIRTUAL_ENV=os.path.dirname(venv_bin),
+                       PATH=venv_bin + os.pathsep + os.environ.get("PATH", ""))
     proc = None
     try:
         # The lock fds go to the child on purpose: if this wrapper is killed while
@@ -804,7 +815,7 @@ def main(argv):
         # ends. Python closes every other fd in the child by default.
         # The hub's hold goes along too, so the hub stays locked while the deploy runs.
         keep = held + ([hub_proc.stdin.fileno()] if hub_proc else [])
-        proc = subprocess.Popen(cmd, pass_fds=keep)
+        proc = subprocess.Popen(cmd, pass_fds=keep, env=env)
         info["child"] = proc.pid
         write_owner(owners, info)
         return proc.wait()
