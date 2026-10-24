@@ -359,6 +359,42 @@ since: then
   > "$AGENT_BOARD_DIR/locks/env/sandbox.lease/owner"
 want 'a lease held by a dead pid is cleared' 'no dev environment is leased' "$("$AB" env status)"
 
+# Sweep can drop a live session's file (idle overnight on a long job) while its
+# lease stays. The lease is still mine: the hook must not ask me about my own box.
+"$AB" env take sandbox --for 'overnight job' >/dev/null 2>&1
+mine=$(cd "$D" && "$AB" mine)
+mv "$mine" "$T/mine.bak"
+out=$(printf '{"cwd":"%s","tool_name":"Bash","tool_input":{"command":"ssh sandbox true"}}' "$D" \
+      | (cd "$D" && "$AB" hook-pretool) 2>&1)
+wantnot 'a lost session file does not make my lease a peer'"'"'s' 'is leased by' "$out"
+mv "$T/mine.bak" "$mine"
+"$AB" env free sandbox >/dev/null 2>&1
+
+# A process named like an agent stands in for one: bash, run as claude.
+mkdir -p "$T/fakebin"; ln -s /bin/bash "$T/fakebin/claude"   # a copy is killed by code signing
+"$T/fakebin/claude" -c 'sleep 3000; true' </dev/null >/dev/null 2>&1 &
+CL=$!; disown "$CL" 2>/dev/null; FAKES+=("$CL")
+"$AB" claim --pid "$CL" --agent claude --cwd "$D" --name idle-overnight >/dev/null
+sed -i.bak "s/^epoch: .*/epoch: 1/" "$AGENT_BOARD_DIR/sessions/$CL.md"
+"$AB" sweep >/dev/null
+want 'sweep keeps a live agent that sat idle' 'yes' \
+  "$([ -f "$AGENT_BOARD_DIR/sessions/$CL.md" ] && echo yes || echo no)"
+P_IDLE=$(fake_named "$O" 'idle-sleeper')
+sed -i.bak "s/^epoch: .*/epoch: 1/" "$AGENT_BOARD_DIR/sessions/$P_IDLE.md"
+"$AB" sweep >/dev/null
+want 'but still drops a stale file whose pid is not an agent' 'gone' \
+  "$([ -f "$AGENT_BOARD_DIR/sessions/$P_IDLE.md" ] && echo kept || echo gone)"
+rm -f "$AGENT_BOARD_DIR/sessions/$CL.md"
+
+# The hook puts a lost session file back on the agent's next tool call. An empty
+# board, so no session file further up this test's own process tree answers first.
+B2="$T/board-lost"; mkdir -p "$B2/sessions"
+out=$(printf '{"cwd":"%s","tool_name":"Bash","tool_input":{"command":"true"}}' "$D" \
+      | AGENT_BOARD_DIR="$B2" "$T/fakebin/claude" -c "cd '$D' && '$AB' hook-pretool; echo \$\$ > '$T/hookparent'" 2>&1)
+HP=$(cat "$T/hookparent" 2>/dev/null)
+want 'a hook re-registers a live agent that lost its file' 'yes' \
+  "$([ -n "$HP" ] && [ -f "$B2/sessions/$HP.md" ] && echo yes || echo no)"
+
 echo
 echo 'the board panels — a view that sits open says "free", check does not'
 mkdir -p "$AGENT_BOARD_DIR/bin"; ln -sf "$(dirname "$AB")/deploylock" "$AGENT_BOARD_DIR/bin/deploylock"
