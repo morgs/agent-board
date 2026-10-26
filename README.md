@@ -66,10 +66,11 @@ MIT — see [`LICENSE`](./LICENSE).
       theme               one line: which pack of names this machine uses
       themes.local/       packs written here — gitignored, override the shipped ones
       persons.local       session names pinned to a person — gitignored
+      persistent.local    sessions live while their pid runs, idle or not — gitignored
       workspace.local     which repos here are worked which way — gitignored
       machines.local      the other machines this board talks to — gitignored
       remote/<label>/     each peer's board as last synced — rewritten, never edited
-      test/               five suites — run them after editing bin/
+      test/               six suites — run them after editing bin/
 
 Each session writes **only its own files**, named after the agent process pid. No
 shared file, so no write contention and no read-modify-write races. Reading the
@@ -348,6 +349,20 @@ An entry counts as live only if `status: ACTIVE`, its pid still exists, and it h
 been touched within `AGENT_BOARD_STALE_SECS` (default 2h). Crashed and Ctrl-C'd
 sessions therefore disappear on their own; `sweep` runs at every session start and
 also prunes `paths/<pid>` for dead pids and a lease whose owner is gone.
+
+**A session that runs all day can stay live while idle.** A chief of staff or a
+`/loop` may go a weekend without a turn, so without a heartbeat, and `tell` would
+find no live agent. `$AGENT_BOARD_DIR/persistent.local` lists such sessions by name,
+one per line, `#` comments allowed:
+
+    chief-of-staff
+    jarvis-remote
+
+A session named there is live while `status: ACTIVE` and its pid exists, whatever
+its heartbeat age, and `sweep` keeps it while the pid runs. A crashed one still
+drops off: its pid is gone, so it is neither live nor kept. Other machines see it
+the same way, because the export carries this machine's own `is_live` judgement.
+It is machine-local and gitignored, like `persons.local`.
 
 ## Names
 

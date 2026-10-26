@@ -20,6 +20,7 @@ bin/agentboard.prev
 # only useful if a pull never argues with them.
 /themes.local/
 /persons.local
+/persistent.local
 
 # Which repos on this machine are worked in which way. Describes a workspace, not
 # this tool — and naming a team's repos is exactly what should not ship.

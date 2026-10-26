@@ -416,6 +416,18 @@ is_pinned_person() {   # is_pinned_person <person>
     END { exit !f }' "$PERSONS_FILE"
 }
 
+# A session that runs all day and may sit idle for one — a chief of staff, a /loop —
+# would fall off the roster, and out of reach of `tell`, once its heartbeat aged
+# past STALE_SECS. One session name per line in persistent.local exempts it: live
+# while its pid runs, however long since its last turn. A crash still drops it.
+PERSISTENT_FILE="$BOARD/persistent.local"
+is_persistent() {   # is_persistent <session name>
+  [ -n "$1" ] && [ -f "$PERSISTENT_FILE" ] || return 1
+  awk -v n="$1" '/^[[:space:]]*(#|$)/ { next }
+    { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if ($0 == n) f = 1 }
+    END { exit !f }' "$PERSISTENT_FILE"
+}
+
 auto_person() {   # auto_person <pid> -> a person no live session is using
   local pid=$1 i=0 cand
   local -a P=($(person_pool))
@@ -536,6 +548,7 @@ is_live() {
   [ "$(get_field "$f" status)" = "ACTIVE" ] || return 1
   pid=$(get_field "$f" pid)
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  is_persistent "$(name_of "$f")" && return 0
   epoch=$(get_field "$f" epoch); [ -n "$epoch" ] || return 1
   age=$(( $(now_e) - epoch ))
   [ "$age" -lt "$STALE_SECS" ]
@@ -2858,6 +2871,7 @@ cmd_sweep() {
     # dropping its file would orphan its leases and file claims. The age rule
     # stays for a pid that some other program has since been given.
     [ -n "$pid" ] && is_agent_comm "$pid" && continue
+    [ -n "$pid" ] && is_persistent "$(name_of "$f")" && continue
     if [ "$age" -gt $(( STALE_SECS * 4 )) ]; then rm -f "$f"; SW_S=$((SW_S+1)); fi
   done
   for f in "$MSGS"/*.md; do
