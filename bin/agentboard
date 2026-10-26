@@ -429,7 +429,8 @@ auto_person() {   # auto_person <pid> -> a person no live session is using
 
 # A new session file takes its pin at once when the name is already known (a
 # resumed or named session), so its first greeting carries the right person.
-claim_person() {   # claim_person <pid> <session name>
+# Pass the name the user chose, never the one issued: an issued name has no pin.
+claim_person() {   # claim_person <pid> <chosen session name>
   local pin; pin=$(pinned_person "$2")
   if [ -n "$pin" ] && ! person_taken "$pin"; then printf '%s' "$pin"
   else auto_person "$1"; fi
@@ -1248,12 +1249,13 @@ cmd_claim() {
     [ -n "$scope" ] && set_field "$f" scope "$scope"
     touch_updated "$f"
   else
+    local chosen=$name
     [ -n "$name" ] || { name=$(auto_name "$pid"); name_src=auto; }
     cat > "$f" <<EOF
 agent: ${agent:-unknown}
 name: ${name:--}
 name_source: ${name_src:--}
-person: $(claim_person "$pid" "$name")
+person: $(claim_person "$pid" "$chosen")
 pid: $pid
 session: ${session:--}
 started: $(now_h)
