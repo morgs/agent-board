@@ -84,7 +84,7 @@ DEPLOYLOCK="$BOARD/bin/deploylock"
 PEERCMD="$BOARD/bin/agentboard-peer"
 MACHINES="$BOARD/machines.local"   # optional: the peers this board is mirrored with
 REMOTED="$BOARD/remote"            # their mirrors, written by the relay
-STALE_SECS="${AGENT_BOARD_STALE_SECS:-7200}"     # 2h without a heartbeat = presumed dead
+STALE_SECS="${AGENT_BOARD_STALE_SECS:-7200}"     # 2h without a heartbeat = presumed dead, unless its pid is still an agent
 DONE_KEEP_SECS="${AGENT_BOARD_DONE_KEEP_SECS:-3600}"
 MSG_KEEP_SECS="${AGENT_BOARD_MSG_KEEP_SECS:-86400}"
 WIN_KEEP_DAYS="${AGENT_BOARD_WIN_KEEP_DAYS:-7}"  # today plus the seven days before it, so a weekly review sees a whole week
@@ -416,10 +416,10 @@ is_pinned_person() {   # is_pinned_person <person>
     END { exit !f }' "$PERSONS_FILE"
 }
 
-# A session that runs all day and may sit idle for one — a chief of staff, a /loop —
-# would fall off the roster, and out of reach of `tell`, once its heartbeat aged
-# past STALE_SECS. One session name per line in persistent.local exempts it: live
-# while its pid runs, however long since its last turn. A crash still drops it.
+# An agent process stays live however long it sits idle (see is_live). For a
+# session whose pid is not an agent by name — a wrapper, a /loop run under a
+# shell — one session name per line in persistent.local does the same: live while
+# its pid runs, however long since its last turn. A crash still drops it.
 PERSISTENT_FILE="$BOARD/persistent.local"
 is_persistent() {   # is_persistent <session name>
   [ -n "$1" ] && [ -f "$PERSISTENT_FILE" ] || return 1
@@ -544,14 +544,17 @@ touch_updated() {
 append_log() { printf -- '- %s %s\n' "$(hhmm)" "$2" >> "$1"; }
 
 is_live() {
-  local f=$1 pid epoch age
+  local f=$1 pid epoch
   [ "$(get_field "$f" status)" = "ACTIVE" ] || return 1
   pid=$(get_field "$f" pid)
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
-  is_persistent "$(name_of "$f")" && return 0
-  epoch=$(get_field "$f" epoch); [ -n "$epoch" ] || return 1
-  age=$(( $(now_e) - epoch ))
-  [ "$age" -lt "$STALE_SECS" ]
+  epoch=$(get_field "$f" epoch)
+  [ -n "$epoch" ] && [ $(( $(now_e) - epoch )) -lt "$STALE_SECS" ] && return 0
+  # Past the heartbeat age: an agent idle all evening is still reachable while its
+  # pid runs an agent. The comm check is what keeps a pid since reused by some
+  # other program from passing.
+  is_agent_comm "$pid" && return 0
+  is_persistent "$(name_of "$f")"
 }
 
 name_of() {   # <file> -> the session's name, or empty

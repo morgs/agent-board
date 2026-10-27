@@ -1,10 +1,10 @@
 #!/bin/bash
-# Verifies persistent.local: a session named there stays live and survives sweep
-# however old its heartbeat, as long as its pid runs; a dead pid still drops it;
-# and a session not named there keeps the heartbeat rule.
+# Verifies the idle rule: an agent process, or a session named in persistent.local,
+# stays live and survives sweep however old its heartbeat, as long as its pid runs;
+# a dead pid still drops it; and any other session keeps the heartbeat rule.
 #
-# The stand-ins are plain `sleep` processes, not agents, so sweep's "a live agent
-# that sat idle" rule cannot be what keeps them.
+# The persistent.local stand-ins are plain `sleep` processes, not agents, so the
+# agent rule cannot be what keeps them.
 #
 #   ~/agent-board/test/persistent.sh
 set -uo pipefail
@@ -78,6 +78,21 @@ rm -f "$AGENT_BOARD_DIR/persistent.local"
 wantnot 'with no persistent.local, an old heartbeat is not live'    'chief-of-staff' "$("$AB" list 2>&1)"
 "$AB" sweep >/dev/null
 want 'and sweep drops it'                                           'gone' "$(kept "$COS")"
+
+# An agent process needs no persistent.local: a copy of sleep named claude has the
+# comm an agent has, so it stays live however old its heartbeat.
+mkdir -p "$T/bin" && cp "$(command -v sleep)" "$T/bin/claude"
+{ trap - EXIT; exec "$T/bin/claude" 3000; } </dev/null >/dev/null 2>&1 &
+AG=$!; disown "$AG" 2>/dev/null; FAKES+=("$AG")
+"$AB" claim --pid "$AG" --agent claude --cwd "$T" --name idle-agent >/dev/null
+sed -i.bak "s/^epoch: .*/epoch: 1/" "$AGENT_BOARD_DIR/sessions/$AG.md"
+want    'an idle agent process with an old heartbeat is live'       'idle-agent' "$("$AB" list 2>&1)"
+wantnot 'tell reaches it'                                           'no live' \
+  "$("$AB" tell idle-agent 'ping' 2>&1)"
+want    'and its export carries it to other machines'               'idle-agent' \
+  "$("$AB" _export | grep '^S')"
+kill "$AG" 2>/dev/null; wait "$AG" 2>/dev/null
+wantnot 'an agent whose pid died is not live'                       'idle-agent' "$("$AB" list 2>&1)"
 
 echo
 printf 'passed %s, failed %s\n' "$pass" "$fail"

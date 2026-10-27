@@ -345,15 +345,19 @@ checkout is never listed.
 
 ## Liveness
 
-An entry counts as live only if `status: ACTIVE`, its pid still exists, and it has
-been touched within `AGENT_BOARD_STALE_SECS` (default 2h). Crashed and Ctrl-C'd
-sessions therefore disappear on their own; `sweep` runs at every session start and
-also prunes `paths/<pid>` for dead pids and a lease whose owner is gone.
+An entry counts as live only if `status: ACTIVE` and its pid still exists. It must
+also have been touched within `AGENT_BOARD_STALE_SECS` (default 2h), unless that pid
+is still an agent process (`claude`, `codex`, `grok`, …): an agent left idle all
+evening stays on the roster, in reach of `tell` and the poke, on this machine and
+on its peers. The name check stops a pid since reused by another program from
+passing. Crashed and Ctrl-C'd sessions therefore disappear on their own; `sweep`
+runs at every session start and also prunes `paths/<pid>` for dead pids and a lease
+whose owner is gone.
 
-**A session that runs all day can stay live while idle.** A chief of staff or a
-`/loop` may go a weekend without a turn, so without a heartbeat, and `tell` would
-find no live agent. `$AGENT_BOARD_DIR/persistent.local` lists such sessions by name,
-one per line, `#` comments allowed:
+**A session whose pid is not an agent by name can stay live while idle too.** A
+wrapper or a `/loop` under a shell may go a weekend without a turn.
+`$AGENT_BOARD_DIR/persistent.local` lists such sessions by name, one per line, `#`
+comments allowed:
 
     chief-of-staff
     jarvis-remote
@@ -1054,7 +1058,7 @@ exactly the failure this board exists to prevent.
 |---|---|---|
 | `AGENT_BOARD_DIR` | `~/agent-board` | relocate the whole board |
 | `AGENT_BOARD_WORKSPACE` | `$AGENT_BOARD_DIR/workspace.local` | the repo-policy profile — point it at a shared file to give a team one copy |
-| `AGENT_BOARD_STALE_SECS` | `7200` | how long without a heartbeat before an entry is ignored |
+| `AGENT_BOARD_STALE_SECS` | `7200` | how long without a heartbeat before an entry is ignored, unless its pid is still an agent |
 | `AGENT_BOARD_DONE_KEEP_SECS` | `3600` | how long finished entries linger before `sweep` drops them |
 | `AGENT_BOARD_MSG_KEEP_SECS` | `86400` | how long messages live before `sweep` drops them |
 | `AGENT_BOARD_DELIVER_ON_STOP` | `1` | `0` stops messages being pushed at end of turn |
