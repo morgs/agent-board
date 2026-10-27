@@ -569,12 +569,14 @@ name_of() {   # <file> -> the session's name, or empty
 }
 
 state_of() {  # <file> -> busy|idle|..., or empty
-  local f=$1 st pid
-  st=$(get_field "$f" state)
-  case "$st" in ''|'-') st="" ;; esac
+  # Claude's own status file first: the field is written from a hook, which runs
+  # mid-turn, so it says busy for an agent that has sat idle since.
+  local f=$1 st="" pid
+  pid=$(get_field "$f" pid)
+  [ -n "$pid" ] && st=$(cc_meta "$pid" status) || st=""
   if [ -z "$st" ]; then
-    pid=$(get_field "$f" pid)
-    [ -n "$pid" ] && st=$(cc_meta "$pid" status) || st=""
+    st=$(get_field "$f" state)
+    case "$st" in ''|'-') st="" ;; esac
   fi
   printf '%s' "$st"
 }
