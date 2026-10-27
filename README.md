@@ -1004,7 +1004,9 @@ already has an origin is never sent back, so nothing echoes. `tell name` resolve
 name that is live only on a peer; a name live on two machines must be written
 `name@label`. Person names are issued unique across the mirrors. To wake an idle
 target on its own machine, set `poke` under `[local]` there — it is called like
-`AGENT_BOARD_POKE_CMD`.
+`AGENT_BOARD_POKE_CMD`. For agents that run in herdr, `bin/ab-poke-herdr` does it on Linux and
+macOS: `poke = ~/agent-board/bin/ab-poke-herdr`. Without a `poke` line, a message to an
+idle agent there waits until someone types in its pane.
 
 **The hub** holds the hard locks, so put it on the machine that is always on.
 - `deploylock` on another machine takes its lock locally and then the same lock on

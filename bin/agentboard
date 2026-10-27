@@ -2093,7 +2093,7 @@ cmd_tell() {
   case "$to" in
     *@*)
       local iv; iv=$(peer_conf relay interval)
-      printf 'sent to %s — the relay carries it on its next sync (within %ss), and wakes it there if it is idle.\n' \
+      printf 'sent to %s — the relay carries it on its next sync (within %ss), and wakes it there if it is idle and that machine sets poke in machines.local.\n' \
         "$to" "${iv:-30}"
       return 0 ;;
   esac

@@ -1,0 +1,26 @@
+#!/bin/sh
+# agent-board poke command: <pid> <name> <socket>. Finds the herdr pane the pid runs
+# in and prompts the agent there to read its inbox. Set it per machine in
+# machines.local:  [local]  poke = ~/agent-board/bin/ab-poke-herdr
+#
+# The relay runs under launchd or systemd, which do not read a shell profile, so
+# herdr is looked for in the usual install places as well as on PATH.
+pid=$1
+[ -n "$pid" ] || exit 1
+
+if [ -r /proc/"$pid"/environ ]; then
+  pane=$(tr "\0" "\n" < /proc/"$pid"/environ 2>/dev/null | sed -n "s/^HERDR_PANE_ID=//p")
+else
+  # macOS has no /proc; `ps eww` appends the environment of a process of this user.
+  pane=$(ps eww -p "$pid" -o command= 2>/dev/null | tr ' ' '\n' | sed -n "s/^HERDR_PANE_ID=//p" | head -1)
+fi
+[ -n "$pane" ] || exit 1
+
+herdr=$(command -v herdr 2>/dev/null)
+for c in "$HOME/.local/bin/herdr" /opt/homebrew/bin/herdr /usr/local/bin/herdr "$HOME/.cargo/bin/herdr"; do
+  [ -n "$herdr" ] && break
+  [ -x "$c" ] && herdr=$c
+done
+[ -n "$herdr" ] || exit 1
+
+exec "$herdr" agent prompt "$pane" "you have mail, run agentboard inbox" >/dev/null
