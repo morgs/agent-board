@@ -23,4 +23,19 @@ for c in "$HOME/.local/bin/herdr" /opt/homebrew/bin/herdr /usr/local/bin/herdr "
 done
 [ -n "$herdr" ] || exit 1
 
+# `agent prompt` types its line and presses Enter, so anything already in the input
+# box would be sent with it, cut off mid-sentence. Claude draws its own prompt
+# suggestion dim (SGR 2); other text after the last ❯ is a draft the human is
+# writing. Exit 75 (EX_TEMPFAIL) and the board tries again on a later tick. A ❯ in
+# a dialog's option list reads as a draft too, which is right: the target cannot
+# take a prompt until the dialog closes.
+esc=$(printf '\033')
+draft=$("$herdr" agent read "$pane" --source visible --format ansi 2>/dev/null \
+  | LC_ALL=C grep -a '❯' | tail -n 1 \
+  | LC_ALL=C sed -e "s/.*❯//" \
+      -e "s/${esc}\[2m[^${esc}]*${esc}\[[0-9;]*m//g" \
+      -e "s/${esc}\[[0-9;?]*[A-Za-z]//g" \
+  | LC_ALL=C tr -d ' \t\r\302\240')
+[ -z "$draft" ] || exit 75
+
 exec "$herdr" agent prompt "$pane" "you have mail, run agentboard inbox" >/dev/null
