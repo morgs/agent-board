@@ -1883,6 +1883,48 @@ poke_cmd() {
   [ -n "$v" ] && printf '%s' "${v/#\~/$HOME}"
 }
 
+# A poke can fail for a reason that passes: the human has half a message typed in the
+# target's input box (the poke would press Enter on it), or the target has a dialog
+# open. Such a poke waits in $POKES, one file per target, and the next tick tries it
+# again: a relay pass, a peer import, or any local agent's Stop. It is dropped once
+# the target has read its mail, has gone busy (its Stop delivers the mail), has
+# ended, or has waited POKE_TTL seconds.
+POKES="$BOARD/pokes"
+POKE_TTL=${AGENT_BOARD_POKE_TTL:-14400}
+
+poke_later() {   # poke_later <pid> — keeps the first time, so the TTL runs from it
+  mkdir -p "$POKES"
+  [ -e "$POKES/$1" ] || now_e > "$POKES/$1"
+}
+
+cmd__repoke() {
+  [ -d "$POKES" ] || return 0
+  local pcmd f pid since try st name sock now
+  pcmd=$(poke_cmd); now=$(now_e)
+  for f in "$POKES"/*; do
+    [ -e "$f" ] || continue
+    pid=$(basename "$f")
+    case "$pid" in *[!0-9]*) continue ;; esac
+    # Several ticks can run at once. A rename is atomic, so one of them takes it.
+    try="$f.try.$$"
+    mv "$f" "$try" 2>/dev/null || continue
+    since=$(cat "$try" 2>/dev/null); since=${since:-0}
+    st=$(cc_meta "$pid" status) || st=""
+    if [ -z "$pcmd" ] || [ ! -f "$SESS/$pid.md" ] || [ "$st" != idle ] \
+       || [ $((now - since)) -ge "$POKE_TTL" ] || ! has_unread "$pid"; then
+      rm -f "$try"; continue
+    fi
+    name=$(name_of "$SESS/$pid.md")
+    sock=$(cc_meta "$pid" messagingSocketPath) || sock=""
+    if "$pcmd" "$pid" "$name" "$sock" >/dev/null 2>&1; then
+      rm -f "$try"
+    else
+      mv "$try" "$f" 2>/dev/null
+    fi
+  done
+  return 0
+}
+
 cmd_peers() {   # what this board is mirrored with, and how fresh each mirror is
   if ! peers_on; then
     printf 'no machines.local — this board is on its own.\n'
@@ -2077,7 +2119,8 @@ poke_target() {   # poke_target <pid> <name>
       printf '%s was idle — poked it via %s.\n' "$name" "$(basename "$pcmd")"
       cmd_note "poked $name (idle) after messaging it"
     else
-      printf '%s is idle and the poke command failed — it will see this when it next runs.\n' "$name"
+      poke_later "$pid"
+      printf '%s is idle but could not be poked now (text in its input box, or a dialog open) — the board pokes it again on a later tick.\n' "$name"
     fi
     return 0
   fi
@@ -2118,8 +2161,32 @@ cmd_tell() {
 # `inbox_epoch` stays on as a floor — set once when the session registers, so a
 # new session is not handed yesterday's chatter — and the read file does the exact
 # bookkeeping. Each session appends only to its own read file.
+#
+# msg_unread <file> <pid> <floor> <readfile>: the message is addressed to <pid> (or to
+# everyone) and <pid> has not been shown it yet.
+msg_unread() {
+  local f=$1 pid=$2 floor=$3 rf=$4 to
+  # not its own words — unless it came from a peer, whose pids are not ours
+  [ -z "$(get_field "$f" origin)" ] && [ "$(get_field "$f" from_pid)" = "$pid" ] && return 1
+  [ "$(get_field "$f" epoch)" -ge "$floor" ] 2>/dev/null || return 1
+  to=$(get_field "$f" to)
+  [ "$to" = '*' ] || [ "$to" = "$pid" ] || return 1
+  [ -f "$rf" ] && grep -qxF "$(basename "$f")" "$rf" 2>/dev/null && return 1
+  return 0
+}
+
+has_unread() {   # has_unread <pid>
+  local pid=$1 floor f
+  floor=$(get_field "$SESS/$pid.md" inbox_epoch); floor=${floor:-0}
+  for f in "$MSGS"/*.md; do
+    [ -e "$f" ] || continue
+    msg_unread "$f" "$pid" "$floor" "$READ/$pid" && return 0
+  done
+  return 1
+}
+
 cmd_inbox() {
-  local peek=0 me mypid floor rf f id to n=0 out="" fresh=""
+  local peek=0 me mypid floor rf f id n=0 out="" fresh=""
   while [ $# -gt 0 ]; do
     case "$1" in --peek) peek=1; shift;; *) shift;; esac
   done
@@ -2130,12 +2197,7 @@ cmd_inbox() {
   for f in "$MSGS"/*.md; do
     [ -e "$f" ] || continue
     id=$(basename "$f")
-    # not my own words — unless it came from a peer, whose pids are not ours
-    [ -z "$(get_field "$f" origin)" ] && [ "$(get_field "$f" from_pid)" = "$mypid" ] && continue
-    [ "$(get_field "$f" epoch)" -ge "$floor" ] 2>/dev/null || continue
-    to=$(get_field "$f" to)
-    [ "$to" = '*' ] || [ "$to" = "$mypid" ] || continue
-    [ -f "$rf" ] && grep -qxF "$id" "$rf" 2>/dev/null && continue
+    msg_unread "$f" "$mypid" "$floor" "$rf" || continue
     out="$out$(render_msg "$f")"$'\n'
     fresh="$fresh$id"$'\n'
     n=$((n+1))
@@ -3399,6 +3461,7 @@ EOF
 hook_stop() {
   cat >/dev/null
   cmd_heartbeat
+  cmd__repoke >/dev/null 2>&1
   [ "$DELIVER_ON_STOP" = "0" ] && exit 0
   local inbox
   inbox=$(cmd_inbox) || exit 0
@@ -3478,6 +3541,7 @@ case "$sub" in
   _export)    cmd__export ;;
   _resolve)   cmd__resolve "$@" ;;
   _poke)      cmd__poke "$@" ;;
+  _repoke)    cmd__repoke ;;
   tell)       cmd_tell "$@" ;;
   inbox)      cmd_inbox "$@" || printf 'no new messages\n' ;;
   msgs)       cmd_msgs "$@" ;;

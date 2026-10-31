@@ -176,6 +176,66 @@ has 'and says to poke, not duplicate' "$out" 'the board already holds the text'
 sed -i.bak 's/"status":"idle"/"status":"busy"/' "$STUBJSON"
 out=$("$AB" tell dozing 'no poke needed' 2>&1)
 has 'busy target is not poked' "$out" 'end of its current turn'
+sed -i.bak 's/"status":"busy"/"status":"idle"/' "$STUBJSON"
+
+echo
+echo 'a poke that cannot land now is tried again'
+# exit 75 is what ab-poke-herdr returns for a draft in the box or a dialog open
+LATER=$AGENT_BOARD_DIR/later.sh
+printf '#!/bin/sh\nexit 75\n' > "$LATER"; chmod +x "$LATER"
+: > "$AGENT_BOARD_DIR/poked"
+out=$(AGENT_BOARD_POKE_CMD=$LATER "$AB" tell dozing 'while you were typing' 2>&1)
+has  'a failed poke says it will try again' "$out" 'pokes it again on a later tick'
+check 'and queues the target' "$(ls "$AGENT_BOARD_DIR/pokes" 2>/dev/null)" "$IDLE"
+AGENT_BOARD_POKE_CMD=$LATER "$AB" _repoke
+check 'still blocked: it stays queued' "$(ls "$AGENT_BOARD_DIR/pokes" 2>/dev/null)" "$IDLE"
+AGENT_BOARD_POKE_CMD=$POKE "$AB" _repoke
+has  'the retry pokes once the box is clear' "$(cat "$AGENT_BOARD_DIR/poked")" "$IDLE dozing"
+check 'and leaves the queue' "$(ls "$AGENT_BOARD_DIR/pokes" 2>/dev/null)" ""
+# a target that read its mail meanwhile needs no poke
+AGENT_BOARD_POKE_CMD=$LATER "$AB" tell dozing 'read in the meantime' >/dev/null 2>&1
+ls "$AGENT_BOARD_DIR/messages" >> "$AGENT_BOARD_DIR/read/$IDLE"
+: > "$AGENT_BOARD_DIR/poked"
+AGENT_BOARD_POKE_CMD=$POKE "$AB" _repoke
+check 'read mail: dropped, not poked' "$(cat "$AGENT_BOARD_DIR/poked")$(ls "$AGENT_BOARD_DIR/pokes")" ""
+# a target that went busy collects at its own Stop
+AGENT_BOARD_POKE_CMD=$LATER "$AB" tell dozing 'busy now' >/dev/null 2>&1
+sed -i.bak 's/"status":"idle"/"status":"busy"/' "$STUBJSON"
+AGENT_BOARD_POKE_CMD=$POKE "$AB" _repoke
+check 'busy: dropped, not poked' "$(cat "$AGENT_BOARD_DIR/poked")$(ls "$AGENT_BOARD_DIR/pokes")" ""
+sed -i.bak 's/"status":"busy"/"status":"idle"/' "$STUBJSON"
+# a draft left for hours does not keep the target queued for ever
+AGENT_BOARD_POKE_CMD=$LATER "$AB" tell dozing 'left overnight' >/dev/null 2>&1
+echo 1 > "$AGENT_BOARD_DIR/pokes/$IDLE"
+AGENT_BOARD_POKE_CMD=$POKE "$AB" _repoke
+check 'past the TTL: dropped, not poked' "$(cat "$AGENT_BOARD_DIR/poked")$(ls "$AGENT_BOARD_DIR/pokes")" ""
+
+echo
+echo 'ab-poke-herdr leaves a draft alone'
+# a stand-in herdr: `agent read` prints a screen, `agent prompt` records the call
+FAKEBIN=$AGENT_BOARD_DIR/fakebin; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/herdr" <<EOF
+#!/bin/sh
+case "\$2" in
+  read)   cat "$AGENT_BOARD_DIR/screen" ;;
+  prompt) echo "\$3 \$4" >> "$AGENT_BOARD_DIR/prompted" ;;
+esac
+EOF
+chmod +x "$FAKEBIN/herdr"
+env HERDR_PANE_ID=w9:p9 sleep 3000 & INPANE=$!; disown $INPANE 2>/dev/null; FAKES+=("$INPANE")
+sleep 0.2
+HP=${AB%/agentboard}/ab-poke-herdr
+screen() { printf '%s\n' '────' "$1" '────' > "$AGENT_BOARD_DIR/screen"; }
+screen "$(printf '❯\302\240\033[0m\033[2m/upcoming\033[0m\r')"
+PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
+check "Claude's dim suggestion is not a draft: poked" "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "0/w9:p9 you have mail, run agentboard inbox"
+rm -f "$AGENT_BOARD_DIR/prompted"
+screen "$(printf '❯\302\240\033[0mI want the inv\033[7m \033[0m\r')"
+PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
+check 'a typed draft: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
+screen "$(printf '❯ 1. Yes\r')"
+PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
+check 'a dialog open: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
 rm -f "$STUBJSON"
 
 echo

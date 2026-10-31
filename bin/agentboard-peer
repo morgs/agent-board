@@ -209,6 +209,15 @@ def poke_local(pid):
     subprocess.run([AGENTBOARD, "_poke", pid], env=env, capture_output=True, timeout=30)
 
 
+def repoke_local():
+    """Retry pokes that could not land earlier: each relay pass and import is a tick."""
+    env = dict(os.environ, AGENT_BOARD_DIR=BOARD)
+    try:
+        subprocess.run([AGENTBOARD, "_repoke"], env=env, capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def cmd_import(args):
     c = need_conf()
     me = c["local"]["label"]
@@ -298,6 +307,7 @@ def cmd_import(args):
     atomic_write(os.path.join(d, "synced"), "%d\n" % int(time.time()))
     for pid in dict.fromkeys(pokes):
         poke_local(pid)
+    repoke_local()
     print("imported %s: %d session(s), %d new message(s)"
           % (origin, len(rows), new))
 
@@ -452,6 +462,7 @@ def cmd_relay(args):
             line = sync_one(c, peer)
             failed = failed or " FAILED — " in line
             print("%s %s" % (time.strftime("%H:%M:%S"), line), flush=True)
+        repoke_local()
         if once:   # a scheduler or a test can tell a failed sync from a good one
             sys.exit(1 if failed else 0)
         time.sleep(c["relay"]["interval"])

@@ -708,6 +708,16 @@ Either way **the poke says "you have mail"; it does not carry the message.** The
 stays the single source of truth, so nothing is ever delivered twice, and the read
 bookkeeping stays in one place.
 
+**A poke that cannot land now is tried again.** When the poke command fails, the
+target goes into `pokes/` and the next tick tries again. A tick is a relay pass, a
+peer import, or the Stop hook of any local agent. The target leaves the queue when the
+poke lands, when it has read its mail, when it goes busy (its own Stop delivers the
+mail), when it ends, or after `AGENT_BOARD_POKE_TTL` seconds. `ab-poke-herdr` uses
+this on purpose. `herdr agent prompt` types a line and presses Enter, so it would send
+the text the human has half typed in the input box. If text that is not Claude's dim
+prompt suggestion follows the last `❯`, or a dialog is open, `ab-poke-herdr` exits 75
+and the board waits.
+
 ## Claude Code integration (automatic, via global hooks)
 
 | Hook | Matcher | Effect |
@@ -1063,6 +1073,7 @@ exactly the failure this board exists to prevent.
 | `AGENT_BOARD_MSG_KEEP_SECS` | `86400` | how long messages live before `sweep` drops them |
 | `AGENT_BOARD_DELIVER_ON_STOP` | `1` | `0` stops messages being pushed at end of turn |
 | `AGENT_BOARD_POKE_CMD` | unset | run as `<cmd> <pid> <name> <socket>` to wake an idle target |
+| `AGENT_BOARD_POKE_TTL` | `14400` | how long a poke that could not land is tried again |
 | `AGENT_BOARD_CC_SESSIONS` | `~/.claude/sessions` | where Claude's own session metadata is read from |
 | `AGENT_BOARD_OVERRIDE` | unset | set on a command to bypass the git/repo gate |
 | `AGENT_BOARD_SSH` | `ssh` | the ssh client the relay, `deploylock` and `env take` use to reach a peer |
