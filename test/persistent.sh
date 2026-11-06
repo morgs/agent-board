@@ -79,10 +79,11 @@ wantnot 'with no persistent.local, an old heartbeat is not live'    'chief-of-st
 "$AB" sweep >/dev/null
 want 'and sweep drops it'                                           'gone' "$(kept "$COS")"
 
-# An agent process needs no persistent.local: a copy of sleep named claude has the
+# An agent process needs no persistent.local: a shell started as claude has the
 # comm an agent has, so it stays live however old its heartbeat.
-mkdir -p "$T/bin" && cp "$(command -v sleep)" "$T/bin/claude"
-{ trap - EXIT; exec "$T/bin/claude" 3000; } </dev/null >/dev/null 2>&1 &
+# A symlink, not a copy: macOS kills a copied system binary on its code signature.
+mkdir -p "$T/bin" && ln -s /bin/bash "$T/bin/claude"
+{ trap - EXIT; exec "$T/bin/claude" -c 'sleep 3000; true'; } </dev/null >/dev/null 2>&1 &
 AG=$!; disown "$AG" 2>/dev/null; FAKES+=("$AG")
 "$AB" claim --pid "$AG" --agent claude --cwd "$T" --name idle-agent >/dev/null
 sed -i.bak "s/^epoch: .*/epoch: 1/" "$AGENT_BOARD_DIR/sessions/$AG.md"

@@ -222,7 +222,16 @@ case "\$2" in
 esac
 EOF
 chmod +x "$FAKEBIN/herdr"
-env HERDR_PANE_ID=w9:p9 sleep 3000 & INPANE=$!; disown $INPANE 2>/dev/null; FAKES+=("$INPANE")
+# macOS `ps eww` hides the environment of Apple's own binaries (/bin/sleep,
+# /bin/bash), so the stand-in agent must be a non-Apple binary, as claude is.
+inpane_cmd=(sleep 3000)
+if [ ! -r /proc/self/environ ]; then
+  for c in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [ -x "$c" ] && { inpane_cmd=("$c" -c 'sleep 3000; true'); break; }
+  done
+  [ "${inpane_cmd[0]}" = sleep ] && command -v node >/dev/null && inpane_cmd=(node -e 'setTimeout(()=>{},3e6)')
+fi
+env HERDR_PANE_ID=w9:p9 "${inpane_cmd[@]}" </dev/null >/dev/null 2>&1 & INPANE=$!; disown $INPANE 2>/dev/null; FAKES+=("$INPANE")
 sleep 0.2
 HP=${AB%/agentboard}/ab-poke-herdr
 screen() { printf '%s\n' '────' "$1" '────' > "$AGENT_BOARD_DIR/screen"; }
