@@ -332,6 +332,13 @@ Five verdicts, and only the first is an invitation to act: merged and clean, mer
 **but dirty** (uncommitted work on a branch that is already in — look before removing),
 not merged yet, an agent is live in it, and **another tool owns it**.
 
+"Merged" means merged into `main` or `origin/main` (it fetches first, so a stale local
+`main` does not hide a merge), **or** a merged PR on GitHub for that branch. The PR test
+catches squash merges, cherry-picks and merges into another base such as `19.0-dev`,
+which leave no ancestry for `git branch --merged` to see; those verdicts name the PR and
+offer `git branch -D`, because `-d` would refuse. Every merged-and-clean verdict prints
+the whole cleanup: worktree, local branch, remote branch.
+
 That last one matters once more than one tool is in play. Agents are told to take
 `../<repo>-<name>`, so a **sibling of the main checkout** is one of ours; another
 agent tool's own worktree directory, `.claude/worktrees/...` and scratchpad trees

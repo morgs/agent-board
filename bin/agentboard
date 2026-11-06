@@ -1599,13 +1599,39 @@ worktrees_report() {   # worktrees_report <repo> [only-this-path]
   local repo=$1 only=${2:-} base
   base=$(default_branch "$repo")
   [ -n "$base" ] || return 0
+  # A stale local main hides a merge, so test against a fresh origin as well.
+  GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch -q origin 2>/dev/null
   WT="$(git -C "$repo" worktree list --porcelain 2>/dev/null)" \
-  MERGED="$(git -C "$repo" branch --merged "$base" --format='%(refname:short)' 2>/dev/null)" \
-  LIVE="$(live_repo_dirs)" ONLY="$only" BASE="$base" python3 <<'PY'
-import os, subprocess
+  MERGED="$(git -C "$repo" branch --merged "$base" --format='%(refname:short)' 2>/dev/null
+            git -C "$repo" branch --merged "origin/$base" --format='%(refname:short)' 2>/dev/null)" \
+  LIVE="$(live_repo_dirs)" ONLY="$only" BASE="$base" REPO="$repo" python3 <<'PY'
+import json, os, shutil, subprocess
 
 base = os.environ["BASE"]
+repo = os.environ["REPO"]
 merged = {b.strip() for b in os.environ["MERGED"].splitlines() if b.strip()}
+
+def merged_pr(br):
+    """A squash merge, a cherry-pick or a merge into another branch (19.0-dev)
+    leaves no ancestry for `git branch --merged` to see; GitHub still knows."""
+    if not shutil.which("gh"):
+        return None
+    try:
+        r = subprocess.run(["gh", "pr", "list", "--head", br, "--state", "merged",
+                            "--json", "number,baseRefName", "--limit", "1"],
+                           cwd=repo, capture_output=True, text=True, timeout=20)
+        prs = json.loads(r.stdout or "[]") if r.returncode == 0 else []
+    except (subprocess.SubprocessError, ValueError):
+        return None
+    return prs[0] if prs else None
+
+def is_dirty(path):
+    return bool(subprocess.run(["git", "-C", path, "status", "--porcelain"],
+                               capture_output=True, text=True).stdout.strip())
+
+def cleanup(path, br, flag):
+    return ("git worktree remove %s && git -C %s branch %s %s && git -C %s push origin --delete %s"
+            % (path, repo, flag, br, repo, br))
 live = {d.strip() for d in os.environ["LIVE"].splitlines() if d.strip()}
 only = os.environ["ONLY"].rstrip("/")
 
@@ -1639,12 +1665,17 @@ for i, t in enumerate(trees):
             note += " (its branch is merged)"
         rows.append((path, br, note))
     elif br in merged and br != base:
-        dirty = subprocess.run(["git", "-C", path, "status", "--porcelain"],
-                               capture_output=True, text=True).stdout.strip()
-        if dirty:
+        if is_dirty(path):
             rows.append((path, br, "branch merged BUT the tree is dirty — look before removing"))
         else:
-            rows.append((path, br, "MERGED and clean -> git worktree remove " + path))
+            rows.append((path, br, "MERGED and clean -> " + cleanup(path, br, "-d")))
+    elif br != "(detached)" and (pr := merged_pr(br)):
+        how = "MERGED via PR #%s into %s" % (pr["number"], pr["baseRefName"])
+        if is_dirty(path):
+            rows.append((path, br, how + " BUT the tree is dirty — look before removing"))
+        else:
+            # -D, because git sees no ancestry; the merged PR is the proof.
+            rows.append((path, br, how + " and clean -> " + cleanup(path, br, "-D")))
     else:
         rows.append((path, br, "branch not merged into %s yet" % base))
 

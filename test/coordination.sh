@@ -234,6 +234,22 @@ git -C "$O" merge -q --no-ff -m merge2 feat/other
 out=$(cd "$O" && "$AB" worktrees)
 want 'a tree another tool owns is not offered for removal' 'another tool manages this one' "$out"
 want 'but its merged state is still reported'              'its branch is merged' "$out"
+# A squash merge or a merge into another base leaves no ancestry; the merged PR
+# on GitHub is the proof, and the branch then needs -D.
+git -C "$O" worktree add -q -b feat/squashed "$T/app-squashed" main 2>/dev/null
+printf 's\n' > "$T/app-squashed/s.txt"
+git -C "$T/app-squashed" add s.txt; git -C "$T/app-squashed" commit -qm s
+mkdir -p "$T/fakebin"
+cat > "$T/fakebin/gh" <<'GH'
+#!/bin/sh
+case "$*" in *"--head feat/squashed"*) echo '[{"number":42,"baseRefName":"19.0-dev"}]';; *) echo '[]';; esac
+GH
+chmod +x "$T/fakebin/gh"
+out=$(cd "$O" && PATH="$T/fakebin:$PATH" "$AB" worktrees)
+want 'a squash-merged PR counts as merged'     'MERGED via PR #42 into 19.0-dev' "$out"
+want 'and its branch is deleted with -D'       'branch -D feat/squashed' "$out"
+want 'a plain merge still deletes with -d'     'branch -d feat/merged' "$out"
+want 'an unmerged branch with no PR stays put' 'not merged into main' "$out"
 
 echo
 echo 'the SessionStart injection'
