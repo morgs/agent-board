@@ -347,6 +347,19 @@ wantnot 'and the freed one is gone'      'testbed' "$("$AB" env status)"
 want 'a traversing name is refused' 'not a usable environment name' "$("$AB" env take ../../etc 2>&1)"
 want 'and nothing was created'      'no dev environment' "$("$AB" env free sandbox >/dev/null; "$AB" env status)"
 
+# Changing a dev box needs my own lease, even when nobody holds one; reading it does not.
+pt() { python3 -c 'import json,sys;print(json.dumps({"cwd":sys.argv[1],"tool_name":"Bash","tool_input":{"command":sys.argv[2]}}))' "$D" "$1" \
+       | (cd "$D" && "$AB" hook-pretool) 2>&1; }
+want 'an Amafu deploy to a free dev box wants a lease'  'LEASE FIRST' "$(pt 'amafu deploy dev-sandbox --follow')"
+want 'so does a restart over ssh'                        'LEASE FIRST' "$(pt 'ssh x@sandbox.dev.bbb.systems "sudo systemctl restart odoo"')"
+want 'and the refresh play'                              'LEASE FIRST' "$(pt 'deploylock ansible-playbook odoo_dev_refresh.yml -l bbb-xn-vm-odoo-dev-sandbox')"
+wantnot 'reading a dev box needs none'                   'LEASE FIRST' "$(pt 'ssh x@sandbox.dev.bbb.systems "tail odoo.log"')"
+wantnot 'a prod deploy is not a dev box'                 'LEASE FIRST' "$(pt 'amafu deploy bbb-prod --follow')"
+wantnot 'nor is the phrase inside a commit message'      'LEASE FIRST' "$(pt 'git commit -m "amafu deploy dev-sandbox"')"
+"$AB" env take sandbox >/dev/null 2>&1
+wantnot 'with the lease the deploy goes through'         'LEASE FIRST' "$(pt 'amafu deploy dev-sandbox --follow')"
+"$AB" env free sandbox >/dev/null 2>&1
+
 # Someone else's lease: written by hand, because a real peer would be a separate
 # long-lived process and the point is what happens to *this* session.
 P_ENV=$(fake_named "$O" 'sandbox-tester')

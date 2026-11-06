@@ -851,6 +851,51 @@ env_i_hold() {   # env_i_hold <name>
   is_my_ancestor "$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)"
 }
 
+# dev_write_targets <scan> <cmd> -> the dev boxes a command changes, one per line.
+# Three shapes: an Amafu deploy of a non-prod environment, the dev refresh play,
+# and an ssh to a dev host that upgrades, restarts or moves its checkout. The box
+# is the last word of the environment or host name (dev-bramble, asuer-adder,
+# bbb-xn-vm-odoo-dev-bramble, bramble.dev.bbb.systems), which is the name people
+# lease. Shared and prod names are left out: no single test cycle owns them.
+dev_write_targets() {
+  printf '%s' "$1" | grep -Eq 'amafu[[:space:]]+deploy|odoo_dev_refresh|ssh[[:space:]]' || return 0
+  SCAN=$1 CMD=$2 python3 -c '
+import os, re
+scan, cmd = os.environ["SCAN"], os.environ["CMD"]
+SKIP = {"prod", "preprod", "website", "staging", "clearance", "dev", "worker", "main", ""}
+def box(name):
+    name = re.sub(r"\.dev\.(bbb|asuer)\.systems$", "", name.lower())
+    name = re.sub(r"-insights$", "", name)
+    t = name.split(".")[0].split("-")[-1]
+    m = re.fullmatch(r"app(\d+)", t)
+    if m and "-dev-" in name:
+        t = "dev" + m.group(1)
+    return None if t in SKIP or not re.fullmatch(r"[a-z][a-z0-9]*", t) else t
+out = []
+# amafu deploy [opts] <env>; a --check run deploys nothing.
+for m in re.finditer(r"(?:^|[;&|(\s])amafu\s+deploy\s+([^;&|]*)", scan):
+    args = m.group(1).split()
+    if "--check" in args:
+        continue
+    env = next((a for a in args if not a.startswith("-")), "")
+    out.append(box(env))
+# the dev refresh play, by its -l / --limit hosts
+if re.search(r"ansible-playbook\b", scan) and "odoo_dev_refresh" in scan \
+   and not re.search(r"--(syntax-check|list-)", scan):
+    for m in re.finditer(r"(?:\s-l\s*|\s--limit[=\s])(\S+)", scan):
+        out += [box(h) for h in re.split(r"[,:]", m.group(1)) if h and h[0] not in "!&"]
+# ssh to a dev host with a command that changes it (the remote command is quoted,
+# so it is read from the raw command, not the scan).
+if re.search(r"(?:^|[;&|(\s])ssh\s", scan) and re.search(
+        r"odoo-upgrade|amafu-deploy|deploy\.sh|systemctl\s+(re)?start|systemctl\s+stop|"
+        r"service\s+\S+\s+(re)?start|git\s+(pull|reset|checkout|merge)", cmd):
+    for m in re.finditer(r"([a-z0-9-]+\.dev\.(?:bbb|asuer)\.systems|(?:bbb|asuer)-xn-vm-odoo-dev-[a-z0-9]+)", scan):
+        out.append(box(m.group(1)))
+for b in dict.fromkeys(x for x in out if x):
+    print(b)
+' 2>/dev/null
+}
+
 env_live_local() {   # -> "name<TAB>pid<TAB>holder<TAB>purpose<TAB>since" per live lease
   local d n rec pid who what since
   [ -d "$ENVLEASES" ] || return 0
@@ -3379,6 +3424,21 @@ hook_pretool() {
   done <<EOF
 $(env_live)
 EOF
+
+  # (2c) Changing a dev box needs your own lease, even when nobody holds one. An
+  # unleased box looks free to the next agent, who deploys over your test. A
+  # box someone else holds was handled by (2b), so only a free one reaches here.
+  local box
+  for box in $(dev_write_targets "$scan" "$cmd"); do
+    env_i_hold "$box" && continue
+    env_owner "$box" >/dev/null 2>&1 && continue
+    { printf 'LEASE FIRST: that command changes the %s dev box, and you do not hold its lease.\n\n' "$box"
+      printf 'Nobody holds it, so take it and run the command again:\n\n'
+      printf '  agentboard env take %s --for "<TID> · <what you are testing>"\n\n' "$box"
+      printf 'Free it when the test cycle is done: agentboard env free %s\n' "$box"
+      printf 'If the box name is wrong for this command, prefix AGENT_BOARD_OVERRIDE=1.\n'; } >&2
+    exit 2
+  done
 
   repo=$(repo_of "${cwd:-$PWD}")
   [ -n "$repo" ] || exit 0

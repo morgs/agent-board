@@ -314,6 +314,17 @@ this is. One case escalates to a **deny**: `ansible-playbook` targeting a leased
 `deploylock` or not. The deploy lock serialises *runs*; it says nothing about a box
 another agent is three steps into a test cycle on.
 
+**Changing a free box needs your own lease.** A box nobody holds looks free to the
+next agent, who then deploys over your test. So a command that changes a dev box is
+denied until you hold its lease, even when nobody else does: `amafu deploy <env>` of
+a non-prod environment, the `odoo_dev_refresh.yml` play, and an `ssh` to a dev host
+that runs `odoo-upgrade`, a deploy script, a service restart or a `git pull/reset/
+checkout`. The box name comes from the command itself (the last word of `dev-bramble`,
+`asuer-adder`, `bbb-xn-vm-odoo-dev-bramble`, `bramble.dev.bbb.systems`), so this needs
+no list either. Prod and shared names (`preprod`, `staging`, a bare `dev`) are left
+out. Reads over ssh need no lease. A wrong guess at the name is passed with
+`AGENT_BOARD_OVERRIDE=1`.
+
 `agentboard check` reports leases above everything else, and does so outside a git
 repo too — an agent testing `sandbox` from its home directory still needs to know.
 
