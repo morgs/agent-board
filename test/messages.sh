@@ -276,5 +276,15 @@ if grep -q 'gone-3' "$rf"; then bad 'while still dropping the dead one'
 else ok 'while still dropping the dead one'; fi
 
 echo
+echo 'a tool can message the session that ran it'
+"$AB" inbox >/dev/null 2>&1
+"$AB" tell "$MYPID" 'note to self' >/dev/null 2>&1
+"$AB" _notify deploylock 'your queued run has started: site.yml'
+inbox=$("$AB" inbox 2>&1)
+has  'a tool notice reaches its own session' "$inbox" 'your queued run has started'
+has  'attributed to the tool'                "$inbox" 'deploylock (tool)'
+hasnt 'while a note to self still is not'    "$inbox" 'note to self'
+
+echo
 printf 'pass=%s fail=%s\n' "$pass" "$fail"
 [ "$fail" = 0 ]

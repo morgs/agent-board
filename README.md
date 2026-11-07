@@ -839,9 +839,10 @@ can never be.
 
     deploylock ansible-playbook refresh.yml -l staging
     deploylock --wait 600 ansible-playbook site.yml   # queue instead of failing
+    deploylock --wait forever ansible-playbook ...    # queue for as long as it takes
     deploylock --explain ansible-playbook ...         # which lock it would take, and why
     deploylock --global ansible-playbook ...          # skip resolution, lock everything
-    deploylock --status                               # every holder, since when
+    deploylock --status                               # every holder and waiter, since when
     deploylock --name prod ansible-playbook ...       # an independent lock family
 
 ### One environment, or everything
@@ -858,6 +859,36 @@ one another:
 
 A queued global run holds `locks/deploy.gate`, and new environment runs wait behind
 it, so a steady stream of small deploys cannot starve a site-wide one.
+
+### The queue: first in, first out
+
+A run that has to wait takes a numbered ticket in `locks/deploy.queue/` (the number
+comes from `locks/deploy.seq`). It tries for the lock only when no older ticket
+conflicts with it. Two runs conflict when either is global or they need a host in
+common. So waiters for the same host, and everything behind a global run, go in
+arrival order, and a run on a host that nobody ahead needs still goes past. Without
+the queue, the next holder was whichever waiter polled first.
+
+Each ticket is `flock`'d by its waiter, like the locks. A waiter that dies leaves a
+ticket that anyone can take, which shows it is dead, and the next reader removes it.
+
+`--status` lists the waiters in order after the holders:
+
+    queue: 2 waiting, first in, first out (a run on another host may go past):
+      1. Ann · a1 — global, waiting 4m10s
+           command: ansible-playbook monitoring.yml
+      2. Bob · b1 — env app1, waiting 0m40s
+           command: ansible-playbook site.yml -l app1
+
+`--wait` takes seconds or `forever`. **A Claude Code foreground Bash call ends after
+10 minutes**, whatever `--wait` says, so a wait longer than that needs the command in
+the background (`run_in_background`). When a run that had to queue starts, deploylock
+posts a board message to the session that ran it (`agentboard _notify`), which pokes
+it if it is idle. A run that started at once gets no message.
+
+Across machines, a run on another machine queues on its own machine first, then on
+the hub through `deploylock --hold`, so the hub's queue orders runs from every
+machine. The hub must run this version before a machine sends `--wait forever` to it.
 
 `deploylock` finds the target by asking Ansible: it runs the same command with
 `--list-hosts --list-tasks` added. That applies `-l`/`--limit`, `-e target_host=...`,
@@ -934,7 +965,7 @@ gets it, so a run still queued for its second host shows as the holder of its fi
       env web-3: held by pid 4380 ...
 
 `deploylock --status --brief` prints one tab-separated line per holder for the
-board's locks panel.
+board's locks panel, then one per waiter with the scope `queued:<scope>`.
 
 Built on `fcntl.flock`, so every lock lives in the kernel against an open fd: it is
 released automatically on exit, crash or `kill -9`. There is no stale-lock case to
@@ -1123,7 +1154,7 @@ it checks the owner pid. `agentboard vault status` forces that read; `agentboard
 does it too.
 
 **A blocked command I know is safe.** `AGENT_BOARD_OVERRIDE=1 <command>` for the git
-gate; `deploylock <command>` or `deploylock --wait 600 <command>` for Ansible;
+gate; `deploylock <command>` or `deploylock --wait 600 <command>` (`--wait forever`, in the background, for longer) for Ansible;
 `command ansible-playbook ...` to bypass the shell wrapper entirely.
 
 **`check` says a checkout is taken and I do not believe it.** `agentboard paths` in

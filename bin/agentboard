@@ -1940,6 +1940,31 @@ cmd__resolve() {   # local names only: the relay asks on behalf of a peer
   resolve_local "$want" 2>/dev/null
 }
 
+# A message to this session from a tool it ran, such as deploylock saying that a
+# queued run has started. `tell` cannot do this: a session is never shown its own
+# words, and a message to itself would be exactly that. The sender here is the
+# tool, with no pid, so the inbox shows it like any other message. Quiet, best effort.
+cmd__notify() {   # _notify <from> <text...>
+  local from=${1:-tool}; shift 2>/dev/null
+  [ $# -gt 0 ] || return 0
+  local me pid f
+  me=$(find_file) || return 0
+  pid=$(get_field "$me" pid); [ -n "$pid" ] || return 0
+  f="$MSGS/$(now_e).0.$RANDOM.md"
+  cat > "$f" <<EOF
+from_pid: 0
+from_name: $from
+from_agent: tool
+to: $pid
+repo: $(get_field "$me" repo)
+epoch: $(now_e)
+time: $(now_h)
+
+$*
+EOF
+  cmd__poke "$pid"
+}
+
 cmd__poke() {   # wake an idle local target of a message a peer sent — quiet, best effort
   local pid=${1:-} name st
   [ -n "$pid" ] && [ -f "$SESS/$pid.md" ] || return 0
@@ -2760,9 +2785,17 @@ locks_panel() {
   if [ -n "$dl" ]; then out=$("$dl" --status --brief 2>/dev/null); rc=$?; else rc=127; fi
   if [ "$rc" = 1 ]; then
     # One line per holder: the global run, or each environment run sharing it.
-    local scope kind=env
+    local scope kind=env nq=0
     while IFS=$'\t' read -r scope agent since pid cmd; do
       [ -n "$scope" ] || continue
+      case "$scope" in
+        queued:*)   # a waiter, in queue order after every holder
+          nq=$((nq+1))
+          case "$agent" in *' · '*) who=$agent ;; *) who=$(name_for_pid "${pid:-0}" "${agent:-?}") ;; esac
+          printf '   %s◌%s queued   %s#%d %s%s%s\n' "$C_YEL" "$C_R" "$C_DIM" "$nq" "$C_R$C_B" "$who" "$C_R"
+          printf '       %s%s%s\n' "$C_DIM" "$(clip 60 "${scope#queued:}, $(ago "$since")${cmd:+ — $cmd}")" "$C_R"
+          continue ;;
+      esac
       case "$agent" in
         *' · '*) who=$agent ;;
         '')      who="unknown holder — lsof $LOCKS/deploy*.lock" ;;
@@ -2775,7 +2808,7 @@ locks_panel() {
         || printf 'env %s' "$scope")${cmd:+ — $cmd}")" "$C_R"
     done <<< "$out"
     if [ "$kind" = global ]; then
-      printf '       %sanything else ansible waits — deploylock --wait 600 <cmd>%s\n' "$C_DIM" "$C_R"
+      printf '       %sanything else waits — deploylock --wait forever <cmd>, in the background%s\n' "$C_DIM" "$C_R"
     else
       printf '       %sother hosts deploy alongside; multi-host runs wait%s\n' "$C_DIM" "$C_R"
     fi
@@ -3376,7 +3409,10 @@ hook_pretool() {
       printf 'real hosts. Only the lock prevents it.\n\n'
       printf 'Re-run it as:\n\n  ~/agent-board/bin/deploylock %s\n\n' "$cmd"
       printf 'Add --wait 600 before the command to queue behind a running deploy instead\n'
-      printf 'of failing. Check who holds it with: deploylock --status\n'
+      printf 'of failing. Waiters go first in, first out. For longer than 10 minutes use\n'
+      printf -- '--wait forever and start the command in the background (run_in_background):\n'
+      printf 'a foreground Bash call is cut off at 10 minutes. deploylock messages you on\n'
+      printf 'the board when a queued run starts. Holders and queue: deploylock --status\n'
     } >&2
     exit 2
   fi
@@ -3632,6 +3668,7 @@ case "$sub" in
   _export)    cmd__export ;;
   _resolve)   cmd__resolve "$@" ;;
   _poke)      cmd__poke "$@" ;;
+  _notify)    cmd__notify "$@" ;;
   _repoke)    cmd__repoke ;;
   tell)       cmd_tell "$@" ;;
   inbox)      cmd_inbox "$@" || printf 'no new messages\n' ;;
