@@ -40,12 +40,23 @@ A single delegate_to line, in a playbook or a role, can vouch for itself instead
 Without a directive, a run with no --limit is global, and so is a playbook (or one
 of its roles) with a delegate_to that points somewhere other than localhost.
 
+Waiters queue first in, first out. Each waiter holds a numbered ticket in
+locks/<name>.queue/ and tries for the lock only when no older waiter conflicts with
+it (a conflict: either run is global, or both need the same host). A run on another
+host still goes past, as before. A ticket is itself flock'd, so a waiter that dies
+leaves a ticket anyone can see is dead. --status lists the waiters in order, and a
+run that had to queue gets a board message from deploylock when it starts.
+
+A Claude Code foreground Bash call ends after 10 minutes, whatever --wait says. For
+a longer wait, start the command in the background (run_in_background).
+
 Uses fcntl.flock, so every lock is held by the kernel against an open fd: it is
 released when this process and the command it runs have exited, crashed or been
 killed. There is no such thing as a stale lock here.
 
     deploylock ansible-playbook refresh.yml -l host1
     deploylock --wait 600 ansible-playbook site.yml     # queue instead of failing
+    deploylock --wait forever ansible-playbook ...      # queue for as long as it takes
     deploylock --explain ansible-playbook ...           # which lock, and why; runs nothing
     deploylock --global ansible-playbook ...            # skip resolution, lock everything
     deploylock --status [--brief]
@@ -179,6 +190,130 @@ def probe(path, mode):
         os.close(fd)
 
 
+# ---------------------------------------------------------------- waiting
+
+FOREVER = float("inf")
+WAITED = {"queued": False}   # set once this run has had to wait for anything
+
+
+def parse_wait(s):
+    if s.lower() in ("forever", "inf", "infinite"):
+        return FOREVER
+    v = float(s)
+    if v != v or v < 0:
+        raise ValueError(s)
+    return v
+
+
+def fmt_wait(w):
+    return "forever" if w == FOREVER else "up to %ds" % int(w)
+
+
+def fmt_secs(secs):
+    secs = max(int(secs), 0)
+    return "%dh%02dm" % (secs // 3600, secs % 3600 // 60) if secs >= 3600 \
+        else "%dm%02ds" % (secs // 60, secs % 60)
+
+
+# ---------------------------------------------------------------- the queue
+
+def queue_dir(name):
+    return os.path.join(LOCKS, "%s.queue" % name)
+
+
+def next_seq(name):
+    """A number no other waiter on this lock family has had, in arrival order."""
+    fd = open_lock(os.path.join(LOCKS, "%s.seq" % name))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            n = int(os.pread(fd, 32, 0).decode().strip() or 0)
+        except ValueError:
+            n = 0
+        n += 1
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, str(n).encode(), 0)
+        return n
+    finally:
+        os.close(fd)
+
+
+def enqueue(name, keys, info):
+    """Take a ticket. -> (fd, path, seq). The ticket is flock'd before it appears
+    under its real name, so no one can see it and take it for dead."""
+    qd = queue_dir(name)
+    os.makedirs(qd, exist_ok=True)
+    seq = next_seq(name)
+    tmp = os.path.join(qd, ".%d.%d.tmp" % (seq, os.getpid()))
+    fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    now = time.time()
+    rec = dict(info, seq=seq, keys=keys, mode="env" if keys else "global",
+               queued_since=datetime.fromtimestamp(now).astimezone().strftime(
+                   "%Y-%m-%dT%H:%M:%S%z"), queued_epoch=int(now))
+    os.write(fd, json.dumps(rec).encode())
+    path = os.path.join(qd, "%010d.%d.json" % (seq, os.getpid()))
+    os.rename(tmp, path)
+    return fd, path, seq
+
+
+def dequeue(ticket):
+    if not ticket:
+        return
+    fd, path, _ = ticket
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    os.close(fd)
+
+
+def waiters(name):
+    """Live tickets, oldest first. A ticket no one holds belongs to a waiter that
+    died; it is removed on sight."""
+    out = []
+    for p in sorted(glob.glob(os.path.join(queue_dir(name), "*.json"))):
+        try:
+            seq = int(os.path.basename(p).split(".")[0])
+        except ValueError:
+            continue
+        try:
+            free = probe(p, fcntl.LOCK_EX)
+        except OSError:
+            continue
+        if free:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+            continue
+        rec = read_owner(p)
+        rec["seq"] = seq
+        out.append(rec)
+    return out
+
+
+def conflicts(a, b):
+    """Two runs conflict when either is global or they need a host in common."""
+    return not a or not b or bool(set(a) & set(b))
+
+
+def ahead_of(name, seq, keys):
+    return [w for w in waiters(name)
+            if w["seq"] < seq and conflicts(keys, w.get("keys") or [])]
+
+
+def scope_of(rec):
+    return "env %s" % rec.get("target") if rec.get("keys") and rec.get("target") \
+        else ("env %s" % ",".join(rec["keys"]) if rec.get("keys") else "global")
+
+
+def describe_waiter(n, rec):
+    waited = fmt_secs(time.time() - rec.get("queued_epoch", time.time()))
+    return ("%d. %s — %s, waiting %s\n       command: %s"
+            % (n, rec.get("agent", "?"), scope_of(rec), waited, rec.get("cmd", "?")))
+
+
 # ---------------------------------------------------------------- describing holders
 
 def ago(info):
@@ -231,9 +366,19 @@ def holders(name):
     return gstate, gowner, list(runs.values()), unknown
 
 
+def print_queue(queue):
+    if not queue:
+        return
+    print("queue: %d waiting, first in, first out (a run on another host may go past):"
+          % len(queue))
+    for n, w in enumerate(queue, 1):
+        print("  " + describe_waiter(n, w))
+
+
 def status(name, brief=False):
     gstate, gowner, runs, unknown = holders(name)
     busy = gstate == "exclusive" or runs or unknown
+    queue = waiters(name)
     if brief:
         # One line per holder, tab separated, for the board's locks panel:
         # scope, who, since (ISO), pid, command
@@ -245,13 +390,20 @@ def status(name, brief=False):
                              r.get("since", ""), str(r.get("pid", "")), r.get("cmd", "")]))
         for k in unknown:
             print("\t".join([k, "", "", "", ""]))
+        # Waiters, in queue order, after every holder: scope is "queued:<scope>".
+        for w in queue:
+            print("\t".join(["queued:" + scope_of(w), w.get("agent", ""),
+                             w.get("queued_since", ""), str(w.get("pid", "")),
+                             w.get("cmd", "")]))
         return 1 if busy else 0
 
     if gstate == "never" and not busy:
         print("lock %r: free (never taken)" % name)
+        print_queue(queue)
         return 0
     if not busy:
         print("lock %r: free" % name)
+        print_queue(queue)
         return 0
     if gstate == "exclusive":
         print("lock %r: global, %s" % (name, describe(gowner, lock_path(name))))
@@ -263,6 +415,7 @@ def status(name, brief=False):
         print("  env %s: %s" % (t, describe(r, lock_path(name, t))))
     for k in unknown:
         print("  env %s: %s" % (k, describe({}, lock_path(name, k))))
+    print_queue(queue)
     return 1
 
 
@@ -445,12 +598,40 @@ def acquire(fd, mode, deadline, wait, label, why_busy):
             return True
         if time.time() >= deadline:
             print("deploylock: %s is %s" % (label, why_busy()), file=sys.stderr)
-            print("\nWait for it (--wait 600) or coordinate with that session. "
-                  "Do not bypass it: overlapping Ansible runs deploy a mixed tree.",
-                  file=sys.stderr)
+            print(GIVE_UP, file=sys.stderr)
             return False
+        WAITED["queued"] = True
         if not announced:
-            print("deploylock: %s busy, waiting up to %ds..." % (label, int(wait)),
+            print("deploylock: %s busy, waiting %s..." % (label, fmt_wait(wait)),
+                  file=sys.stderr)
+            announced = True
+        time.sleep(POLL)
+
+
+GIVE_UP = ("\nQueue for it (--wait 600, or --wait forever with the command in the "
+           "background) or coordinate with that session. Do not bypass it: "
+           "overlapping Ansible runs deploy a mixed tree.")
+
+
+def wait_turn(name, seq, keys, deadline, wait):
+    """Wait until no older waiter conflicts with this one. False on timeout."""
+    announced = False
+    while True:
+        ahead = ahead_of(name, seq, keys)
+        if not ahead:
+            return True
+        if time.time() >= deadline:
+            print("deploylock: %r — %d run%s queued ahead of this one:"
+                  % (name, len(ahead), "" if len(ahead) == 1 else "s"), file=sys.stderr)
+            for n, w in enumerate(ahead, 1):
+                print("  " + describe_waiter(n, w), file=sys.stderr)
+            print(GIVE_UP, file=sys.stderr)
+            return False
+        WAITED["queued"] = True
+        if not announced:
+            print("deploylock: %r — queued behind %d run%s (first: %s, %s), waiting %s..."
+                  % (name, len(ahead), "" if len(ahead) == 1 else "s",
+                     ahead[0].get("agent", "?"), scope_of(ahead[0]), fmt_wait(wait)),
                   file=sys.stderr)
             announced = True
         time.sleep(POLL)
@@ -524,6 +705,18 @@ def take(name, keys, wait, info):
     Each key's owner is written as soon as that key is held, so a run still queued
     for its second key shows up as the holder of its first, not as an unknown."""
     deadline = time.time() + wait
+    ticket = enqueue(name, keys, info)
+    try:
+        if not wait_turn(name, ticket[2], keys, deadline, wait):
+            return None
+        return take_locks(name, keys, wait, info, deadline)
+    finally:
+        # Held or given up, this run no longer waits. Anyone queued behind it now
+        # finds the locks it holds, or none.
+        dequeue(ticket)
+
+
+def take_locks(name, keys, wait, info, deadline):
     gfd = open_lock(lock_path(name))
     gate = open_lock(gate_path(name))
     if keys:
@@ -599,7 +792,8 @@ def hub_ssh(hub, *argv):
 def hold_on_hub(hub, me, name, keys, wait, info):
     """Take the same locks on the hub. -> (process holding them, None) or (None, why).
     The process's stdin is the hold: closing it, or dying, releases the hub."""
-    argv = ["--hold", "--name", name, "--wait", str(int(max(wait, 0)))]
+    argv = ["--hold", "--name", name,
+            "--wait", "forever" if wait == FOREVER else str(int(max(wait, 0)))]
     if keys:
         argv += ["--keys", ",".join(keys)]
     try:
@@ -614,7 +808,8 @@ def hold_on_hub(hub, me, name, keys, wait, info):
     try:
         proc.stdin.write((json.dumps(sent) + "\n").encode())
         proc.stdin.flush()
-        ready, _, _ = select.select([proc.stdout], [], [], max(wait, 0) + 30)
+        ready, _, _ = select.select([proc.stdout], [], [],
+                                    None if wait == FOREVER else max(wait, 0) + 30)
         line = proc.stdout.readline().decode(errors="replace").strip() if ready else ""
     except OSError:
         line = ""
@@ -700,7 +895,12 @@ def main(argv):
         if a == "--name":
             name = argv[i + 1]; i += 2
         elif a == "--wait":
-            wait = float(argv[i + 1]); i += 2
+            try:
+                wait = parse_wait(argv[i + 1])
+            except (ValueError, IndexError):
+                print("deploylock: --wait takes seconds or 'forever'", file=sys.stderr)
+                return 2
+            i += 2
         elif a == "--global":
             force_global = True; i += 1
         elif a == "--explain":
@@ -789,6 +989,14 @@ def main(argv):
 
     board("note", "HOLDING %s lock (%s): %s" % (
         name, "env " + target if target else "global", printable[:100]))
+    waited = time.time() - start
+    # The hub's own wait shows only as time: a hold there that answered at once
+    # takes a second or two over ssh.
+    if WAITED["queued"] or waited > 5:
+        board("_notify", "deploylock", "your queued run has started, after %s waiting "
+              "(%s lock, %s): %s" % (fmt_secs(waited), name,
+                                     "env " + target if target else "global",
+                                     printable[:160]))
     # Some parent shells hand over non-blocking stdio and ansible refuses to
     # start on it. The flag is on the shared file description, so the child
     # inherits the fix.

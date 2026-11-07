@@ -155,8 +155,49 @@ want 'the holder shows its shared hosts'         'shared:  backup1' "$("$DL" --s
 sleep 1.5
 out=$("$DL" ansible-playbook site.yml -l app2 2>&1); rc=$?
 want 'a queued global run is not overtaken'      '1' "$rc"
-want 'and the late run is told why'              'a global run is queued ahead' "$out"
+want 'and the late run is told why'              'queued ahead of this one' "$out"
+want 'naming the global run ahead of it'         '1. Tester · t1 — global' "$out"
 idle
+
+echo
+echo 'the queue — first in, first out'
+# A stand-in agentboard in the throwaway board records what deploylock tells it.
+mkdir -p "$AGENT_BOARD_DIR/bin"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s"\n' "$T/ab.log" > "$AGENT_BOARD_DIR/bin/agentboard"
+chmod +x "$AGENT_BOARD_DIR/bin/agentboard"
+cp site.yml first.yml; cp site.yml second.yml; cp site.yml third.yml
+: > "$FAKE_LOG"
+FAKE_SLEEP=6 "$DL" ansible-playbook site.yml -l app1 >/dev/null 2>&1 & BG+=($!)
+wait_owner deploy.app1.owner
+AGENT_BOARD_AGENT="Ann · a1" "$DL" --wait 30 ansible-playbook first.yml -l app1 >/dev/null 2>&1 & BG+=($!)
+sleep 1
+AGENT_BOARD_AGENT="Bob · b1" "$DL" --wait forever ansible-playbook second.yml -l app1 >/dev/null 2>&1 & BG+=($!)
+sleep 1
+AGENT_BOARD_AGENT="Cy · c1" "$DL" --wait 30 ansible-playbook third.yml -l app1 >/dev/null 2>&1 & w=$!
+sleep 1
+out=$("$DL" --status 2>&1)
+want 'status shows the queue'                  'queue: 3 waiting' "$out"
+want 'oldest waiter first'                     '1. Ann · a1 — env app1, waiting' "$out"
+want 'then the next'                           '2. Bob · b1 — env app1' "$out"
+want 'with its command'                        'command: ansible-playbook second.yml -l app1' "$out"
+want 'brief status lists waiters after holders' "$(printf 'queued:env app1\tAnn · a1')" "$("$DL" --status --brief)"
+kill -9 "$w"; wait "$w" 2>/dev/null
+out=$("$DL" --status 2>&1)
+want 'a waiter that dies leaves the queue'     'queue: 2 waiting' "$out"
+out=$("$DL" ansible-playbook site.yml -l app2 2>&1); rc=$?
+want 'a run on another host goes past the queue' '0' "$rc"
+idle
+want 'waiters ran in arrival order' 'start site.yml app1|start first.yml app1|start second.yml app1' \
+  "$(grep -v app2 "$FAKE_LOG" | grep '^start' | tr '\n' '|')"
+want 'a queued run is told on the board when it starts' \
+  '_notify deploylock your queued run has started' "$(cat "$T/ab.log")"
+want 'with its command' 'env app1): ansible-playbook second.yml -l app1' "$(cat "$T/ab.log")"
+want 'a run that did not queue is not told' '2' "$(grep -c '^_notify' "$T/ab.log")"
+want 'the queue is empty afterwards' "lock 'deploy': free" "$("$DL" --status)"
+want 'no ticket left behind' '0' "$(ls "$AGENT_BOARD_DIR/locks/deploy.queue" | wc -l | tr -d ' ')"
+out=$("$DL" --wait soon ansible-playbook site.yml -l app1 2>&1); rc=$?
+want '--wait takes seconds or forever only' '2' "$rc"
+rm -rf "$AGENT_BOARD_DIR/bin"
 
 echo
 echo 'a killed wrapper does not release a running deploy'
