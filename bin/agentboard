@@ -1670,6 +1670,19 @@ def merged_pr(br):
         return None
     return prs[0] if prs else None
 
+def cherry_picked(br):
+    """Commits landed on the base by cherry-pick, with no PR: `git cherry` marks a
+    commit `-` when an equivalent patch is already upstream. Every one `-` means
+    nothing on the branch is left to lose."""
+    up = "origin/" + base
+    if subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", up],
+                      capture_output=True).returncode != 0:
+        up = base
+    r = subprocess.run(["git", "-C", repo, "cherry", up, br],
+                       capture_output=True, text=True)
+    marks = [l[:1] for l in r.stdout.splitlines() if l.strip()]
+    return r.returncode == 0 and bool(marks) and set(marks) == {"-"}
+
 def is_dirty(path):
     return bool(subprocess.run(["git", "-C", path, "status", "--porcelain"],
                                capture_output=True, text=True).stdout.strip())
@@ -1720,6 +1733,12 @@ for i, t in enumerate(trees):
             rows.append((path, br, how + " BUT the tree is dirty — look before removing"))
         else:
             # -D, because git sees no ancestry; the merged PR is the proof.
+            rows.append((path, br, how + " and clean -> " + cleanup(path, br, "-D")))
+    elif br != "(detached)" and cherry_picked(br):
+        how = "MERGED by cherry-pick: every commit is already on %s" % base
+        if is_dirty(path):
+            rows.append((path, br, how + " BUT the tree is dirty — look before removing"))
+        else:
             rows.append((path, br, how + " and clean -> " + cleanup(path, br, "-D")))
     else:
         rows.append((path, br, "branch not merged into %s yet" % base))

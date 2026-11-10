@@ -250,6 +250,16 @@ want 'a squash-merged PR counts as merged'     'MERGED via PR #42 into 19.0-dev'
 want 'and its branch is deleted with -D'       'branch -D feat/squashed' "$out"
 want 'a plain merge still deletes with -d'     'branch -d feat/merged' "$out"
 want 'an unmerged branch with no PR stays put' 'not merged into main' "$out"
+# Commits landed on main by cherry-pick, with no PR: git cherry shows each one is
+# already upstream, so the branch counts as merged and needs -D.
+git -C "$O" worktree add -q -b feat/picked "$T/app-picked" main 2>/dev/null
+printf 'p\n' > "$T/app-picked/p.txt"
+git -C "$T/app-picked" add p.txt; git -C "$T/app-picked" commit -qm p
+GIT_COMMITTER_DATE="2020-01-01T00:00:00" git -C "$O" cherry-pick feat/picked >/dev/null
+out=$(cd "$O" && PATH="$T/fakebin:$PATH" "$AB" worktrees)
+want 'a cherry-picked branch counts as merged' 'MERGED by cherry-pick' "$out"
+want 'and its branch is deleted with -D'       'branch -D feat/picked' "$out"
+wantnot 'a branch with a commit not on main is not' 'feat/open]  MERGED' "$out"
 
 echo
 echo 'the SessionStart injection'
