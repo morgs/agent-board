@@ -156,6 +156,11 @@ run "$A" 'git add -A' 2
 run "$A" 'git add .' 2
 run "$A" 'git stash' 2
 run "$A" 'git reset --hard' 2
+echo 'notes — a flag counts only inside the commit that carries it'
+run "$A" 'git commit -m x && git log --oneline --all' 0
+run "$A" 'git log --all; git commit -m x' 0
+run "$A" 'git add x.md && git commit -m x --all && git push' 2
+run "$A" 'git log --all && git commit -a -m x' 2
 echo 'notes — the file gate does not apply (nothing collides here)'
 edit "$A" "$A/sessions/mine.md" allow
 

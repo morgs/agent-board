@@ -3331,8 +3331,11 @@ m() {
 # sweep up, discard or stash files another agent is still working on. Hazardous in
 # every repo, including the ones where ordinary commits are fine.
 whole_tree_op() {
-  m "$1" '(^|[;&|(])[[:space:]]*git[[:space:]]+commit([[:space:]]|$)' \
-    && m "$1" -- '(^|[[:space:]])(-a|-am|-ma|--all)([[:space:]]|$)' && return 0
+  # Only the commit's own arguments count: `git commit -m x && git log --all`
+  # names its paths, and the --all belongs to the log.
+  local seg
+  seg=$(printf '%s' "$1" | grep -oE '(^|[;&|(])[[:space:]]*git[[:space:]]+commit([[:space:]][^;&|)]*)?' 2>/dev/null)
+  [ -n "$seg" ] && m "$seg" -- '(^|[[:space:]])(-a|-am|-ma|--all)([[:space:]]|$)' && return 0
   m "$1" '(^|[;&|(])[[:space:]]*git[[:space:]]+add[[:space:]]+(-A|--all|\.|:/)([[:space:]]|$)' && return 0
   m "$1" '(^|[;&|(])[[:space:]]*git[[:space:]]+reset[[:space:]]+--hard([[:space:]]|$)' && return 0
   m "$1" '(^|[;&|(])[[:space:]]*git[[:space:]]+(checkout|restore)[[:space:]]+(--[[:space:]]+)?\.([[:space:]]|$)' && return 0
