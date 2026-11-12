@@ -2395,8 +2395,14 @@ Add something that landed to today's tally. It shows on the board under
 "wins today", and again tomorrow under "yesterday" — that second one is the
 list read out at standup, so a win written today is read aloud tomorrow.
 
-  agentboard win "🚀 the nightly export is LIVE on prod — it streams in
-  batches now instead of holding the whole table in memory"
+  agentboard win "🚀 the nightly export is LIVE on prod — finance gets the
+  morning report by 07:00 again; it streams in batches now instead of
+  holding the whole table in memory"
+
+Say the user impact: who notices and what changes for them (staff,
+consultants, customers, the team), in words a non-engineer reads. The
+weekly report to the team is built from these wins, so the impact must be
+in the sentence, not only the technical change.
 
 Write it with some excitement, not as a changelog entry. Emoji welcome,
 personality welcome, say what was good about it. The flat version of the
