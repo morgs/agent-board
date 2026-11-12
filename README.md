@@ -70,7 +70,7 @@ MIT — see [`LICENSE`](./LICENSE).
       workspace.local     which repos here are worked which way — gitignored
       machines.local      the other machines this board talks to — gitignored
       remote/<label>/     each peer's board as last synced — rewritten, never edited
-      test/               six suites — run them after editing bin/
+      test/               seven suites — run them after editing bin/
 
 Each session writes **only its own files**, named after the agent process pid. No
 shared file, so no write contention and no read-modify-write races. Reading the
@@ -466,6 +466,12 @@ time. `$AGENT_BOARD_DIR/persons.local` pins one, by session name, one per line:
 The pinned person need not be in the theme, nobody else is drawn it, and if another
 live session already has it the pin waits rather than making two. It is
 machine-local and gitignored, like the theme.
+
+**A full pool gives `Anon`.** When every name in the pack is held by a live session,
+here or on a peer, the next session is `Anon`. It looks for a free name again at most
+once every `AGENT_BOARD_ANON_RETRY_SECS` (default 60), on its own hook events, and
+takes the first one it finds. Two `Anon` sessions share one `tell` address, so a pool
+that is often full needs more names: add them to the pack's `[names]`.
 
 **A pack does not have to be one we ship.** `agentboard theme --new <name>` writes a
 skeleton to `$AGENT_BOARD_DIR/themes.local/<name>.theme`, which is gitignored — so
@@ -1120,6 +1126,7 @@ exactly the failure this board exists to prevent.
 | `AGENT_BOARD_STALE_SECS` | `7200` | how long without a heartbeat before an entry is ignored, unless its pid is still an agent |
 | `AGENT_BOARD_DONE_KEEP_SECS` | `3600` | how long finished entries linger before `sweep` drops them |
 | `AGENT_BOARD_MSG_KEEP_SECS` | `86400` | how long messages live before `sweep` drops them |
+| `AGENT_BOARD_ANON_RETRY_SECS` | `60` | how often a session that drew `Anon` from a full pool looks for a free name |
 | `AGENT_BOARD_DELIVER_ON_STOP` | `1` | `0` stops messages being pushed at end of turn |
 | `AGENT_BOARD_POKE_CMD` | unset | run as `<cmd> <pid> <name> <socket>` to wake an idle target |
 | `AGENT_BOARD_POKE_TTL` | `14400` | how long a poke that could not land is tried again |
@@ -1185,6 +1192,9 @@ genuinely alive — check with `ps -p <pid>`.
     ~/agent-board/test/deploylock.sh       # environment vs global resolution,
                                            # readers and writers, shared hosts,
                                            # writer preference, kill -9, sweep
+    ~/agent-board/test/name-pool.sh        # a full name pool, a claim killed
+                                           # part-way, an empty session file,
+                                           # the Stop hook's repair
 
 All four build their own throwaway git repos and fake agents in a throwaway
 `AGENT_BOARD_DIR`, so they neither read nor write the live board or the real
