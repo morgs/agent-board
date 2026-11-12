@@ -88,7 +88,7 @@ REMOTED="$BOARD/remote"            # their mirrors, written by the relay
 STALE_SECS="${AGENT_BOARD_STALE_SECS:-7200}"     # 2h without a heartbeat = presumed dead, unless its pid is still an agent
 DONE_KEEP_SECS="${AGENT_BOARD_DONE_KEEP_SECS:-3600}"
 MSG_KEEP_SECS="${AGENT_BOARD_MSG_KEEP_SECS:-86400}"
-WIN_KEEP_DAYS="${AGENT_BOARD_WIN_KEEP_DAYS:-7}"  # today plus the seven days before it, so a weekly review sees a whole week
+WIN_KEEP_DAYS="${AGENT_BOARD_WIN_KEEP_DAYS:-14}"  # today plus the fourteen days before it, so a weekly review that slips a week still sees both weeks
 DELIVER_ON_STOP="${AGENT_BOARD_DELIVER_ON_STOP:-1}"
 ANON_RETRY_SECS="${AGENT_BOARD_ANON_RETRY_SECS:-60}"   # how often a session with no person looks for a free one
 # Set only by the commands a human runs at a prompt. Everything the hooks print
