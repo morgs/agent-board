@@ -209,6 +209,14 @@ mkdir -p "$B/wins"
 printf '%s\tGroot\tthe role landed\n' "$(date +%H:%M:%S)" > "$B/wins/$(date +%F).$PB"
 relay >/dev/null 2>&1
 has 'a beta win shows on alpha, with its machine' "$(ab "$A" wins 2>&1)" 'Groot@beta'
+d5=$(date -v-5d +%F 2>/dev/null || date -d '-5 days' +%F)
+d30=$(date -v-30d +%F 2>/dev/null || date -d '-30 days' +%F)
+printf '09:00:00\tGroot\tthe old migration landed\n' > "$B/wins/$d5.$PB"
+printf '09:00:00\tGroot\tlong gone\n' > "$B/wins/$d30.$PB"
+relay >/dev/null 2>&1
+out=$(ab "$A" wins --all 2>&1)
+has  'a beta win from five days ago shows in alpha wins --all' "$out" 'the old migration landed'
+hasnt 'a beta win past the keep window is not carried'          "$out" 'long gone'
 
 out=$(ab "$B" relay --once 2>&1); rc=$?
 check 'a board that reaches no peer has nothing to relay' "$rc" 1

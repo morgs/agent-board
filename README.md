@@ -1067,6 +1067,8 @@ never checks a remote pid. `agentboard relay --once` runs one pass, and
 the sync age. A mirror older than `stale` is shown as "not seen since", never as
 live. Wins and file claims cross as a view only: each machine has its own
 checkouts, so two edits of one file meet at `git push`, not in one tree.
+A peer's wins cross for the whole keep window, so `wins --all` on any one
+machine lists every machine's days, and a weekly summary can be written from either.
 
 **Messages** cross with their id unchanged and an `origin:` line, and a message that
 already has an origin is never sent back, so nothing echoes. `tell name` resolves a

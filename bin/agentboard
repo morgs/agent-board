@@ -2011,7 +2011,7 @@ print_peer_entry() {   # print_peer_entry <peer_rows line>
 #   P pid repo path                                   its uncommitted file claims
 #   E env pid holder for since                        a dev env lease held here
 #   V pid holder file since                           the vault lease, if held
-#   W day time who what                               today's and yesterday's wins
+#   W day time who what                               wins inside the keep window
 cmd__export() {
   local f pid repo rb st sc p e w day
   for f in "$SESS"/*.md; do
@@ -2036,11 +2036,14 @@ cmd__export() {
     printf 'V\t%s\t%s\t%s\t%s\n' "$(vault_owner_field pid)" "$(vault_owner_field name)" \
       "$(vault_owner_field file)" "$(vault_owner_field since)"
   fi
-  for day in "$(days_ago 1)" "$(date +%F)"; do
-    for w in "$WINS/$day".*; do
-      [ -e "$w" ] || continue
-      awk -F'\t' -v d="$day" 'NF>=3 {print "W\t" d "\t" $1 "\t" $2 "\t" $3}' "$w"
-    done
+  # The whole keep window, not just today and yesterday: the weekly summary is
+  # written on one machine, and a peer's older days would otherwise exist only there.
+  local cutoff; cutoff=$(days_ago "$WIN_KEEP_DAYS") || cutoff=""
+  for w in "$WINS"/*.*; do
+    [ -e "$w" ] || continue
+    day=$(basename "$w"); day=${day%%.*}
+    [ -n "$cutoff" ] && [[ "$day" < "$cutoff" ]] && continue
+    awk -F'\t' -v d="$day" 'NF>=3 {print "W\t" d "\t" $1 "\t" $2 "\t" $3}' "$w"
   done
   return 0
 }
@@ -2475,7 +2478,7 @@ day_label() {   # day_label <YYYY-MM-DD> -> "Wed 16 Sep (yesterday)"
 
 win_days() {   # every day that has a win, newest first
   local f
-  for f in "$WINS"/*.*; do [ -e "$f" ] || continue; basename "$f" | sed 's/\.[^.]*$//'; done \
+  for f in "$WINS"/*.* "$REMOTED"/*/wins/*.*; do [ -e "$f" ] || continue; basename "$f" | sed 's/\.[^.]*$//'; done \
     2>/dev/null | sort -ru
 }
 
