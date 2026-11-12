@@ -2500,7 +2500,10 @@ list read out at standup, so a win written today is read aloud tomorrow.
 Say the user impact: who notices and what changes for them (staff,
 consultants, customers, the team), in words a non-engineer reads. The
 weekly report to the team is built from these wins, so the impact must be
-in the sentence, not only the technical change.
+in the sentence, not only the technical change. A security fix often
+changes nothing a user sees: then tag it "🔒 security fix" and give the
+risk it removes as the impact (what could have been exposed or abused,
+and by whom).
 
 Write it with some excitement, not as a changelog entry. Emoji welcome,
 personality welcome, say what was good about it. The flat version of the
