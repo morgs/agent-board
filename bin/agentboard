@@ -68,6 +68,7 @@
 # Env: AGENT_BOARD_DIR (default ~/agent-board), AGENT_BOARD_STALE_SECS (7200),
 #      AGENT_BOARD_DONE_KEEP_SECS (3600), AGENT_BOARD_MSG_KEEP_SECS (86400),
 #      AGENT_BOARD_DELIVER_ON_STOP (1), AGENT_BOARD_POKE_CMD (unset),
+#      AGENT_BOARD_ANON_RETRY_SECS (60),
 #      AGENT_BOARD_CC_SESSIONS (~/.claude/sessions — where Claude keeps its own
 #      per-session metadata; overridable so the tests stay self-contained).
 
@@ -89,6 +90,7 @@ DONE_KEEP_SECS="${AGENT_BOARD_DONE_KEEP_SECS:-3600}"
 MSG_KEEP_SECS="${AGENT_BOARD_MSG_KEEP_SECS:-86400}"
 WIN_KEEP_DAYS="${AGENT_BOARD_WIN_KEEP_DAYS:-7}"  # today plus the seven days before it, so a weekly review sees a whole week
 DELIVER_ON_STOP="${AGENT_BOARD_DELIVER_ON_STOP:-1}"
+ANON_RETRY_SECS="${AGENT_BOARD_ANON_RETRY_SECS:-60}"   # how often a session with no person looks for a free one
 # Set only by the commands a human runs at a prompt. Everything the hooks print
 # lands in some agent's context window, where a banner, a colour escape and a
 # joke are all just tokens it has to pay for and cannot act on.
@@ -133,10 +135,30 @@ agent_pid() {
   printf '%s' "${PPID:-$$}"
 }
 
+# A session file is one that says whose it is. A hook killed part-way through a
+# claim used to leave a 0-byte file, and everything that then read "my pid" from it
+# got the empty string: an inbox floor of 0, a read file that was the read/
+# directory itself, and the same old broadcasts delivered at every Stop. So a file
+# with no pid in its frontmatter is treated as no file at all, here, once — the
+# callers that register on demand then write a whole one over it.
+session_ok() {   # session_ok <file>: it has a pid in its frontmatter
+  local line
+  [ -s "$1" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in 'pid: '[0-9]*) return 0 ;; '') return 1 ;; esac
+  done < "$1" 2>/dev/null
+  return 1
+}
+
 find_file() {
   local pid=$$ i=0
   while [ "${pid:-0}" -gt 1 ] && [ "$i" -lt 15 ]; do
-    [ -f "$SESS/$pid.md" ] && { printf '%s' "$SESS/$pid.md"; return 0; }
+    # The nearest file up the tree is this session's, usable or not: walking past
+    # a broken one would hand a nested agent its parent's identity.
+    if [ -f "$SESS/$pid.md" ]; then
+      session_ok "$SESS/$pid.md" || return 1
+      printf '%s' "$SESS/$pid.md"; return 0
+    fi
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
     i=$((i+1))
   done
@@ -383,15 +405,60 @@ lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
 person_of() { local v; v=$(get_field "$1" person); case "$v" in ''|'-') ;; *) printf '%s' "$v" ;; esac; }
 
-person_taken() {   # among live sessions only — a retired person is free to reuse
-  local want=$1 f
-  for f in "$SESS"/*.md; do
-    [ -e "$f" ] || continue
-    is_live "$f" || continue
-    [ "$(person_of "$f")" = "$want" ] && return 0
+# Every live local session in one pass: file, pid, person, name as stored, separated
+# by US (0x1f — a tab would collapse an empty field when the shell reads it back). One awk
+# reads the frontmatter of all of them; asking each file for each field separately
+# is three forks a field, which is nothing once and was 28 seconds when a full pool
+# made auto_person ask about every candidate in turn. The file names go in on stdin
+# and are read with getline, so one swept from under us is skipped, not fatal.
+live_local() {
+  local f st pid ep person name
+  set -- "$SESS"/*.md
+  [ -e "$1" ] || return 0
+  printf '%s\n' "$@" | awk '
+    { f = $0; st = pid = ep = per = nm = ""; g1 = g2 = g3 = g4 = g5 = 0
+      while ((getline line < f) > 0) {
+        if      (!g1 && index(line, "status: ") == 1) { st  = substr(line, 9);  g1 = 1 }
+        else if (!g2 && index(line, "pid: ")    == 1) { pid = substr(line, 6);  g2 = 1 }
+        else if (!g3 && index(line, "epoch: ")  == 1) { ep  = substr(line, 8);  g3 = 1 }
+        else if (!g4 && index(line, "person: ") == 1) { per = substr(line, 9);  g4 = 1 }
+        else if (!g5 && index(line, "name: ")   == 1) { nm  = substr(line, 7);  g5 = 1 }
+      }
+      close(f)
+      printf "%s\037%s\037%s\037%s\037%s\037%s\n", f, st, pid, ep, per, nm }' 2>/dev/null \
+  | while IFS=$'\037' read -r f st pid ep person name; do
+      live_by "$f" "$st" "$pid" "$ep" || continue
+      case "$person" in '-') person="" ;; esac
+      case "$name" in '-') name="" ;; esac
+      printf '%s\037%s\037%s\037%s\n' "$f" "$pid" "$person" "$name"
+    done
+}
+
+# Who is in use, here and on every fresh peer — the whole set, read once.
+live_persons() {
+  live_local | awk -F'\037' '$3 != "" { print $3 }'
+  peers_on && peer_rows | awk -F'\t' '$3 != "" && $3 != "-" { print $3 }'
+  return 0
+}
+live_names() {   # as name_of has it: the stored name, else the one Claude holds
+  local f pid person name
+  live_local | while IFS=$'\037' read -r f pid person name; do
+    [ -n "$name" ] || name=$(cc_meta "$pid" name) || name=""
+    [ -n "$name" ] && printf '%s\n' "$name"
   done
-  peers_on && peer_rows | awk -F'\t' -v w="$want" '$3==w {f=1} END {exit !f}' && return 0
+  peers_on && peer_rows | awk -F'\t' '$4 != "" && $4 != "-" { print $4 }'
+  return 0
+}
+
+# Matched in the shell, not with `grep -q` on the end of a pipe: grep leaves at the
+# first match, the writer can take a SIGPIPE, and under pipefail a hit reads as a miss.
+in_lines() {   # in_lines <word> <newline-separated list>
+  case $'\n'"$2"$'\n' in *$'\n'"$1"$'\n'*) return 0 ;; esac
   return 1
+}
+
+person_taken() {   # among live sessions only — a retired person is free to reuse
+  in_lines "$1" "$(live_persons)"
 }
 
 # A pin keeps a long-running role's person across restarts: a session named
@@ -408,12 +475,14 @@ pinned_person() {   # pinned_person <session name> -> its person, or nothing
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", k); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
       if (k == n && v != "") { print v; exit } }' "$PERSONS_FILE"
 }
-is_pinned_person() {   # is_pinned_person <person>
-  [ -f "$PERSONS_FILE" ] || return 1
-  awk -v p="$1" '/^[[:space:]]*(#|$)/ { next }
+pinned_persons() {   # every pinned person, one per line
+  [ -f "$PERSONS_FILE" ] || return 0
+  awk '/^[[:space:]]*(#|$)/ { next }
     { i = index($0, "="); if (!i) next; v = substr($0, i+1)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); if (v == p) f = 1 }
-    END { exit !f }' "$PERSONS_FILE"
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); if (v != "") print v }' "$PERSONS_FILE"
+}
+is_pinned_person() {   # is_pinned_person <person>
+  in_lines "$1" "$(pinned_persons)"
 }
 
 # An agent process stays live however long it sits idle (see is_live). For a
@@ -428,15 +497,25 @@ is_persistent() {   # is_persistent <session name>
     END { exit !f }' "$PERSISTENT_FILE"
 }
 
+# The names in use are read once, then every candidate is tested against that
+# set in the shell. Asking "is this one taken?" per candidate rescans the board
+# each time, which costs nothing while the first candidate is free and everything
+# once the pool is full: all of it is probed, and a SessionStart hook that takes
+# 28 seconds is killed long before it answers. The whole pool is walked, whatever
+# its size, so a free name is always found if there is one.
+AB_PERSON_NONE=Anon   # what a session is called while every name in the pool is out
 auto_person() {   # auto_person <pid> -> a person no live session is using
-  local pid=$1 i=0 cand
+  local pid=$1 i=0 cand taken n
   local -a P=($(person_pool))
-  while [ "$i" -lt 96 ]; do
-    cand="${P[$(( ( ${pid:-0} / 7 + i ) % ${#P[@]} ))]}"
-    is_pinned_person "$cand" || person_taken "$cand" || { printf '%s' "$cand"; return 0; }
+  n=${#P[@]}
+  [ "$n" -gt 0 ] || { printf '%s' "$AB_PERSON_NONE"; return 0; }
+  taken=$(live_persons; pinned_persons)
+  while [ "$i" -lt "$n" ]; do
+    cand="${P[$(( ( ${pid:-0} / 7 + i ) % n ))]}"
+    in_lines "$cand" "$taken" || { printf '%s' "$cand"; return 0; }
     i=$((i+1))
   done
-  printf 'Anon'
+  printf '%s' "$AB_PERSON_NONE"
 }
 
 # A new session file takes its pin at once when the name is already known (a
@@ -449,26 +528,20 @@ claim_person() {   # claim_person <pid> <chosen session name>
 }
 
 name_taken() {   # name_taken <name> — among live sessions, the only ones addressable
-  local want=$1 f
-  for f in "$SESS"/*.md; do
-    [ -e "$f" ] || continue
-    is_live "$f" || continue
-    [ "$(name_of "$f")" = "$want" ] && return 0
-  done
-  peers_on && peer_rows | awk -F'\t' -v w="$want" '$4==w {f=1} END {exit !f}' && return 0
-  return 1
+  in_lines "$1" "$(live_names)"
 }
 
 # Seeded from the pid so a session keeps its name if it is claimed twice before
 # the file lands, then probed for collisions, because a name that is ambiguous is
 # a name that cannot be used as an address.
 auto_name() {   # auto_name <pid> -> a name no live session is using
-  local pid=$1 i=0 cand h
+  local pid=$1 i=0 cand h taken
   local -a A=($AB_ADJ) N=($AB_NOUN)
   h=$(( ${pid:-0} ))
+  taken=$(live_names)   # once, as in auto_person
   while [ "$i" -lt 96 ]; do
     cand="${A[$(( (h + i) % ${#A[@]} ))]}-${N[$(( (h / ${#A[@]} + i * 7) % ${#N[@]} ))]}"
-    name_taken "$cand" || { printf '%s' "$cand"; return 0; }
+    in_lines "$cand" "$taken" || { printf '%s' "$cand"; return 0; }
     i=$((i+1))
   done
   printf 'agent-%s' "$pid"   # 96 live collisions is not a board, it is a stampede
@@ -530,6 +603,15 @@ touch_updated() {
     local person pin; person=$(person_of "$1"); pin=$(pinned_person "$(name_of "$1")")
     if [ -n "$pin" ] && [ "$person" != "$pin" ] && ! person_taken "$pin"; then
       set_field "$1" person "$pin"
+    elif [ "$person" = "$AB_PERSON_NONE" ]; then
+      # The pool was full when this session drew. Look again, but on a timer: this
+      # runs on every hook, and a full pool does not empty between two of them.
+      local tried now; tried=$(get_field "$1" person_tried); now=$(now_e)
+      if [ $(( now - ${tried:-0} )) -ge "$ANON_RETRY_SECS" ] 2>/dev/null; then
+        person=$(auto_person "$pid")
+        [ "$person" = "$AB_PERSON_NONE" ] || set_field "$1" person "$person"
+        set_field "$1" person_tried "$now"
+      fi
     elif [ -z "$person" ] || { [ "$person" != "$pin" ] && ! person_in_theme "$person"; }; then
       set_field "$1" person "$(auto_person "$pid")"
     fi
@@ -544,12 +626,15 @@ touch_updated() {
 append_log() { printf -- '- %s %s\n' "$(hhmm)" "$2" >> "$1"; }
 
 is_live() {
-  local f=$1 pid epoch
-  [ "$(get_field "$f" status)" = "ACTIVE" ] || return 1
-  pid=$(get_field "$f" pid)
+  live_by "$1" "$(get_field "$1" status)" "$(get_field "$1" pid)" "$(get_field "$1" epoch)"
+}
+# The rule itself, on fields the caller has already read — live_local reads them
+# for every session in one pass, and there must be one definition of "live".
+live_by() {   # live_by <file> <status> <pid> <epoch>
+  local f=$1 pid=$3 epoch=$4
+  [ "$2" = "ACTIVE" ] || return 1
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
-  epoch=$(get_field "$f" epoch)
-  [ -n "$epoch" ] && [ $(( $(now_e) - epoch )) -lt "$STALE_SECS" ] && return 0
+  [ -n "$epoch" ] && [ $(( $(now_e) - epoch )) -lt "$STALE_SECS" ] 2>/dev/null && return 0
   # Past the heartbeat age: an agent idle all evening is still reachable while its
   # pid runs an agent. The comm check is what keeps a pid since reused by some
   # other program from passing.
@@ -1299,7 +1384,7 @@ cmd_claim() {
   local name_src=""; [ -n "$name" ] && name_src=user
 
   local f="$SESS/$pid.md"
-  if [ -f "$f" ] && [ "$(get_field "$f" status)" = "ACTIVE" ]; then
+  if session_ok "$f" && [ "$(get_field "$f" status)" = "ACTIVE" ]; then
     set_field "$f" cwd "$cwd"; set_field "$f" repo "$repo"; set_field "$f" branch "$branch"
     # A chosen name is written on every refresh so /rename takes effect at once;
     # an issued one is written once and then left alone, or the session would be
@@ -1312,18 +1397,25 @@ cmd_claim() {
     [ -n "$scope" ] && set_field "$f" scope "$scope"
     touch_updated "$f"
   else
-    local chosen=$name
+    # Everything that takes time is worked out before the file exists, and the
+    # file is moved into place whole. `cat > "$f" <<EOF` opens the file first and
+    # expands the body second, so a hook killed at its timeout while the person
+    # was still being drawn left a 0-byte session file behind — a session with no
+    # pid, which then could not be healed by anything that read its pid.
+    local chosen=$name person nowh nowe tmp="$f.tmp.$$"
     [ -n "$name" ] || { name=$(auto_name "$pid"); name_src=auto; }
-    cat > "$f" <<EOF
+    person=$(claim_person "$pid" "$chosen")
+    nowh=$(now_h); nowe=$(now_e)
+    cat > "$tmp" <<EOF && mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
 agent: ${agent:-unknown}
 name: ${name:--}
 name_source: ${name_src:--}
-person: $(claim_person "$pid" "$chosen")
+person: ${person:--}
 pid: $pid
 session: ${session:--}
-started: $(now_h)
-updated: $(now_h)
-epoch: $(now_e)
+started: $nowh
+updated: $nowh
+epoch: $nowe
 status: ACTIVE
 cwd: $cwd
 repo: $repo
@@ -1332,7 +1424,7 @@ scope: ${scope:--}
 hold: -
 hold_since: -
 state: -
-inbox_epoch: $(now_e)
+inbox_epoch: $nowe
 
 EOF
   fi
@@ -2297,6 +2389,7 @@ msg_unread() {
 
 has_unread() {   # has_unread <pid>
   local pid=$1 floor f
+  [ -n "$pid" ] || return 1
   floor=$(get_field "$SESS/$pid.md" inbox_epoch); floor=${floor:-0}
   for f in "$MSGS"/*.md; do
     [ -e "$f" ] || continue
@@ -2312,8 +2405,13 @@ cmd_inbox() {
   done
   me=$(find_file) || return 1
   mypid=$(get_field "$me" pid)
+  # Without a pid there is no "me" to deliver to: every broadcast would match, the
+  # floor would be 0, and the read marks would be appended to read/ itself, which
+  # fails — so the same messages came back at every Stop. Deliver nothing instead.
+  [ -n "$mypid" ] || return 1
   floor=$(get_field "$me" inbox_epoch); floor=${floor:-0}
   rf="$READ/$mypid"
+  [ -d "$rf" ] && return 1
   for f in "$MSGS"/*.md; do
     [ -e "$f" ] || continue
     id=$(basename "$f")
@@ -3075,6 +3173,13 @@ cmd_sweep() {
     [ -n "$pid" ] && is_persistent "$(name_of "$f")" && continue
     if [ "$age" -gt $(( STALE_SECS * 4 )) ]; then rm -f "$f"; SW_S=$((SW_S+1)); fi
   done
+  # A session file is written as <file>.tmp.<writer pid> and moved into place. A
+  # writer killed in between leaves the temp behind; nothing reads it, so it only
+  # needs collecting once that writer is gone.
+  for f in "$SESS"/*.md.tmp.*; do
+    [ -e "$f" ] || continue
+    kill -0 "${f##*.}" 2>/dev/null || rm -f "$f"
+  done
   for f in "$MSGS"/*.md; do
     [ -e "$f" ] || continue
     local ep2; ep2=$(get_field "$f" epoch)
@@ -3383,8 +3488,10 @@ gate_file_write() {
   hook_decide ask "$(printf '%s already has uncommitted changes from%s.\n\nIn a shared-main repo everyone commits to main from one shared checkout, so two agents on the same file will not conflict in git — they will just overwrite each other. Either coordinate first:\n\n  agentboard tell <name> "I need to change %s too"\n\nor edit a different file. Approve if you know this is safe.\n' "$rel" "${owners#,}" "$rel")"
 }
 
-# A live session whose file was lost (swept, deleted by hand) registers again
-# on its next tool call, so its claims and name come back without a restart.
+# A live session whose file was lost (swept, deleted by hand) or left unusable
+# (find_file refuses one with no pid) registers again on its next hook, so its
+# claims and name come back without a restart. The new file's inbox floor is now:
+# what was broadcast before it is not delivered again.
 reclaim_if_lost() {
   local p
   find_file >/dev/null 2>&1 && return 0
@@ -3615,6 +3722,7 @@ EOF
 # message has arrived. That is what stops this from looping forever.
 hook_stop() {
   cat >/dev/null
+  reclaim_if_lost
   cmd_heartbeat
   cmd__repoke >/dev/null 2>&1
   [ "$DELIVER_ON_STOP" = "0" ] && exit 0
