@@ -3348,32 +3348,55 @@ for p in sys.argv[1].split("."):
     cur = cur.get(p) if isinstance(cur,dict) else None
 print(cur if isinstance(cur,str) else "")' "$1" 2>/dev/null; }
 
+# Tool names that run a shell command. Their command must be readable, or the
+# call is refused: a gate that cannot read the command cannot judge it.
+SHELL_TOOLS='Bash|shell|local_shell|exec_command'
+# Tool names that only write files from a patch: no command gate applies.
+PATCH_TOOLS='apply_patch|Edit|Write|MultiEdit|NotebookEdit'
+
 # The shell command a tool call will run. Claude sends a string; Codex sends a
 # string too, but a list (argv) is accepted as well, and `bash -lc <script>`
 # is reduced to the script, because that is what the gates must read.
+# Exit 0 with the command (empty: the tool has no command), 3 if the command
+# cannot be read, anything else if the parser itself failed. Fail closed on all
+# but 0.
 tool_command() {
-  python3 -c '
-import json, shlex, sys
+  SHELL_TOOLS=$SHELL_TOOLS python3 -c '
+import json, os, shlex, sys
 try: d = json.load(sys.stdin)
-except Exception: sys.exit(0)
+except Exception: sys.exit(3)
+if not isinstance(d, dict): sys.exit(3)
+shell = d.get("tool_name") in os.environ["SHELL_TOOLS"].split("|")
 ti = d.get("tool_input")
-c = ti.get("command", ti.get("cmd")) if isinstance(ti, dict) else None
-if isinstance(c, list) and all(isinstance(x, str) for x in c):
+c = None
+if isinstance(ti, dict):
+    c = ti.get("command", ti.get("cmd"))
+elif shell:
+    c = ti
+if c is None:
+    sys.exit(3 if shell else 0)
+if isinstance(c, list) and c and all(isinstance(x, str) for x in c):
     if len(c) == 3 and c[0].rsplit("/", 1)[-1] in ("bash", "sh", "zsh") and c[1] in ("-c", "-lc"):
         c = c[2]
     else:
         c = shlex.join(c)
-print(c if isinstance(c, str) else "")' 2>/dev/null
+if not isinstance(c, str):
+    sys.exit(3 if shell else 0)
+print(c)'
 }
 
 # Codex edits files with apply_patch: one call, a patch text, any number of
 # files. Prints the absolute path of every file the patch adds, updates, deletes
 # or moves to, one per line; nothing if the call is not a patch.
+# Headers are read as Codex reads them (codex-rs apply-patch, 0.169.0): each line
+# trimmed, then the marker. Exit 3 for a patch that names no file the hook can
+# read, so the caller refuses it rather than let an unread patch through.
 patch_paths() {   # stdin = hook payload
-  python3 -c '
-import json, os, re, sys
+  SHELL_TOOLS=$SHELL_TOOLS python3 -c '
+import json, os, sys
 try: d = json.load(sys.stdin)
-except Exception: sys.exit(0)
+except Exception: sys.exit(3)
+if not isinstance(d, dict): sys.exit(3)
 ti = d.get("tool_input")
 if isinstance(ti, dict):
     t = ti.get("command", ti.get("patch", ti.get("input")))
@@ -3383,13 +3406,41 @@ if isinstance(t, list):
     t = next((x for x in t if isinstance(x, str) and "*** Begin Patch" in x), None)
 if not isinstance(t, str) or "*** Begin Patch" not in t:
     sys.exit(0)
+markers = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
 cwd = d.get("cwd") or os.getcwd()
-seen = []
-for mo in re.finditer(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$", t, re.M):
-    p = os.path.normpath(os.path.join(cwd, mo.group(1)))
-    if p not in seen:
-        seen.append(p)
-print("\n".join(seen))' 2>/dev/null
+seen, empty = [], False
+for line in t.splitlines():
+    s = line.strip()
+    for mk in markers:
+        if s.startswith(mk):
+            rel = s[len(mk):].strip()
+            if not rel:
+                empty = True
+                break
+            p = os.path.normpath(os.path.join(cwd, rel))
+            if p not in seen:
+                seen.append(p)
+            break
+if empty or not seen:
+    # A shell command that only mentions the marker (a grep, a doc) is not a
+    # patch. One that runs apply_patch, or a patch tool, is, and must name files.
+    if d.get("tool_name") in os.environ["SHELL_TOOLS"].split("|") and "apply_patch" not in t:
+        sys.exit(0)
+    sys.exit(3)
+print("\n".join(seen))'
+}
+
+# Refuse a tool call that the gates could not judge. Exit 2 blocks the call in
+# both Claude Code and Codex.
+hook_refuse() {   # hook_refuse <what went wrong>
+  {
+    printf 'BLOCKED: the agent board could not check this tool call (%s).\n\n' "$1"
+    printf 'The gates fail closed: a call they cannot read is refused, not let through.\n'
+    printf 'Tell the user what you tried to do. For a shell command they judge safe, run it\n'
+    printf 'again with AGENT_BOARD_OVERRIDE=1 before it. A patch must name its files with\n'
+    printf '"*** Add File: ", "*** Update File: ", "*** Delete File: " or "*** Move to: ".\n'
+  } >&2
+  exit 2
 }
 
 # PreToolUse can deny outright or hand the decision back to the user ("ask").
@@ -3533,12 +3584,39 @@ whole_tree_op() {
 # grant is spent. It never passes the vault gate, which is not a question.
 allow_edit_file() { local p; p=$(agent_pid); printf '%s/allow-edit.%s' "$LOCKS" "$p"; }
 
+# Taking and adding a grant hold an flock on <file>.lock, so two hooks of one
+# session that race for the same grant cannot both spend it. A grant counts as
+# spent only once the rewritten file is in place.
 allow_edit_take() {   # allow_edit_take <abs path>: 0 and spent if granted
   local f; f=$(allow_edit_file)
-  [ -f "$f" ] && grep -qxF "$1" "$f" || return 1
-  grep -vxF "$1" "$f" > "$f.tmp.$$"; mv "$f.tmp.$$" "$f"
-  [ -s "$f" ] || rm -f "$f"
-  return 0
+  [ -f "$f" ] || return 1
+  F=$f P=$1 python3 -c '
+import fcntl, os, sys
+f, p = os.environ["F"], os.environ["P"]
+with open(f + ".lock", "a") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    try:
+        with open(f) as fh: lines = fh.read().splitlines()
+    except FileNotFoundError:
+        sys.exit(1)
+    if p not in lines: sys.exit(1)
+    lines.remove(p)
+    if lines:
+        tmp = "%s.tmp.%d" % (f, os.getpid())
+        with open(tmp, "w") as fh: fh.write("\n".join(lines) + "\n")
+        os.replace(tmp, f)
+    else:
+        os.unlink(f)
+sys.exit(0)' 2>/dev/null
+}
+
+allow_edit_add() {   # allow_edit_add <abs path>
+  F=$(allow_edit_file) P=$1 python3 -c '
+import fcntl, os
+f, p = os.environ["F"], os.environ["P"]
+with open(f + ".lock", "a") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    with open(f, "a") as fh: fh.write(p + "\n")'
 }
 
 cmd_allow_edit() {   # cmd_allow_edit <path>...
@@ -3546,7 +3624,8 @@ cmd_allow_edit() {   # cmd_allow_edit <path>...
   [ $# -gt 0 ] || { printf 'usage: agentboard allow-edit <path>...   (only after the user said yes)\n' >&2; return 1; }
   for p in "$@"; do
     a=$(abs_path "$p") || { printf 'no such directory for: %s\n' "$p" >&2; continue; }
-    printf '%s\n' "$a" >> "$(allow_edit_file)"; n=$((n+1))
+    allow_edit_add "$a" || { printf 'could not record the grant for: %s\n' "$p" >&2; continue; }
+    n=$((n+1))
   done
   [ "$n" -gt 0 ] || return 1
   printf 'your next edit of %s path(s) passes the overlap gate, once.\n' "$n"
@@ -3603,7 +3682,7 @@ hook_posttool() {
   reclaim_if_lost
   tool=$(printf '%s' "$payload" | jget tool_name)
   local pp
-  pp=$(printf '%s' "$payload" | patch_paths)
+  pp=$(printf '%s' "$payload" | patch_paths 2>/dev/null)   # nothing to block here
   if [ -n "$pp" ]; then
     while IFS= read -r path; do record_path "$path" || true; done <<EOF
 $pp
@@ -3620,20 +3699,31 @@ EOF
 hook_pretool() {
   local payload tool cmd cwd scan repo policy conflicts path
   payload=$(cat)
+  printf '%s' "$payload" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert isinstance(d, dict) and isinstance(d.get("tool_name"), str) and d["tool_name"]' 2>/dev/null \
+    || hook_refuse "the hook payload is not a JSON object with a tool_name"
   reclaim_if_lost
   tool=$(printf '%s' "$payload" | jget tool_name)
   cwd=$(printf '%s' "$payload" | jget cwd)
 
   # A patch (Codex apply_patch) is a file write to every file it names. One
   # that arrives inside a shell command is still a shell command, so it goes on
-  # to the command gates as well.
-  local pp
-  pp=$(printf '%s' "$payload" | patch_paths)
+  # to the command gates as well. So does a patch under any tool name that is
+  # not a pure patch tool: only those may skip the command gates.
+  local pp prc=0
+  pp=$(printf '%s' "$payload" | patch_paths) || prc=$?
+  case $prc in
+    0) ;;
+    3) hook_refuse "a patch that names no file the board can read" ;;
+    *) hook_refuse "the patch parser failed, exit $prc" ;;
+  esac
   if [ -n "$pp" ]; then
     while IFS= read -r path; do gate_file_write "$path"; done <<EOF
 $pp
 EOF
-    case "$tool" in Bash|shell|local_shell|exec_command) ;; *) exit 0 ;; esac
+    case "|$PATCH_TOOLS|" in *"|$tool|"*) exit 0 ;; esac
   fi
 
   case "$tool" in
@@ -3644,7 +3734,13 @@ EOF
       exit 0 ;;
   esac
 
-  cmd=$(printf '%s' "$payload" | tool_command)
+  local crc=0
+  cmd=$(printf '%s' "$payload" | tool_command) || crc=$?
+  case $crc in
+    0) ;;
+    3) hook_refuse "the $tool call has no command the board can read" ;;
+    *) hook_refuse "the command parser failed, exit $crc" ;;
+  esac
   [ -n "$cmd" ] || exit 0
   case "$cmd" in *AGENT_BOARD_OVERRIDE*) exit 0;; esac
   scan=$(printf '%s' "$cmd" | scan_text)
@@ -3885,7 +3981,7 @@ hook_end() {
   vault_i_hold && cmd_vault free >/dev/null 2>&1
   env_free_mine >/dev/null 2>&1
   cmd_done
-  rm -f "$(allow_edit_file)"
+  rm -f "$(allow_edit_file)" "$(allow_edit_file).lock"
   # Codex gives SessionEnd one second. The sweep is not urgent: the next
   # session start runs one anyway.
   [ "$AB_HOST" = codex ] || cmd_sweep
@@ -3903,6 +3999,40 @@ case "$sub" in
       printf '%s %s %s\t%s\n' "$(now_h 2>/dev/null)" "$AB_HOST" "$sub" "$(printf '%s' "$_ab_in" | tr '\n' ' ')" \
         >> "$AGENT_BOARD_HOOK_LOG" 2>/dev/null
       exec < <(printf '%s' "$_ab_in")
+    fi
+    # Codex does not block a tool call when its PreToolUse hook times out,
+    # crashes or answers in a form it cannot use: the call runs. So the Codex
+    # gate runs as a child under a time budget (well inside Codex's 600s), and
+    # anything but a clean allow (exit 0, no output), a deny (exit 0 + deny
+    # JSON) or a refusal (exit 2) is turned into a refusal here.
+    if [ "$sub" = hook-pretool ] && [ "$AB_HOST" = codex ] && [ -z "${AB_HOOK_CHILD:-}" ]; then
+      _ab_budget=${AGENT_BOARD_HOOK_BUDGET:-20}
+      _ab_d=$(mktemp -d "${TMPDIR:-/tmp}/agentboard-hook.XXXXXX") || {
+        printf 'BLOCKED: the agent board hook could not make a temp dir, so it cannot check this call.\n' >&2; exit 2; }
+      AB_HOOK_CHILD=1 timeout -k 2 "$_ab_budget" "$0" hook-pretool --codex >"$_ab_d/out" 2>"$_ab_d/err"
+      _ab_rc=$?
+      _ab_why=""
+      case $_ab_rc in
+        0) if [ -s "$_ab_d/out" ] && ! python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+h = d["hookSpecificOutput"]
+assert h["permissionDecision"] == "deny" and h["permissionDecisionReason"].strip()' "$_ab_d/out" 2>/dev/null; then
+             _ab_why="its answer was not a deny Codex accepts"
+           fi ;;
+        2) ;;
+        124) _ab_why="it ran past its ${_ab_budget}s budget" ;;
+        137) _ab_why="it was killed (exit 137), or ran past its ${_ab_budget}s budget" ;;
+        *) _ab_why="it failed with exit $_ab_rc" ;;
+      esac
+      if [ -n "$_ab_why" ]; then
+        printf 'BLOCKED: the agent board gate could not decide on this call: %s.\n' "$_ab_why" >&2
+        printf 'The gates fail closed. Tell the user; they can check  agentboard check  and retry.\n' >&2
+        [ -s "$_ab_d/err" ] && { printf '\nThe gate said:\n' >&2; head -c 2000 "$_ab_d/err" >&2; }
+        rm -rf "$_ab_d"; exit 2
+      fi
+      cat "$_ab_d/out"; cat "$_ab_d/err" >&2
+      rm -rf "$_ab_d"; exit "$_ab_rc"
     fi ;;
 esac
 case "$sub" in

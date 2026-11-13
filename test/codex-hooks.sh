@@ -86,6 +86,19 @@ pre() {
   OUT=$(cd "$D" && printf '%s' "$pl" | "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
   ERR=$(cat "$T/err")
 }
+# preraw <raw stdin> -> RC, OUT, ERR (for payloads no tool would build)
+preraw() {
+  OUT=$(cd "$D" && printf '%s' "$1" | "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
+  ERR=$(cat "$T/err")
+}
+# shim <match> <action>: a python3 on PATH that runs <action> when its -c script
+# contains <match>, and is the real python3 otherwise. Breaks one helper only.
+REALPY=$(command -v python3)
+shim() {
+  mkdir -p "$T/shim"
+  printf '#!/bin/bash\ncase "$2" in *%q*) %s ;; esac\nexec %q "$@"\n' "$1" "$2" "$REALPY" > "$T/shim/python3"
+  chmod +x "$T/shim/python3"
+}
 decision() { printf '%s' "$OUT" | python3 -c '
 import json, sys
 s = sys.stdin.read().strip()
@@ -131,6 +144,53 @@ pl=$(payload PreToolUse Bash "$(shell 'ansible-playbook site.yml')")
 [ "$RC" = 2 ] && grep -q 'codex hook-pretool.*ansible-playbook site.yml' "$T/hooks.log" \
   && ok '    AGENT_BOARD_HOOK_LOG records the payload, and the gate still refuses' || bad "hook log rc=$RC"
 
+echo 'Fail closed: a payload or parser the gate cannot read is refused (review #2)'
+preraw '{'
+[ "$RC" = 2 ] && printf '%s' "$ERR" | grep -q 'could not check' && ok 'malformed JSON: refused' || bad "malformed rc=$RC"
+preraw '{"cwd":"/","tool_input":{"command":"git stash"}}'
+[ "$RC" = 2 ] && ok 'no tool_name: refused' || bad "no tool_name rc=$RC"
+pre Bash '{}'
+[ "$RC" = 2 ] && ok 'Bash with no command: refused' || bad "missing command rc=$RC"
+pre Bash '{"command": {"command": "git stash"}}'
+[ "$RC" = 2 ] && ok 'Bash with a command object: refused' || bad "command object rc=$RC"
+pre Bash '{"command": ["git", 1]}'
+[ "$RC" = 2 ] && ok 'Bash with a bad argv list: refused' || bad "bad argv rc=$RC"
+pre Read '{"file_path": "x"}'
+[ "$RC" = 0 ] && ok '    a tool with no command (Read) still passes' || bad "Read rc=$RC"
+shim 'import json, os, shlex, sys' 'exit 1'
+OLDPATH=$PATH; PATH="$T/shim:$PATH"
+pre Bash "$(shell 'git status')"
+PATH=$OLDPATH
+[ "$RC" = 2 ] && ok 'command parser process fails: refused, even for a harmless command' || bad "parser fail rc=$RC"
+shim 'markers = (' 'exit 1'
+PATH="$T/shim:$PATH"
+pre apply_patch "$(patch Update mine.yml)"
+PATH=$OLDPATH
+[ "$RC" = 2 ] && ok 'patch parser process fails: refused' || bad "patch parser fail rc=$RC"
+
+echo 'Patch headers are read as Codex reads them (review #1)'
+ind() { V=$1 P=$2 python3 -c '
+import json, os
+t = "*** Begin Patch\n  *** %s File: %s  \n@@\n-a\n+z\n*** End Patch\n" % (os.environ["V"], os.environ["P"])
+print(json.dumps({"command": t}))'; }
+pre apply_patch "$(ind Update shared.yml)"
+[ "$(decision)" = deny ] && ok 'indented header on a peer-held file: deny' || bad "indented overlap: rc=$RC $OUT"
+pre apply_patch "$(ind Update vault.yml)"
+[ "$(decision)" = deny ] && ok 'indented header on a vault file: deny' || bad "indented vault: rc=$RC $OUT"
+pre apply_patch '{"command": "*** Begin Patch\n*** Frobnicate File: shared.yml\n*** End Patch\n"}'
+[ "$RC" = 2 ] && ok 'a patch that names no file the hook can read: refused' || bad "no-path patch rc=$RC"
+pre apply_patch '{"command": "*** Begin Patch\n*** Update File:   \n*** End Patch\n"}'
+[ "$RC" = 2 ] && ok 'a header with an empty path: refused' || bad "empty path rc=$RC"
+pre Bash "$(shell "grep -n '*** Begin Patch' notes.txt")"
+[ "$RC" = 0 ] && ok '    a shell command that only mentions the marker passes' || bad "mention rc=$RC"
+
+echo 'Only pure patch tools skip the command gates (review #5)'
+HP=$'apply_patch <<\'EOF\'\n*** Begin Patch\n*** Update File: mine.yml\n@@\n-b\n+c\n*** End Patch\nEOF\ngit stash'
+pre functions.exec_command "$(shell "$HP")"
+[ "$RC" = 2 ] && ok 'unknown tool name, patch + git stash: refused' || bad "unknown tool rc=$RC"
+pre functions.exec_command "$(shell 'git stash')"
+[ "$RC" = 2 ] && ok 'unknown tool name, git stash alone: refused' || bad "unknown alone rc=$RC"
+
 echo 'PreToolUse, apply_patch: the file gates answer in a form Codex accepts'
 pre apply_patch "$(patch Update vault.yml)"
 [ "$(decision)" = deny ] && ok 'patch to a vault file without the lease: deny' || bad "vault patch: $OUT"
@@ -144,8 +204,37 @@ pre apply_patch "$(patch Update shared.yml)"
 [ "$(decision)" = allow ] && ok 'after allow-edit: allowed once' || bad "after allow-edit: $OUT"
 pre apply_patch "$(patch Update shared.yml)"
 [ "$(decision)" = deny ] && ok 'allow-edit is spent after one use' || bad "spent: $OUT"
+(cd "$D" && "$AB" allow-edit shared.yml) >/dev/null
+pl=$(payload PreToolUse apply_patch "$(patch Update shared.yml)")
+mkdir -p "$T/race"
+for i in $(seq 1 20); do
+  (cd "$D" && printf '%s' "$pl" | "$AB" hook-pretool --codex >"$T/race/$i" 2>/dev/null) &
+done
+wait
+n=0; for i in $(seq 1 20); do [ -s "$T/race/$i" ] || n=$((n+1)); done
+[ "$n" = 1 ] && ok 'one grant, 20 concurrent edits: exactly one passes (review #4)' || bad "race: $n passed"
 pre Edit "$(patch Update shared.yml)"
 [ "$(decision)" = deny ] && ok 'the same patch under the Edit tool name is gated too' || bad "Edit alias: $OUT"
+
+echo 'The Codex gate is bounded: a hang, a crash or bad output is a refusal (review #3)'
+shim 'import json, os, shlex, sys' 'sleep 30'
+PATH="$T/shim:$PATH"
+s0=$(date +%s)
+OUT=$(cd "$D" && payload PreToolUse Bash "$(shell 'git status')" | AGENT_BOARD_HOOK_BUDGET=2 "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
+el=$(( $(date +%s) - s0 ))
+PATH=$OLDPATH
+[ "$RC" = 2 ] && grep -q 'budget' "$T/err" && [ "$el" -lt 10 ] && ok "a hung gate is refused after its budget (${el}s)" || bad "hang rc=$RC el=$el"
+# Walk up to the gate process (the child of `timeout`) and kill it outright.
+shim 'import json, os, shlex, sys' 'p=$PPID; while [ "$p" -gt 1 ]; do q=$(ps -o ppid= -p "$p" | tr -d " "); if [ "$(ps -o comm= -p "$q")" = timeout ]; then kill -KILL "$p"; exit 1; fi; p=$q; done; exit 1'
+PATH="$T/shim:$PATH"
+pre Bash "$(shell 'git status')"
+PATH=$OLDPATH
+[ "$RC" = 2 ] && printf '%s' "$ERR" | grep -q 'was killed' && ok 'a gate killed mid-run is refused' || bad "crash rc=$RC $ERR"
+shim 'permissionDecisionReason": os.environ' 'echo not-json; exit 0'
+PATH="$T/shim:$PATH"
+pre apply_patch "$(patch Update vault.yml)"
+PATH=$OLDPATH
+[ "$RC" = 2 ] && printf '%s' "$ERR" | grep -q 'not a deny' && ok 'an answer Codex could not use is turned into a refusal' || bad "bad output rc=$RC $OUT"
 
 echo 'PostToolUse records the files a patch touched'
 printf 'c\n' > "$D/mine.yml"

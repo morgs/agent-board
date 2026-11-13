@@ -22,6 +22,12 @@
 # patch text in tool_input.command. Both refusal forms (exit 2 + stderr, and the
 # JSON deny) stop the call, and Codex shows "Command blocked by PreToolUse hook".
 # To see the payloads again, start codex with AGENT_BOARD_HOOK_LOG=<file>.
+#
+# Codex does not block a call when this hook times out (default 600s) or crashes.
+# `hook-pretool --codex` therefore runs the gate under its own budget
+# (AGENT_BOARD_HOOK_BUDGET, 20s) and turns a timeout, a crash or an unusable answer
+# into a refusal. If this command cannot start at all (the path is gone, the hook
+# is untrusted), Codex runs the call unchecked: see README, "Fail closed".
 
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]

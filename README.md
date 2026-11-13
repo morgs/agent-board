@@ -1053,6 +1053,41 @@ To see what a host sends, start it with `AGENT_BOARD_HOOK_LOG=<file>`. Each hook
 then appends its stdin to that file, one line per call. `test/codex-hooks.sh`
 tests the Codex answers under a process named `codex`.
 
+### Fail closed, and where it cannot
+
+Codex does not block a tool call when its PreToolUse hook times out, crashes or
+answers in a form Codex cannot use: the call runs. So the gates fail closed on
+their own side:
+
+- A payload that is not a JSON object with a `tool_name`, a shell call
+  (`Bash`, `shell`, `local_shell`, `exec_command`) whose command is missing or not
+  a string or argv list, and a parser that fails: all refused with exit 2.
+- A patch is read as Codex reads it: each line trimmed, then the marker
+  (`*** Add File: `, `*** Update File: `, `*** Delete File: `, `*** Move to: `).
+  A patch that names no file the hook can read is refused.
+- Only the pure patch tools (`apply_patch`, and the Claude edit tools) skip the
+  command gates. Any other tool name with a command goes through them.
+- Under `--codex`, PreToolUse runs the gate as a child under a time budget
+  (`AGENT_BOARD_HOOK_BUDGET`, 20 seconds; Codex waits 600). A child that runs past
+  it, is killed, or answers with anything but silence, a deny or exit 2 becomes a
+  refusal.
+- `allow-edit` grants are added and spent under an flock, so one grant passes one
+  edit even when hooks run at the same time.
+
+What the board still cannot make fail closed, because the hook never runs or
+dies before it can answer:
+
+- The hook command cannot start: the script path is gone (a removed worktree),
+  `bash` or `timeout` is missing, or the hook is not trusted or is disabled in
+  `config.toml`. Codex then runs the call unchecked.
+- The watchdog process itself is killed (SIGKILL, the OOM killer) before it
+  answers.
+- A tool that Codex does not pass through PreToolUse, or a command that the model
+  runs some way other than a tool call the hook sees.
+
+So the hooks are a guard rail for well-meant agents, not a sandbox. Hard limits
+on what Codex may run belong in its own instructions and sandbox as well.
+
 ## More than one machine
 
 With no `machines.local`, a board knows only its own machine. With one, boards on
@@ -1164,6 +1199,7 @@ exactly the failure this board exists to prevent.
 | `AGENT_BOARD_SSH` | `ssh` | the ssh client the relay, `deploylock` and `env take` use to reach a peer |
 | `AGENT_BOARD_AGENT` | board name | override the holder name `deploylock` records (default: `agentboard whoami --known`) |
 | `AGENT_BOARD_HOOK_LOG` | unset | append each hook's stdin to this file (debugging a host's payloads) |
+| `AGENT_BOARD_HOOK_BUDGET` | `20` | seconds the Codex PreToolUse gate may take before the call is refused |
 
 ## Troubleshooting
 
