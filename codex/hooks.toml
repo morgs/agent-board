@@ -15,6 +15,13 @@
 #
 # No matcher on PreToolUse or PostToolUse: the hook itself decides what to look
 # at (shell commands, and apply_patch texts for file claims and the file gates).
+#
+# Seen live on codex-cli 0.169.0 (2026-11-13): the model calls a JavaScript `exec`
+# tool, but each shell command inside it reaches PreToolUse as tool_name "Bash"
+# with tool_input.command, and a file edit as tool_name "apply_patch" with the
+# patch text in tool_input.command. Both refusal forms (exit 2 + stderr, and the
+# JSON deny) stop the call, and Codex shows "Command blocked by PreToolUse hook".
+# To see the payloads again, start codex with AGENT_BOARD_HOOK_LOG=<file>.
 
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]

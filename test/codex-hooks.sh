@@ -126,6 +126,11 @@ pre Bash '{"command": ["bash", "-lc", "git stash"]}'
 pre Bash "$(shell $'apply_patch <<\'EOF\'\n*** Begin Patch\n*** Update File: mine.yml\n@@\n-b\n+c\n*** End Patch\nEOF\nansible-playbook site.yml')"
 [ "$RC" = 2 ] && ok '    a patch inside a shell call does not hide the command' || bad "shell patch rc=$RC"
 
+pl=$(payload PreToolUse Bash "$(shell 'ansible-playbook site.yml')")
+(cd "$D" && printf '%s' "$pl" | AGENT_BOARD_HOOK_LOG="$T/hooks.log" "$AB" hook-pretool --codex) 2>/dev/null; RC=$?
+[ "$RC" = 2 ] && grep -q 'codex hook-pretool.*ansible-playbook site.yml' "$T/hooks.log" \
+  && ok '    AGENT_BOARD_HOOK_LOG records the payload, and the gate still refuses' || bad "hook log rc=$RC"
+
 echo 'PreToolUse, apply_patch: the file gates answer in a form Codex accepts'
 pre apply_patch "$(patch Update vault.yml)"
 [ "$(decision)" = deny ] && ok 'patch to a vault file without the lease: deny' || bad "vault patch: $OUT"

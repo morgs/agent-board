@@ -3895,7 +3895,15 @@ hook_end() {
 # --- dispatch --------------------------------------------------------------
 sub=${1:-check}; shift 2>/dev/null
 case "$sub" in
-  hook-*) [ "${1:-}" = "--codex" ] && { AB_HOST=codex; shift; } ;;
+  hook-*) [ "${1:-}" = "--codex" ] && { AB_HOST=codex; shift; }
+    # Debugging a host's payloads: AGENT_BOARD_HOOK_LOG=<file> in the agent's
+    # environment appends each hook's stdin there, one line per call.
+    if [ -n "${AGENT_BOARD_HOOK_LOG:-}" ]; then
+      _ab_in=$(cat)
+      printf '%s %s %s\t%s\n' "$(now_h 2>/dev/null)" "$AB_HOST" "$sub" "$(printf '%s' "$_ab_in" | tr '\n' ' ')" \
+        >> "$AGENT_BOARD_HOOK_LOG" 2>/dev/null
+      exec < <(printf '%s' "$_ab_in")
+    fi ;;
 esac
 case "$sub" in
   check)      cmd_check "$@" ;;
