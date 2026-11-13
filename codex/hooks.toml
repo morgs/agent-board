@@ -1,0 +1,42 @@
+# Agent-board hooks for Codex CLI (codex-cli 0.169.0 and later, hooks stable).
+#
+# The same five hooks Claude Code runs from ~/.claude/settings.json, called with
+# --codex so that agentboard answers in the form Codex accepts:
+#   - PreToolUse: only "deny" (with a reason) or exit 2 + stderr. Codex has no
+#     "ask", so a decision that needs the user becomes a deny that tells the agent
+#     to stop and ask, then `agentboard allow-edit <path>` or AGENT_BOARD_OVERRIDE=1.
+#   - Stop: the inbox comes back as {"decision":"block","reason": ...}.
+#   - SessionEnd: Codex allows one second, so the sweep is skipped there.
+#
+# To install, copy the [[hooks.*]] tables below into ~/.codex/config.toml. Codex
+# then asks to trust them the first time a session starts ("Hooks need review").
+# Trust is stored per hook in config.toml as hooks.state."<key>".trusted_hash.
+# Every change to a command line here needs that trust again.
+#
+# No matcher on PreToolUse or PostToolUse: the hook itself decides what to look
+# at (shell commands, and apply_patch texts for file claims and the file gates).
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "/home/ubuntu/agent-board/bin/agentboard hook-start --codex"
+
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/home/ubuntu/agent-board/bin/agentboard hook-pretool --codex"
+
+[[hooks.PostToolUse]]
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "/home/ubuntu/agent-board/bin/agentboard hook-posttool --codex"
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "/home/ubuntu/agent-board/bin/agentboard hook-stop --codex"
+
+[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = "/home/ubuntu/agent-board/bin/agentboard hook-end --codex"

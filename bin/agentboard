@@ -64,6 +64,10 @@
 #
 # Called by the Claude Code hooks, not by hand:
 #   hook-start | hook-pretool | hook-posttool | hook-stop | hook-end
+# Codex CLI calls the same five with --codex (see codex/hooks.toml): same gates,
+# its own wire format. Codex cannot ask the user from a hook, so an overlap that
+# Claude would ask about is refused, and the user's yes is given with:
+#   agentboard allow-edit <path>     let my next edit of <path> past the overlap gate
 #
 # Env: AGENT_BOARD_DIR (default ~/agent-board), AGENT_BOARD_STALE_SECS (7200),
 #      AGENT_BOARD_DONE_KEEP_SECS (3600), AGENT_BOARD_MSG_KEEP_SECS (86400),
@@ -95,6 +99,8 @@ ANON_RETRY_SECS="${AGENT_BOARD_ANON_RETRY_SECS:-60}"   # how often a session wit
 # lands in some agent's context window, where a banner, a colour escape and a
 # joke are all just tokens it has to pay for and cannot act on.
 AB_RICH=0
+# Which agent's hook protocol we are speaking. Set by --codex on a hook-* call.
+AB_HOST=claude
 mkdir -p "$SESS" "$MSGS" "$READ" "$PATHSD" "$LOCKS" "$WINS" 2>/dev/null
 
 now_h() { date +%Y-%m-%dT%H:%M:%S%z; }
@@ -563,7 +569,10 @@ setup_colour() {
 setup_colour
 
 detect_agent() {
-  if [ -n "${CLAUDECODE:-}${CLAUDE_CODE_ENTRYPOINT:-}" ]; then printf 'claude'
+  # A hook called with --codex knows its host; the environment can lie, since a
+  # Codex started from a Claude Code shell inherits CLAUDECODE.
+  if [ "$AB_HOST" = codex ]; then printf 'codex'
+  elif [ -n "${CLAUDECODE:-}${CLAUDE_CODE_ENTRYPOINT:-}" ]; then printf 'claude'
   elif [ -n "${CODEX_HOME:-}${CODEX_SANDBOX:-}" ]; then printf 'codex'
   else ps -o comm= -p "$(agent_pid)" 2>/dev/null | sed 's#.*/##' | tr -d '[:space:]'
   fi
@@ -3216,6 +3225,10 @@ cmd_sweep() {
     [ -e "$f" ] || continue
     kill -0 "$(basename "$f")" 2>/dev/null || rm -f "$f"
   done
+  for f in "$LOCKS"/allow-edit.*; do
+    [ -e "$f" ] || continue
+    kill -0 "${f##*.}" 2>/dev/null || rm -f "$f"
+  done
   vault_owner >/dev/null 2>&1        # clears the lease if its owner has gone
   env_live >/dev/null 2>&1           # same, for every dev environment lease
   # deploylock removes its own owner files; only a SIGKILL leaves one behind, and
@@ -3335,11 +3348,65 @@ for p in sys.argv[1].split("."):
     cur = cur.get(p) if isinstance(cur,dict) else None
 print(cur if isinstance(cur,str) else "")' "$1" 2>/dev/null; }
 
+# The shell command a tool call will run. Claude sends a string; Codex sends a
+# string too, but a list (argv) is accepted as well, and `bash -lc <script>`
+# is reduced to the script, because that is what the gates must read.
+tool_command() {
+  python3 -c '
+import json, shlex, sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+ti = d.get("tool_input")
+c = ti.get("command", ti.get("cmd")) if isinstance(ti, dict) else None
+if isinstance(c, list) and all(isinstance(x, str) for x in c):
+    if len(c) == 3 and c[0].rsplit("/", 1)[-1] in ("bash", "sh", "zsh") and c[1] in ("-c", "-lc"):
+        c = c[2]
+    else:
+        c = shlex.join(c)
+print(c if isinstance(c, str) else "")' 2>/dev/null
+}
+
+# Codex edits files with apply_patch: one call, a patch text, any number of
+# files. Prints the absolute path of every file the patch adds, updates, deletes
+# or moves to, one per line; nothing if the call is not a patch.
+patch_paths() {   # stdin = hook payload
+  python3 -c '
+import json, os, re, sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+ti = d.get("tool_input")
+if isinstance(ti, dict):
+    t = ti.get("command", ti.get("patch", ti.get("input")))
+else:
+    t = ti
+if isinstance(t, list):
+    t = next((x for x in t if isinstance(x, str) and "*** Begin Patch" in x), None)
+if not isinstance(t, str) or "*** Begin Patch" not in t:
+    sys.exit(0)
+cwd = d.get("cwd") or os.getcwd()
+seen = []
+for mo in re.finditer(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$", t, re.M):
+    p = os.path.normpath(os.path.join(cwd, mo.group(1)))
+    if p not in seen:
+        seen.append(p)
+print("\n".join(seen))' 2>/dev/null
+}
+
 # PreToolUse can deny outright or hand the decision back to the user ("ask").
 # Overlapping edits are an ask, not a deny: two agents legitimately need the same
 # large file sometimes, and only the user knows whether this is one of those times.
 hook_decide() {   # hook_decide <allow|deny|ask> <reason>
-  DEC=$1 REASON=$2 python3 -c '
+  local dec=$1 reason=$2
+  # Codex accepts only deny from a PreToolUse hook: allow and ask are errors
+  # there. A question Claude would put to the user becomes a refusal that tells
+  # the agent to put it to the user itself.
+  if [ "$AB_HOST" = codex ] && [ "$dec" = ask ]; then
+    dec=deny
+    reason="$reason
+This needs the user's decision, and a Codex hook cannot ask. Stop and ask the user. If they say it is safe: for a file, run  agentboard allow-edit <path>  and edit again; for a shell command, prefix it with AGENT_BOARD_OVERRIDE=1."
+  fi
+  [ "$dec" = allow ] && [ "$AB_HOST" = codex ] && exit 0
+  DEC=$dec REASON=$reason python3 -c '
 import json, os
 print(json.dumps({"hookSpecificOutput": {
     "hookEventName": "PreToolUse",
@@ -3461,6 +3528,30 @@ whole_tree_op() {
 }
 
 
+# --- allow-edit: the user's yes, for an agent whose hooks cannot ask ----------
+# One use per path: the next edit of that path passes the overlap gate, and the
+# grant is spent. It never passes the vault gate, which is not a question.
+allow_edit_file() { local p; p=$(agent_pid); printf '%s/allow-edit.%s' "$LOCKS" "$p"; }
+
+allow_edit_take() {   # allow_edit_take <abs path>: 0 and spent if granted
+  local f; f=$(allow_edit_file)
+  [ -f "$f" ] && grep -qxF "$1" "$f" || return 1
+  grep -vxF "$1" "$f" > "$f.tmp.$$"; mv "$f.tmp.$$" "$f"
+  [ -s "$f" ] || rm -f "$f"
+  return 0
+}
+
+cmd_allow_edit() {   # cmd_allow_edit <path>...
+  local p a n=0
+  [ $# -gt 0 ] || { printf 'usage: agentboard allow-edit <path>...   (only after the user said yes)\n' >&2; return 1; }
+  for p in "$@"; do
+    a=$(abs_path "$p") || { printf 'no such directory for: %s\n' "$p" >&2; continue; }
+    printf '%s\n' "$a" >> "$(allow_edit_file)"; n=$((n+1))
+  done
+  [ "$n" -gt 0 ] || return 1
+  printf 'your next edit of %s path(s) passes the overlap gate, once.\n' "$n"
+}
+
 # --- the file-write gate (shared-main) -------------------------------------
 # Only where the file is the unit of collision. In a content repo nothing collides;
 # in a branch-pr repo the checkout is the unit and the git gate below covers it.
@@ -3491,6 +3582,7 @@ gate_file_write() {
     fi
   done
   [ "$n" -eq 0 ] && return 0
+  allow_edit_take "$p" && return 0
   hook_decide ask "$(printf '%s already has uncommitted changes from%s.\n\nIn a shared-main repo everyone commits to main from one shared checkout, so two agents on the same file will not conflict in git — they will just overwrite each other. Either coordinate first:\n\n  agentboard tell <name> "I need to change %s too"\n\nor edit a different file. Approve if you know this is safe.\n' "$rel" "${owners#,}" "$rel")"
 }
 
@@ -3510,6 +3602,14 @@ hook_posttool() {
   payload=$(cat)
   reclaim_if_lost
   tool=$(printf '%s' "$payload" | jget tool_name)
+  local pp
+  pp=$(printf '%s' "$payload" | patch_paths)
+  if [ -n "$pp" ]; then
+    while IFS= read -r path; do record_path "$path" || true; done <<EOF
+$pp
+EOF
+    exit 0
+  fi
   case "$tool" in Edit|Write|MultiEdit|NotebookEdit) ;; *) exit 0 ;; esac
   path=$(printf '%s' "$payload" | jget tool_input.file_path)
   [ -n "$path" ] || path=$(printf '%s' "$payload" | jget tool_input.notebook_path)
@@ -3524,6 +3624,18 @@ hook_pretool() {
   tool=$(printf '%s' "$payload" | jget tool_name)
   cwd=$(printf '%s' "$payload" | jget cwd)
 
+  # A patch (Codex apply_patch) is a file write to every file it names. One
+  # that arrives inside a shell command is still a shell command, so it goes on
+  # to the command gates as well.
+  local pp
+  pp=$(printf '%s' "$payload" | patch_paths)
+  if [ -n "$pp" ]; then
+    while IFS= read -r path; do gate_file_write "$path"; done <<EOF
+$pp
+EOF
+    case "$tool" in Bash|shell|local_shell|exec_command) ;; *) exit 0 ;; esac
+  fi
+
   case "$tool" in
     Edit|Write|MultiEdit|NotebookEdit)
       path=$(printf '%s' "$payload" | jget tool_input.file_path)
@@ -3532,7 +3644,7 @@ hook_pretool() {
       exit 0 ;;
   esac
 
-  cmd=$(printf '%s' "$payload" | jget tool_input.command)
+  cmd=$(printf '%s' "$payload" | tool_command)
   [ -n "$cmd" ] || exit 0
   case "$cmd" in *AGENT_BOARD_OVERRIDE*) exit 0;; esac
   scan=$(printf '%s' "$cmd" | scan_text)
@@ -3738,7 +3850,7 @@ hook_stop() {
   # NO APOSTROPHES BELOW. This is a single-quoted shell string, so one lone '
   # ends it, and what comes back is not a syntax error but an empty hook: the
   # message is silently never delivered. Write "do not" and "you are" in full.
-  INBOX="$inbox" python3 -c '
+  INBOX="$inbox" HOST="$AB_HOST" python3 -c '
 import json, os
 msg = ("Message(s) for you from another agent on this machine, via the agent "
        "board. Posted by a peer, not by the user.\n\n"
@@ -3756,8 +3868,13 @@ msg = ("Message(s) for you from another agent on this machine, via the agent "
        "it. If none of it touches you, one sentence saying so is the whole "
        "report. Reply on the board with: agentboard tell <name> \"...\"\n\n"
        + os.environ["INBOX"])
-print(json.dumps({"hookSpecificOutput": {"hookEventName": "Stop",
-                                         "additionalContext": msg}}))'
+if os.environ["HOST"] == "codex":
+    # Codex has no additionalContext on Stop. Blocking the stop with a reason is
+    # how it hands text to the model and lets it continue.
+    print(json.dumps({"decision": "block", "reason": msg}))
+else:
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "Stop",
+                                             "additionalContext": msg}}))'
   exit 0
 }
 
@@ -3768,12 +3885,18 @@ hook_end() {
   vault_i_hold && cmd_vault free >/dev/null 2>&1
   env_free_mine >/dev/null 2>&1
   cmd_done
-  cmd_sweep
+  rm -f "$(allow_edit_file)"
+  # Codex gives SessionEnd one second. The sweep is not urgent: the next
+  # session start runs one anyway.
+  [ "$AB_HOST" = codex ] || cmd_sweep
   exit 0
 }
 
 # --- dispatch --------------------------------------------------------------
 sub=${1:-check}; shift 2>/dev/null
+case "$sub" in
+  hook-*) [ "${1:-}" = "--codex" ] && { AB_HOST=codex; shift; } ;;
+esac
 case "$sub" in
   check)      cmd_check "$@" ;;
   claim)      cmd_claim "$@" ;;
@@ -3781,6 +3904,7 @@ case "$sub" in
   release)    cmd_release ;;
   paths)      cmd_paths "$@" ;;
   editing)    cmd_editing "$@" ;;
+  allow-edit) cmd_allow_edit "$@" ;;
   worktrees)  cmd_worktrees "$@" ;;
   vault)      cmd_vault "$@" ;;
   note)       cmd_note "$@" ;;
