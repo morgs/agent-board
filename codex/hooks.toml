@@ -1,0 +1,58 @@
+# Agent-board hooks for Codex CLI (codex-cli 0.169.0 and later, hooks stable).
+#
+# The same five hooks Claude Code runs from ~/.claude/settings.json, called with
+# --codex so that agentboard answers in the form Codex accepts:
+#   - PreToolUse: a refusal is always exit 2 + a reason on stderr. Codex has no
+#     "ask", so a decision that needs the user becomes a deny that tells the agent
+#     to stop and ask, then `agentboard allow-edit <path>` or AGENT_BOARD_OVERRIDE=1.
+#   - Stop: the inbox comes back as {"decision":"block","reason": ...}.
+#   - SessionEnd: Codex allows one second, so the sweep is skipped there.
+#
+# To install, copy the [[hooks.*]] tables below into ~/.codex/config.toml. Codex
+# then asks to trust them the first time a session starts ("Hooks need review").
+# Trust is stored per hook in config.toml as hooks.state."<key>".trusted_hash.
+# Every change to a command line here needs that trust again.
+#
+# No matcher on PreToolUse or PostToolUse: the hook itself decides what to look
+# at (shell commands, and apply_patch texts for file claims and the file gates).
+#
+# Seen live on codex-cli 0.169.0 (2026-11-13): the model calls a JavaScript `exec`
+# tool, but each shell command inside it reaches PreToolUse as tool_name "Bash"
+# with tool_input.command, and a file edit as tool_name "apply_patch" with the
+# patch text in tool_input.command. Both refusal forms (exit 2 + stderr, and the
+# JSON deny) stop the call, and Codex shows "Command blocked by PreToolUse hook".
+# To see the payloads again, start codex with AGENT_BOARD_HOOK_LOG=<file>.
+#
+# Codex does not block a call when this hook times out (default 600s) or crashes.
+# `hook-pretool --codex` therefore runs the gate under its own budget
+# (AGENT_BOARD_HOOK_BUDGET, default 20s, clamped to 1..300) and passes on only
+# exit 0 with no stdout (allow) or exit 2 with a reason (deny). A timeout, a crash
+# or any other answer becomes a refusal. If this command cannot start at all (the
+# path is gone, the hook is untrusted), Codex runs the call unchecked: see README,
+# "Fail closed". `timeout` (coreutils) must be installed; without it every call
+# is refused.
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "/home/ubuntu/agent-board/bin/agentboard hook-start --codex"
+
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/home/ubuntu/agent-board/bin/agentboard hook-pretool --codex"
+
+[[hooks.PostToolUse]]
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "/home/ubuntu/agent-board/bin/agentboard hook-posttool --codex"
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "/home/ubuntu/agent-board/bin/agentboard hook-stop --codex"
+
+[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = "/home/ubuntu/agent-board/bin/agentboard hook-end --codex"

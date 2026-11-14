@@ -64,6 +64,10 @@
 #
 # Called by the Claude Code hooks, not by hand:
 #   hook-start | hook-pretool | hook-posttool | hook-stop | hook-end
+# Codex CLI calls the same five with --codex (see codex/hooks.toml): same gates,
+# its own wire format. Codex cannot ask the user from a hook, so an overlap that
+# Claude would ask about is refused, and the user's yes is given with:
+#   agentboard allow-edit <path>     let my next edit of <path> past the overlap gate
 #
 # Env: AGENT_BOARD_DIR (default ~/agent-board), AGENT_BOARD_STALE_SECS (7200),
 #      AGENT_BOARD_DONE_KEEP_SECS (3600), AGENT_BOARD_MSG_KEEP_SECS (86400),
@@ -95,6 +99,8 @@ ANON_RETRY_SECS="${AGENT_BOARD_ANON_RETRY_SECS:-60}"   # how often a session wit
 # lands in some agent's context window, where a banner, a colour escape and a
 # joke are all just tokens it has to pay for and cannot act on.
 AB_RICH=0
+# Which agent's hook protocol we are speaking. Set by --codex on a hook-* call.
+AB_HOST=claude
 mkdir -p "$SESS" "$MSGS" "$READ" "$PATHSD" "$LOCKS" "$WINS" 2>/dev/null
 
 now_h() { date +%Y-%m-%dT%H:%M:%S%z; }
@@ -335,7 +341,7 @@ theme_missing() {   # theme_missing <name> -> which required section is absent
 # — a mis-typed theme must not be able to stop sessions registering.
 theme_now() {
   local t
-  t=$(head -1 "$BOARD/theme" 2>/dev/null | tr -d ' \t\r')
+  t=""; [ -f "$BOARD/theme" ] && t=$(head -1 "$BOARD/theme" 2>/dev/null | tr -d ' \t\r')
   if [ -n "$t" ] && theme_valid "$t"; then printf '%s' "$t"
   else printf '%s' "$AB_THEME_DEFAULT"; fi
 }
@@ -563,14 +569,17 @@ setup_colour() {
 setup_colour
 
 detect_agent() {
-  if [ -n "${CLAUDECODE:-}${CLAUDE_CODE_ENTRYPOINT:-}" ]; then printf 'claude'
+  # A hook called with --codex knows its host; the environment can lie, since a
+  # Codex started from a Claude Code shell inherits CLAUDECODE.
+  if [ "$AB_HOST" = codex ]; then printf 'codex'
+  elif [ -n "${CLAUDECODE:-}${CLAUDE_CODE_ENTRYPOINT:-}" ]; then printf 'claude'
   elif [ -n "${CODEX_HOME:-}${CODEX_SANDBOX:-}" ]; then printf 'codex'
   else ps -o comm= -p "$(agent_pid)" 2>/dev/null | sed 's#.*/##' | tr -d '[:space:]'
   fi
 }
 
 # --- field helpers ---------------------------------------------------------
-get_field() { sed -n "s/^$2: //p" "$1" 2>/dev/null | head -1; }
+get_field() { [ -f "$1" ] || return 0; sed -n "s/^$2: //p" "$1" 2>/dev/null | head -1; }
 
 # Replaces the key in place, or adds it at the end of the frontmatter block if
 # this file predates the field (session files outlive script changes).
@@ -740,6 +749,31 @@ ws_list() {   # ws_list <section> -> the repo names in it, one per line
   ini_section "$WORKSPACE" "$1" | tr -s '[:space:]' '\n' | grep . || true
 }
 
+# Checked tools for the gate. A gate decision reads the output of grep, sed, awk
+# and the rest, often in a pipeline or $( ), where an exit leaves only that
+# subshell. So, while hook_pretool runs, each of these tools is a function that
+# runs the real one and, on an exit outside its normal set, appends a line to a
+# flag file; hook_pretool's EXIT trap refuses the call when the flag is there.
+# Normal: 0 for all; 1 for grep (no match) and python3 (our own "no" answer);
+# 3 for python3 (our "nothing readable" answer, which the callers refuse); 141,
+# SIGPIPE, when a reader such as head -1 stopped early. A read of a file that
+# may be missing tests for the file first, so an error exit is a real failure.
+ab_tool_failed() {   # ab_tool_failed <what> <exit>: record it, inside the gate only
+  [ -n "${AB_CHECK_FAIL:-}" ] || return 0
+  printf '%s exited %s\n' "$1" "$2" >> "$AB_CHECK_FAIL" 2>/dev/null || :
+}
+ab_check_tools() {
+  local t
+  for t in grep sed awk cut tr sort comm head tail uniq wc python3; do
+    eval "$t() {
+      command $t \"\$@\"
+      local rc=\$?
+      case $t:\$rc in *:0|*:141|grep:1|python3:1|python3:3) ;; *) ab_tool_failed $t \$rc ;; esac
+      return \$rc
+    }"
+  done
+}
+
 ws_has() {   # ws_has <section> <repo name>
   ws_list "$1" | grep -qx "$2"
 }
@@ -787,7 +821,7 @@ dirty_paths() {   # dirty_paths <repo> -> uncommitted paths, one per line
   [ -n "$repo" ] || return 0
   if [ "$repo" != "$_DIRTY_REPO" ]; then
     _DIRTY_REPO=$repo
-    _DIRTY_VAL=$(git -C "$repo" status --porcelain -z 2>/dev/null | python3 -c '
+    _DIRTY_VAL=$( { git -C "$repo" status --porcelain -z 2>/dev/null || ab_tool_failed "git status" $?; } | python3 -c '
 import sys
 recs = sys.stdin.buffer.read().split(b"\0")
 i = 0
@@ -872,6 +906,7 @@ vault_in_head() {   # vault_in_head <repo> <relpath>
   [ "$h" = "$VAULT_HDR" ]
 }
 vault_encrypted_now() {   # vault_encrypted_now <repo> <relpath>
+  [ -f "$1/$2" ] || return 1
   head -c 14 "$1/$2" 2>/dev/null | grep -qF "$VAULT_HDR"
 }
 vault_files() {   # vault_files <repo> -> encrypted-in-HEAD paths
@@ -912,11 +947,11 @@ env_ok_name() {   # a name that is safe as a path segment and as a word in a reg
 env_owner() {   # env_owner <name> -> owner record of a LIVE lease, else clears it
   local d; d=$(env_dir "$1")
   [ -d "$d" ] || return 1
-  local pid exp; pid=$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)
+  local pid="" exp; [ -f "$d/owner" ] && pid=$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)
   case "$pid" in
     *:*)   # held here for a peer, whose pid this machine cannot see: it lives
            # while the peer's relay keeps renewing it
-      exp=$(sed -n 's/^expires: //p' "$d/owner" 2>/dev/null | head -1 | tr -dc 0-9)
+      exp=""; [ -f "$d/owner" ] && exp=$(sed -n 's/^expires: //p' "$d/owner" 2>/dev/null | head -1 | tr -dc 0-9)
       if [ -z "$exp" ] || [ "$exp" -le "$(now_e)" ]; then
         rm -rf "$d" 2>/dev/null
         return 1
@@ -932,7 +967,7 @@ env_owner() {   # env_owner <name> -> owner record of a LIVE lease, else clears 
 
 env_i_hold() {   # env_i_hold <name>
   local d; d=$(env_dir "$1")
-  [ -d "$d" ] || return 1
+  [ -f "$d/owner" ] || return 1
   is_my_ancestor "$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)"
 }
 
@@ -1025,8 +1060,8 @@ env_free_mine() {   # every lease this session holds — called on session end
 
 vault_owner() {   # -> the owner record of a LIVE lease, or nothing
   [ -d "$VLEASE" ] || return 1
-  local pid
-  pid=$(sed -n 's/^pid: //p' "$VLEASE/owner" 2>/dev/null | head -1)
+  local pid=""
+  [ -f "$VLEASE/owner" ] && pid=$(sed -n 's/^pid: //p' "$VLEASE/owner" 2>/dev/null | head -1)
   if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
     rm -rf "$VLEASE" 2>/dev/null
     return 1
@@ -1946,7 +1981,7 @@ peer_labels() {   # every [peer] label in machines.local
 }
 
 peer_age() {   # peer_age <label> -> seconds since that mirror was refreshed, or nothing
-  local t; t=$(head -1 "$REMOTED/$1/synced" 2>/dev/null | tr -dc 0-9)
+  local t=""; [ -f "$REMOTED/$1/synced" ] && t=$(head -1 "$REMOTED/$1/synced" 2>/dev/null | tr -dc 0-9)
   [ -n "$t" ] && printf '%s' "$(( $(now_e) - t ))"
 }
 
@@ -1977,10 +2012,10 @@ peer_status_line() {   # peer_status_line <label> -> one line on how fresh that 
   a=$(peer_age "$l")
   if [ -z "$a" ]; then printf '  %s%s: never synced — is the relay running?%s\n' "$C_DIM" "$l" "$C_R"; return; fi
   if peer_fresh "$l"; then
-    n=$(grep -c . "$REMOTED/$l/sessions.tsv" 2>/dev/null || true)
+    n=0; [ -f "$REMOTED/$l/sessions.tsv" ] && n=$(grep -c . "$REMOTED/$l/sessions.tsv" 2>/dev/null || true)
     printf '  %s%s: %s agent(s), synced %s ago%s\n' "$C_DIM" "$l" "${n:-0}" "$(secs_h "$a")" "$C_R"
   else
-    t=$(head -1 "$REMOTED/$l/synced" 2>/dev/null | tr -dc 0-9)
+    t=""; [ -f "$REMOTED/$l/synced" ] && t=$(head -1 "$REMOTED/$l/synced" 2>/dev/null | tr -dc 0-9)
     printf '  %s%s: not seen since %s — its agents are not shown%s\n' "$C_DIM" "$l" \
       "$(date -r "$t" +%H:%M 2>/dev/null || date -d "@$t" +%H:%M 2>/dev/null)" "$C_R"
   fi
@@ -3216,6 +3251,15 @@ cmd_sweep() {
     [ -e "$f" ] || continue
     kill -0 "$(basename "$f")" 2>/dev/null || rm -f "$f"
   done
+  # allow-edit.<pid> and its allow-edit.<pid>.lock go together, and only once
+  # <pid> is dead: unlinking a lock a live session may hold splits it in two.
+  local ae_pid
+  for f in "$LOCKS"/allow-edit.*; do
+    [ -e "$f" ] || continue
+    ae_pid=${f##*/allow-edit.}; ae_pid=${ae_pid%%.*}
+    case "$ae_pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$ae_pid" 2>/dev/null || rm -f "$f"
+  done
   vault_owner >/dev/null 2>&1        # clears the lease if its owner has gone
   env_live >/dev/null 2>&1           # same, for every dev environment lease
   # deploylock removes its own owner files; only a SIGKILL leaves one behind, and
@@ -3333,19 +3377,137 @@ except Exception: sys.exit(0)
 cur=d
 for p in sys.argv[1].split("."):
     cur = cur.get(p) if isinstance(cur,dict) else None
-print(cur if isinstance(cur,str) else "")' "$1" 2>/dev/null; }
+print(cur if isinstance(cur,str) else "")' "$1" 2>/dev/null || ab_tool_failed jget $?; }
+
+# Tool names that run a shell command. Their command must be readable, or the
+# call is refused: a gate that cannot read the command cannot judge it.
+SHELL_TOOLS='Bash|shell|local_shell|exec_command'
+# Tool names that only write files from a patch: no command gate applies.
+PATCH_TOOLS='apply_patch|Edit|Write|MultiEdit|NotebookEdit'
+
+# The shell command a tool call will run. Claude sends a string; Codex sends a
+# string too, but a list (argv) is accepted as well, and `bash -lc <script>`
+# is reduced to the script, because that is what the gates must read.
+# Exit 0 with the command (empty: the tool has no command), 3 if the command
+# cannot be read, anything else if the parser itself failed. Fail closed on all
+# but 0.
+tool_command() {
+  SHELL_TOOLS=$SHELL_TOOLS python3 -c '
+import json, os, shlex, sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(3)
+if not isinstance(d, dict): sys.exit(3)
+shell = d.get("tool_name") in os.environ["SHELL_TOOLS"].split("|")
+ti = d.get("tool_input")
+c = None
+if isinstance(ti, dict):
+    c = ti.get("command", ti.get("cmd"))
+elif shell:
+    c = ti
+if c is None:
+    sys.exit(3 if shell else 0)
+if isinstance(c, list) and c and all(isinstance(x, str) for x in c):
+    if len(c) == 3 and c[0].rsplit("/", 1)[-1] in ("bash", "sh", "zsh") and c[1] in ("-c", "-lc"):
+        c = c[2]
+    else:
+        c = shlex.join(c)
+if not isinstance(c, str):
+    sys.exit(3 if shell else 0)
+print(c)'
+}
+
+# Codex edits files with apply_patch: one call, a patch text, any number of
+# files. Prints the absolute path of every file the patch adds, updates, deletes
+# or moves to, one per line; nothing if the call is not a patch.
+# Headers are read as Codex reads them (codex-rs apply-patch, 0.169.0): each line
+# trimmed, then the marker. Exit 3 for a patch that names no file the hook can
+# read, so the caller refuses it rather than let an unread patch through.
+patch_paths() {   # stdin = hook payload
+  SHELL_TOOLS=$SHELL_TOOLS python3 -c '
+import json, os, sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(3)
+if not isinstance(d, dict): sys.exit(3)
+ti = d.get("tool_input")
+if isinstance(ti, dict):
+    t = ti.get("command", ti.get("patch", ti.get("input")))
+else:
+    t = ti
+if isinstance(t, list):
+    t = next((x for x in t if isinstance(x, str) and "*** Begin Patch" in x), None)
+if not isinstance(t, str) or "*** Begin Patch" not in t:
+    sys.exit(0)
+markers = ("*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: ")
+cwd = d.get("cwd") or os.getcwd()
+seen, empty = [], False
+for line in t.splitlines():
+    s = line.strip()
+    for mk in markers:
+        if s.startswith(mk):
+            rel = s[len(mk):]   # as Codex: the trimmed line, minus the marker, as is
+            if not rel:
+                empty = True
+                break
+            p = os.path.normpath(os.path.join(cwd, rel))
+            if p not in seen:
+                seen.append(p)
+            break
+if empty or not seen:
+    # A shell command that only mentions the marker (a grep, a doc) is not a
+    # patch. One that runs apply_patch, or a patch tool, is, and must name files.
+    if d.get("tool_name") in os.environ["SHELL_TOOLS"].split("|") and "apply_patch" not in t:
+        sys.exit(0)
+    sys.exit(3)
+print("\n".join(seen))'
+}
+
+# Refuse a tool call that the gates could not judge. Exit 2 blocks the call in
+# both Claude Code and Codex.
+hook_refuse() {   # hook_refuse <what went wrong>
+  {
+    printf 'BLOCKED: the agent board could not check this tool call (%s).\n\n' "$1"
+    printf 'The gates fail closed: a call they cannot read is refused, not let through.\n'
+    printf 'Tell the user what you tried to do. For a shell command they judge safe, run it\n'
+    printf 'again with AGENT_BOARD_OVERRIDE=1 before it. A patch must name its files with\n'
+    printf '"*** Add File: ", "*** Update File: ", "*** Delete File: " or "*** Move to: ".\n'
+  } >&2
+  exit 2
+}
 
 # PreToolUse can deny outright or hand the decision back to the user ("ask").
 # Overlapping edits are an ask, not a deny: two agents legitimately need the same
 # large file sometimes, and only the user knows whether this is one of those times.
 hook_decide() {   # hook_decide <allow|deny|ask> <reason>
-  DEC=$1 REASON=$2 python3 -c '
+  local dec=$1 reason=$2
+  # Codex accepts only deny from a PreToolUse hook: allow and ask are errors
+  # there. A question Claude would put to the user becomes a refusal that tells
+  # the agent to put it to the user itself.
+  if [ "$AB_HOST" = codex ] && [ "$dec" = ask ]; then
+    dec=deny
+    reason="$reason
+This needs the user's decision, and a Codex hook cannot ask. Stop and ask the user. If they say it is safe: for a file, run  agentboard allow-edit <path>  and edit again; for a shell command, prefix it with AGENT_BOARD_OVERRIDE=1."
+  fi
+  if [ "$AB_HOST" = codex ]; then
+    [ "$dec" = allow ] && exit 0
+    # Exit 2 with the reason on stderr: the one refusal form Codex honours that
+    # needs no renderer, and the only one the watchdog lets through.
+    printf '%s\n' "${reason:-Refused by the agent board.}" >&2
+    exit 2
+  fi
+  local out
+  if out=$(DEC=$dec REASON=$reason python3 -c '
 import json, os
 print(json.dumps({"hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": os.environ["DEC"],
-    "permissionDecisionReason": os.environ["REASON"]}}))'
-  exit 0
+    "permissionDecisionReason": os.environ["REASON"]}}))') && [ -n "$out" ]; then
+    printf '%s\n' "$out"
+    exit 0
+  fi
+  # The renderer failed. An allow can stay silent; anything else fails closed.
+  [ "$dec" = allow ] && exit 0
+  printf '%s\n' "${reason:-Refused by the agent board.}" >&2
+  exit 2
 }
 
 hook_start() {
@@ -3442,6 +3604,10 @@ m() {
   shift
   [ "$1" = "--" ] && shift
   printf '%s' "$subject" | grep -Eq -- "$1"
+  local rc=$?
+  [ "$rc" -le 1 ] && return "$rc"
+  [ -n "${AB_IN_PRETOOL:-}" ] && hook_refuse "a pattern check failed (grep exit $rc)"
+  return "$rc"
 }
 
 # Operations that act on the whole working tree rather than named paths, so they
@@ -3452,6 +3618,8 @@ whole_tree_op() {
   # names its paths, and the --all belongs to the log.
   local seg
   seg=$(printf '%s' "$1" | grep -oE '(^|[;&|(])[[:space:]]*git[[:space:]]+commit([[:space:]][^;&|)]*)?' 2>/dev/null)
+  local src=$?   # 1 is "no git commit here"; more is a failure (the checked grep flags it too)
+  [ "$src" -le 1 ] || { [ -n "${AB_IN_PRETOOL:-}" ] && hook_refuse "a pattern check failed (grep exit $src)"; return 0; }
   [ -n "$seg" ] && m "$seg" -- '(^|[[:space:]])(-a|-am|-ma|--all)([[:space:]]|$)' && return 0
   m "$1" '(^|[;&|(])[[:space:]]*git[[:space:]]+add[[:space:]]+(-A|--all|\.|:/)([[:space:]]|$)' && return 0
   m "$1" '(^|[;&|(])[[:space:]]*git[[:space:]]+reset[[:space:]]+--hard([[:space:]]|$)' && return 0
@@ -3460,6 +3628,58 @@ whole_tree_op() {
   return 1
 }
 
+
+# --- allow-edit: the user's yes, for an agent whose hooks cannot ask ----------
+# One use per path: the next edit of that path passes the overlap gate, and the
+# grant is spent. It never passes the vault gate, which is not a question.
+allow_edit_file() { local p; p=$(agent_pid); printf '%s/allow-edit.%s' "$LOCKS" "$p"; }
+
+# Taking and adding a grant hold an flock on <file>.lock, so two hooks of one
+# session that race for the same grant cannot both spend it. A grant counts as
+# spent only once the rewritten file is in place.
+allow_edit_take() {   # allow_edit_take <abs path>: 0 and spent if granted
+  local f; f=$(allow_edit_file)
+  [ -f "$f" ] || return 1
+  F=$f P=$1 python3 -c '
+import fcntl, os, sys
+f, p = os.environ["F"], os.environ["P"]
+with open(f + ".lock", "a") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    try:
+        with open(f) as fh: lines = fh.read().splitlines()
+    except FileNotFoundError:
+        sys.exit(1)
+    if p not in lines: sys.exit(1)
+    lines.remove(p)
+    if lines:
+        tmp = "%s.tmp.%d" % (f, os.getpid())
+        with open(tmp, "w") as fh: fh.write("\n".join(lines) + "\n")
+        os.replace(tmp, f)
+    else:
+        os.unlink(f)
+sys.exit(0)' 2>/dev/null
+}
+
+allow_edit_add() {   # allow_edit_add <abs path>
+  F=$(allow_edit_file) P=$1 python3 -c '
+import fcntl, os
+f, p = os.environ["F"], os.environ["P"]
+with open(f + ".lock", "a") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    with open(f, "a") as fh: fh.write(p + "\n")'
+}
+
+cmd_allow_edit() {   # cmd_allow_edit <path>...
+  local p a n=0
+  [ $# -gt 0 ] || { printf 'usage: agentboard allow-edit <path>...   (only after the user said yes)\n' >&2; return 1; }
+  for p in "$@"; do
+    a=$(abs_path "$p") || { printf 'no such directory for: %s\n' "$p" >&2; continue; }
+    allow_edit_add "$a" || { printf 'could not record the grant for: %s\n' "$p" >&2; continue; }
+    n=$((n+1))
+  done
+  [ "$n" -gt 0 ] || return 1
+  printf 'your next edit of %s path(s) passes the overlap gate, once.\n' "$n"
+}
 
 # --- the file-write gate (shared-main) -------------------------------------
 # Only where the file is the unit of collision. In a content repo nothing collides;
@@ -3486,11 +3706,12 @@ gate_file_write() {
     [ "$(get_field "$f" repo)" = "$repo" ] || continue
     [ -n "$me" ] && [ "$f" = "$me" ] && continue
     pid=$(get_field "$f" pid)
-    if live_paths "$pid" "$repo" | grep -qxF "$rel"; then
+    if live_paths "$pid" "$repo" | grep -qxF -- "$rel"; then
       owners="$owners, $(label_of "$f")"; n=$((n+1))
     fi
   done
   [ "$n" -eq 0 ] && return 0
+  allow_edit_take "$p" && return 0
   hook_decide ask "$(printf '%s already has uncommitted changes from%s.\n\nIn a shared-main repo everyone commits to main from one shared checkout, so two agents on the same file will not conflict in git — they will just overwrite each other. Either coordinate first:\n\n  agentboard tell <name> "I need to change %s too"\n\nor edit a different file. Approve if you know this is safe.\n' "$rel" "${owners#,}" "$rel")"
 }
 
@@ -3510,6 +3731,14 @@ hook_posttool() {
   payload=$(cat)
   reclaim_if_lost
   tool=$(printf '%s' "$payload" | jget tool_name)
+  local pp
+  pp=$(printf '%s' "$payload" | patch_paths 2>/dev/null)   # nothing to block here
+  if [ -n "$pp" ]; then
+    while IFS= read -r path; do record_path "$path" || true; done <<EOF
+$pp
+EOF
+    exit 0
+  fi
   case "$tool" in Edit|Write|MultiEdit|NotebookEdit) ;; *) exit 0 ;; esac
   path=$(printf '%s' "$payload" | jget tool_input.file_path)
   [ -n "$path" ] || path=$(printf '%s' "$payload" | jget tool_input.notebook_path)
@@ -3520,9 +3749,51 @@ hook_posttool() {
 hook_pretool() {
   local payload tool cmd cwd scan repo policy conflicts path
   payload=$(cat)
+  AB_IN_PRETOOL=1
+  # A gate tool that fails anywhere, even in a subshell, leaves this flag (see
+  # ab_check_tools), and the EXIT trap turns whatever answer follows into a
+  # refusal.
+  local fd
+  fd=$(mktemp -d "${TMPDIR:-/tmp}/ab-pretool.XXXXXX" 2>/dev/null) && [ -d "$fd" ] \
+    || hook_refuse "the gate could not make its scratch directory"
+  AB_CHECK_FAIL=$fd/check-failed
+  trap '_ab_rc=$?; _ab_f=""; [ -e "$AB_CHECK_FAIL" ] && _ab_f=$(command head -3 "$AB_CHECK_FAIL" 2>/dev/null | command tr "\n" ";"); [ -e "$AB_CHECK_FAIL" ] && [ -z "$_ab_f" ] && _ab_f="?"
+    rm -rf "${AB_CHECK_FAIL%/*}"
+    if [ -n "$_ab_f" ] && [ "$_ab_rc" != 2 ]; then
+      printf "BLOCKED: a check inside the agent board gate failed (%s), so it could not decide on this call.\nThe gates fail closed: a call they cannot check is refused, not let through.\n" "${_ab_f%;}" >&2
+      exit 2
+    fi
+    exit "$_ab_rc"' EXIT
+  # A signal would skip the EXIT trap and leave the scratch dir; exit through it,
+  # as a refusal.
+  trap 'printf "BLOCKED: the agent board gate was interrupted before it could decide.\n" >&2; exit 2' TERM INT HUP
+  ab_check_tools
+  printf '%s' "$payload" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert isinstance(d, dict) and isinstance(d.get("tool_name"), str) and d["tool_name"]' 2>/dev/null \
+    || hook_refuse "the hook payload is not a JSON object with a tool_name"
   reclaim_if_lost
   tool=$(printf '%s' "$payload" | jget tool_name)
   cwd=$(printf '%s' "$payload" | jget cwd)
+
+  # A patch (Codex apply_patch) is a file write to every file it names. One
+  # that arrives inside a shell command is still a shell command, so it goes on
+  # to the command gates as well. So does a patch under any tool name that is
+  # not a pure patch tool: only those may skip the command gates.
+  local pp prc=0
+  pp=$(printf '%s' "$payload" | patch_paths) || prc=$?
+  case $prc in
+    0) ;;
+    3) hook_refuse "a patch that names no file the board can read" ;;
+    *) hook_refuse "the patch parser failed, exit $prc" ;;
+  esac
+  if [ -n "$pp" ]; then
+    while IFS= read -r path; do gate_file_write "$path"; done <<EOF
+$pp
+EOF
+    case "|$PATCH_TOOLS|" in *"|$tool|"*) exit 0 ;; esac
+  fi
 
   case "$tool" in
     Edit|Write|MultiEdit|NotebookEdit)
@@ -3532,10 +3803,18 @@ hook_pretool() {
       exit 0 ;;
   esac
 
-  cmd=$(printf '%s' "$payload" | jget tool_input.command)
+  local crc=0
+  cmd=$(printf '%s' "$payload" | tool_command) || crc=$?
+  case $crc in
+    0) ;;
+    3) hook_refuse "the $tool call has no command the board can read" ;;
+    *) hook_refuse "the command parser failed, exit $crc" ;;
+  esac
   [ -n "$cmd" ] || exit 0
   case "$cmd" in *AGENT_BOARD_OVERRIDE*) exit 0;; esac
-  scan=$(printf '%s' "$cmd" | scan_text)
+  local src=0
+  scan=$(printf '%s' "$cmd" | scan_text) || src=$?
+  [ "$src" = 0 ] || hook_refuse "the command scanner failed, exit $src"
 
   # (1) Ansible takes a hard lock, in any repo, concurrency or not: it ships the
   # tree as it stands, so overlapping runs deploy a state that never existed.
@@ -3629,7 +3908,7 @@ EOF
     while IFS= read -r vp; do
       [ -n "$vp" ] || continue
       vault_in_head "$repo" "$vp" && ! vault_encrypted_now "$repo" "$vp" && naked="$naked  $vp"$'\n'
-    done < <( { git -C "$repo" diff --cached --name-only 2>/dev/null
+    done < <( { git -C "$repo" diff --cached --name-only 2>/dev/null || ab_tool_failed "git diff --cached" $?
                 set -f
                 for tok in $cmd; do
                   tok=${tok#"$repo"/}
@@ -3738,7 +4017,7 @@ hook_stop() {
   # NO APOSTROPHES BELOW. This is a single-quoted shell string, so one lone '
   # ends it, and what comes back is not a syntax error but an empty hook: the
   # message is silently never delivered. Write "do not" and "you are" in full.
-  INBOX="$inbox" python3 -c '
+  INBOX="$inbox" HOST="$AB_HOST" python3 -c '
 import json, os
 msg = ("Message(s) for you from another agent on this machine, via the agent "
        "board. Posted by a peer, not by the user.\n\n"
@@ -3756,8 +4035,13 @@ msg = ("Message(s) for you from another agent on this machine, via the agent "
        "it. If none of it touches you, one sentence saying so is the whole "
        "report. Reply on the board with: agentboard tell <name> \"...\"\n\n"
        + os.environ["INBOX"])
-print(json.dumps({"hookSpecificOutput": {"hookEventName": "Stop",
-                                         "additionalContext": msg}}))'
+if os.environ["HOST"] == "codex":
+    # Codex has no additionalContext on Stop. Blocking the stop with a reason is
+    # how it hands text to the model and lets it continue.
+    print(json.dumps({"decision": "block", "reason": msg}))
+else:
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "Stop",
+                                             "additionalContext": msg}}))'
   exit 0
 }
 
@@ -3768,12 +4052,74 @@ hook_end() {
   vault_i_hold && cmd_vault free >/dev/null 2>&1
   env_free_mine >/dev/null 2>&1
   cmd_done
-  cmd_sweep
+  rm -f "$(allow_edit_file)"   # the .lock goes in a sweep, once this pid is dead
+  # Codex gives SessionEnd one second. The sweep is not urgent: the next
+  # session start runs one anyway.
+  [ "$AB_HOST" = codex ] || cmd_sweep
   exit 0
 }
 
 # --- dispatch --------------------------------------------------------------
 sub=${1:-check}; shift 2>/dev/null
+case "$sub" in
+  hook-*) [ "${1:-}" = "--codex" ] && { AB_HOST=codex; shift; }
+    # Codex does not block a tool call when its PreToolUse hook times out,
+    # crashes or answers in a form it cannot use: the call runs. So the Codex
+    # gate runs as a child under a time budget, and this parent, which runs no
+    # python and only short shell steps (it has no deadline of its own, so a host
+    # too slow for Codex's 600 s can still beat it), passes on exactly two results:
+    #   exit 0 with nothing on stdout  -> allow
+    #   exit 2 with a reason on stderr -> refuse
+    # Anything else (a timeout, a kill, any stdout, exit 2 without a reason) is
+    # refused here, with a reason of its own.
+    if [ "$sub" = hook-pretool ] && [ "$AB_HOST" = codex ] && [ -z "${AB_HOOK_CHILD:-}" ]; then
+      _ab_budget=${AGENT_BOARD_HOOK_BUDGET:-20}
+      # Whole seconds, 1..300: Codex gives up at 600, and an allow it never
+      # hears is a call that runs unchecked.
+      case "$_ab_budget" in ''|*[!0-9]*) _ab_budget=20 ;; esac
+      [ "$_ab_budget" -ge 1 ] 2>/dev/null || _ab_budget=20
+      [ "$_ab_budget" -le 300 ] || _ab_budget=300
+      _ab_d=$(mktemp -d "${TMPDIR:-/tmp}/agentboard-hook.XXXXXX") || {
+        printf 'BLOCKED: the agent board hook could not make a temp dir, so it cannot check this call.\n' >&2; exit 2; }
+      # TMPDIR inside our dir: a child killed outright cannot clean its own
+      # scratch, so the rm -rf below does it.
+      # Codex starts hooks with SIGPIPE ignored. Then a writer whose reader stops
+      # early (sed ... | head -1) exits with an error instead of SIGPIPE, and the
+      # checked tools would refuse the call. Give the child the default back.
+      _ab_env=env; env --default-signal=PIPE true 2>/dev/null && _ab_env="env --default-signal=PIPE"
+      AB_HOOK_CHILD=1 TMPDIR="$_ab_d" $_ab_env timeout -k 2 "$_ab_budget" "$0" hook-pretool --codex >"$_ab_d/out" 2>"$_ab_d/err"
+      _ab_rc=$?
+      _ab_why=""
+      if [ -s "$_ab_d/out" ]; then
+        _ab_why="it wrote an answer on stdout, which this gate never does (exit $_ab_rc)"
+      else
+        case $_ab_rc in
+          0) ;;
+          2) grep -q '[^[:space:]]' "$_ab_d/err" 2>/dev/null || _ab_why="it refused without a reason" ;;
+          124) _ab_why="it ran past its ${_ab_budget}s budget" ;;
+          137) _ab_why="it was killed (exit 137), or ran past its ${_ab_budget}s budget" ;;
+          *) _ab_why="it failed with exit $_ab_rc" ;;
+        esac
+      fi
+      if [ -n "$_ab_why" ]; then
+        printf 'BLOCKED: the agent board gate could not decide on this call: %s.\n' "$_ab_why" >&2
+        printf 'The gates fail closed. Tell the user; they can check  agentboard check  and retry.\n' >&2
+        [ -s "$_ab_d/err" ] && { printf '\nThe gate said:\n' >&2; head -c 2000 "$_ab_d/err" >&2; }
+        rm -rf "$_ab_d"; exit 2
+      fi
+      [ "$_ab_rc" = 2 ] && cat "$_ab_d/err" >&2
+      rm -rf "$_ab_d"; exit "$_ab_rc"
+    fi
+    # Debugging a host's payloads: AGENT_BOARD_HOOK_LOG=<file> in the agent's
+    # environment appends each hook's stdin there, one line per call. For the
+    # Codex gate this runs in the child, inside the budget.
+    if [ -n "${AGENT_BOARD_HOOK_LOG:-}" ]; then
+      _ab_in=$(cat)
+      printf '%s %s %s\t%s\n' "$(now_h 2>/dev/null)" "$AB_HOST" "$sub" "$(printf '%s' "$_ab_in" | tr '\n' ' ')" \
+        >> "$AGENT_BOARD_HOOK_LOG" 2>/dev/null
+      exec < <(printf '%s' "$_ab_in")
+    fi ;;
+esac
 case "$sub" in
   check)      cmd_check "$@" ;;
   claim)      cmd_claim "$@" ;;
@@ -3781,6 +4127,7 @@ case "$sub" in
   release)    cmd_release ;;
   paths)      cmd_paths "$@" ;;
   editing)    cmd_editing "$@" ;;
+  allow-edit) cmd_allow_edit "$@" ;;
   worktrees)  cmd_worktrees "$@" ;;
   vault)      cmd_vault "$@" ;;
   note)       cmd_note "$@" ;;

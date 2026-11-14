@@ -142,6 +142,7 @@ classification cannot save you there.
     agentboard release                 # finished — it is free again
     agentboard paths                   # files I hold here, and anyone overlapping
     agentboard editing <path>...       # declare a file as mine (agents without hooks)
+    agentboard allow-edit <path>...    # Codex: the user said yes, pass the overlap gate once
     agentboard worktrees               # worktrees whose branch is merged
     agentboard workspace               # which repos here are worked which way
     agentboard vault take <file>       # exclusive lease over the encrypted files
@@ -1018,13 +1019,106 @@ declared claim and an observed one are indistinguishable downstream — and both
 on commit. An agent that declares nothing still shows up in the union floor as *dirty
 but claimed by no live agent*, which is the safety net, not the plan.
 
-**Codex is not on the board, on purpose.** It has no board section in
-`~/.codex/AGENTS.md`, so it never claims, holds, reads its inbox or takes the deploy
-lock or vault lease. For the other agents, a Codex session is the same as an agent that
-declares nothing. Its dirty files show as claimed by no live agent, and nothing stops
-it running Ansible while the deploy lock is held. Keep Codex out of `deploy` and out
-of vault files while other agents are live. To put it back, copy the section from
-`~/.grok/AGENTS.md`, and change the name of the agent.
+## Codex CLI integration (hooks, with `--codex`)
+
+Codex CLI (0.169.0 and later) has hooks with nearly the same payloads as Claude
+Code, so it runs the same five hooks and the same gates. `codex/hooks.toml` is the
+block to copy into `~/.codex/config.toml`. Each command carries `--codex`, because
+Codex takes different answers:
+
+| | Claude Code | Codex (`--codex`) |
+|---|---|---|
+| PreToolUse allow | silent | silent |
+| PreToolUse deny | `permissionDecision: "deny"` or exit 2 | always exit 2 with the reason on stderr (Codex accepts both forms; the watchdog passes on only this one) |
+| PreToolUse ask | `permissionDecision: "ask"` | **no ask in Codex**: an exit-2 refusal that tells the agent to stop and ask the user |
+| Stop, messages waiting | `additionalContext` | `{"decision": "block", "reason": ...}` |
+| SessionEnd | sweeps, then marks DONE | marks DONE only: Codex allows one second |
+
+Where Claude would ask, the Codex agent asks the user in the chat. If the user says
+yes, it runs `agentboard allow-edit <path>` (the next edit of that path passes the
+overlap gate, once) or prefixes the shell command with `AGENT_BOARD_OVERRIDE=1`.
+`allow-edit` never passes the vault gate: that needs the lease.
+
+What Codex sends: the model calls a JavaScript `exec` tool, but each shell command
+inside it reaches PreToolUse as `tool_name: "Bash"` with `tool_input.command`. A
+file edit arrives as `tool_name: "apply_patch"` with the patch text in
+`tool_input.command`. The paths named in the patch go through the file gates, and
+PostToolUse records them as claims. No matcher is set, so the hook sees every call.
+
+Codex runs a hook only after it is trusted. Trust is stored per hook in
+`config.toml` as `hooks.state."<key>".trusted_hash`, so a changed command line needs
+trust again. The TUI asks for it ("Hooks need review") at the next start.
+
+To see what a host sends, start it with `AGENT_BOARD_HOOK_LOG=<file>`. Each hook
+then appends its stdin to that file, one line per call. `test/codex-hooks.sh`
+tests the Codex answers under a process named `codex`.
+
+### Fail closed, and where it cannot
+
+Codex does not block a tool call when its PreToolUse hook times out, crashes or
+answers in a form Codex cannot use: the call runs. So the gates try to fail
+closed on their own side. What they do:
+
+- A payload that is not a JSON object with a `tool_name`, and a shell call
+  (`Bash`, `shell`, `local_shell`, `exec_command`) whose command is missing or not
+  a string or argv list: refused with exit 2.
+- A parser or the command scanner inside the gate that exits with an error:
+  refused with exit 2.
+- While the gate runs, `grep`, `sed`, `awk`, `cut`, `tr`, `sort`, `comm`,
+  `head`, `tail`, `uniq`, `wc` and `python3` are shell functions that run the
+  real tool and check its exit. An exit outside the tool's normal set (0; 1 for
+  grep; 1 and 3 for our own python answers; 141 when a reader stopped early)
+  leaves a flag file, also from a subshell or pipeline. On exit the gate turns
+  any answer into a refusal that names the tool. A file that may be missing is
+  tested before it is read, so its absence is not a failure. `git status` and
+  `git diff --cached`, which the peer and vault checks read, are checked too.
+  A signal (TERM, INT, HUP) to the gate is also a refusal.
+- `test/codex-hooks.sh` fails each call of each of these tools in turn, in six
+  calls the gate refuses (a peer-held file, a vault file, `git commit -a`,
+  `ansible-playbook` without the lock, `ansible-vault` without the lease, a
+  branch switch in a no-branch repo), and checks that every one stays refused.
+- Not checked: other commands (`git rev-parse`, `ps`, `kill`, `date`, `stat`
+  and the like) whose failure the code reads as an ordinary answer, such as "not
+  in a repo" or "that process is gone". The sweep covers the six calls above,
+  not every input. So this is not a proof that no failure can slip through.
+- Codex starts hooks with SIGPIPE ignored. The gate child gets the default back
+  (`env --default-signal=PIPE`), so a writer that a reader cut short is not taken
+  for a failure.
+- Patch headers: each line is trimmed, then the marker
+  (`*** Add File: `, `*** Update File: `, `*** Delete File: `, `*** Move to: `)
+  is cut off, and the rest is the path, unchanged, as in Codex 0.169.0. A patch
+  that names no file the hook can read is refused. This follows the Codex source
+  we read; a later Codex can change it.
+- Only the pure patch tools (`apply_patch`, and the Claude edit tools) skip the
+  command gates. Any other tool name with a command goes through them.
+- Under `--codex`, PreToolUse runs the gate as a child under a time budget
+  (`AGENT_BOARD_HOOK_BUDGET`, default 20 seconds, clamped to 1..300 so that it
+  stays below the 600 seconds Codex waits). The parent is plain bash, with no
+  python and only short shell steps, but it has no deadline of its own. It passes
+  on only two answers: exit 0 with nothing on stdout (allow), and exit 2 with a
+  reason on stderr (deny). Anything else (a timeout, a kill, other exit codes,
+  any stdout, exit 2 with a blank reason) becomes a refusal with a reason of its
+  own. Under `--codex` the gate always refuses with exit 2 and stderr, never JSON.
+- `allow-edit` grants are added and spent under an flock on a sidecar lock file.
+  `sweep` removes a grant and its lock only when the session that owns them has
+  died. This narrows the race between hooks that run at the same time; the tests
+  show one pass for 20 concurrent edits on one grant.
+
+What the board still cannot make fail closed, because the hook never runs or
+dies before it can answer:
+
+- The hook command cannot start: the script path is gone (a removed worktree),
+  `bash` is missing, or the hook is not trusted or is disabled in `config.toml`.
+  Codex then runs the call unchecked. (`timeout` is an install dependency, but a
+  missing one is not fail-open: the parent sees exit 127 and refuses.)
+- The watchdog process itself is killed (SIGKILL, the OOM killer) before it
+  answers, or the host is so slow that the parent cannot finish within the 600
+  seconds Codex waits.
+- A tool that Codex does not pass through PreToolUse, or a command that the model
+  runs some way other than a tool call the hook sees.
+
+So the hooks are a guard rail for well-meant agents, not a sandbox. Hard limits
+on what Codex may run belong in its own instructions and sandbox as well.
 
 ## More than one machine
 
@@ -1136,6 +1230,8 @@ exactly the failure this board exists to prevent.
 | `AGENT_BOARD_OVERRIDE` | unset | set on a command to bypass the git/repo gate |
 | `AGENT_BOARD_SSH` | `ssh` | the ssh client the relay, `deploylock` and `env take` use to reach a peer |
 | `AGENT_BOARD_AGENT` | board name | override the holder name `deploylock` records (default: `agentboard whoami --known`) |
+| `AGENT_BOARD_HOOK_LOG` | unset | append each hook's stdin to this file (debugging a host's payloads) |
+| `AGENT_BOARD_HOOK_BUDGET` | `20` | seconds the Codex PreToolUse gate may take before the call is refused (clamped to 1..300, below Codex's 600) |
 
 ## Troubleshooting
 
