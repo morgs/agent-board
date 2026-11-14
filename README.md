@@ -70,7 +70,7 @@ MIT — see [`LICENSE`](./LICENSE).
       workspace.local     which repos here are worked which way — gitignored
       machines.local      the other machines this board talks to — gitignored
       remote/<label>/     each peer's board as last synced — rewritten, never edited
-      test/               seven suites — run them after editing bin/
+      test/               the test suites — run them after editing bin/
 
 Each session writes **only its own files**, named after the agent process pid. No
 shared file, so no write contention and no read-modify-write races. Reading the
@@ -144,6 +144,8 @@ classification cannot save you there.
     agentboard editing <path>...       # declare a file as mine (agents without hooks)
     agentboard allow-edit <path>...    # Codex: the user said yes, pass the overlap gate once
     agentboard worktrees               # worktrees whose branch is merged
+    agentboard worktrees --clean       # run the printed cleanup for the merged ones
+    agentboard worktrees --dry-run     # what --clean would do, doing nothing
     agentboard workspace               # which repos here are worked which way
     agentboard vault take <file>       # exclusive lease over the encrypted files
     agentboard vault free | status
@@ -336,7 +338,7 @@ its branch is merged it is dead weight, and the next agent that needs a tree sho
 reuse the slot rather than pile up another one.
 
     $ agentboard worktrees             # in ~/work/app
-      ~/work/app-widgets  [feat/widget-roles]  MERGED and clean -> git worktree remove ~/work/app-widgets
+      ~/work/app-widgets  [feat/widget-roles]  MERGED and clean -> git worktree remove ~/work/app-widgets && git -C ~/work/app branch -d feat/widget-roles && git -C ~/work/app push origin --delete feat/widget-roles
       ~/work/app-export   [feat/nightly-export]  branch not merged into main yet
       ~/work/app-hub      [feat/hub-capacity]  an agent is working here
 
@@ -358,9 +360,40 @@ under `/private/tmp` are not, and the tool that made them keeps its own state ab
 them. Those are reported — including whether
 their branch is merged, which is worth knowing — but never recommended for removal.
 
-**Reported, never removed.** A worktree can hold uncommitted work the board never saw,
-so the command prints the exact `git worktree remove` line and stops there. The main
+**The report removes nothing.** A worktree can hold uncommitted work the board never
+saw, so a bare `agentboard worktrees` prints the exact cleanup and stops there. The main
 checkout is never listed.
+
+**`--clean` runs that cleanup, and only that.** An agent that made a worktree should
+clean it up when its PR is merged, and a rule that needs reading ("remove it if clean,
+then the branch delete the report prints, `-D` only when it names a PR") made agents
+stop and hand the job to the user. `--clean` takes each MERGED-and-clean verdict and
+runs its printed steps in order, stopping at the first that fails:
+
+1. `git worktree remove <path>`, never `--force`;
+2. `git -C <main checkout> branch -d|-D <branch>`, with the flag the verdict printed;
+3. `git push origin --delete <branch>`, only when the branch is still on origin
+   **and** no open PR has it as its base. Deleting the base of an open PR makes GitHub
+   close that PR (see the stacked-PR gate under
+   [The gates, in the order they fire](#the-gates-in-the-order-they-fire)), so that
+   remote branch is left and the line says which PR holds it. If GitHub cannot be
+   asked, the remote branch is left too.
+
+Everything else is skipped and the line gives the reason: dirty, untracked files, not
+merged, another agent in it, another tool's tree, or the tree you are standing in.
+`git worktree remove` deletes ignored files without asking, so a tree with ignored
+files is skipped as well, unless they are only caches that rebuild themselves
+(`__pycache__`, `node_modules`, `.venv`, `.pytest_cache` and the like): a gitignored
+local DB copy or `.env` is somebody's data. Your own session does not count as an agent
+working in its tree, so run it from the main checkout:
+
+    $ agentboard worktrees --clean     # in ~/work/app
+    removed  ~/work/app-widgets [feat/widget-roles]  (worktree, branch feat/widget-roles, origin/feat/widget-roles)
+    skipped  ~/work/app-export [feat/nightly-export]  (branch not merged into main yet)
+    skipped  ~/work/app-hub [feat/hub-capacity]  (an agent is working here)
+
+`--dry-run` prints the same lines as `would remove ...` with the commands, and does
+nothing. The exit status is 1 if a step failed.
 
 ## Liveness
 
@@ -794,13 +827,23 @@ question whose answer is one line. `note` is now write-only: it goes to the log,
    `git reset --hard`, `git checkout .`. Blocked in **every** repo, `content` included,
    when another agent is live there: they sweep up, discard or stash files that
    belong to someone else. Name your own paths instead.
-7. **History-changing git ops in `branch-pr` repos** — `commit`, `push`, `pull`,
+7. **`gh pr merge <n> --delete-branch` (or `-d`) on the lower PR of a stack** —
+   blocked when an open PR in that repo has PR `<n>`'s head branch as its base.
+   Deleting that branch makes GitHub close the upper PR, and a reopen does not start
+   a valid CI run. The message names the upper PRs and the fix: retarget each one
+   first (`gh api -X PATCH repos/<owner>/<repo>/pulls/<upper> -f base=main`), or merge
+   without `--delete-branch`. It asks GitHub with two `gh` calls (6 s timeout each),
+   only for a command that matches; `-R`/`--repo` and a PR given as number, URL,
+   branch or nothing are all handled. If `gh` is missing, offline or answers badly,
+   the merge is allowed: this gate catches one mistake, it does not make GitHub a
+   dependency of every merge.
+8. **History-changing git ops in `branch-pr` repos** — `commit`, `push`, `pull`,
    `checkout`, `switch`, `merge`, `rebase`, `reset`, `worktree remove|move|prune`.
    Blocked when another agent **holds** that checkout — not merely when one is present,
    which is the older, noisier rule. `git worktree add` is deliberately *not* gated:
    it is the remedy, and it creates a new directory without touching the current tree.
 
-Gates 4, 6 and 7 need a second live agent. Gates 1–3 and 5 do not.
+Gates 4, 6 and 8 need a second live agent. Gates 1–3, 5 and 7 do not.
 
 So in a `content` repo, a session's usual `git pull --ff-only`, `git add <its own
 file>`, `git commit`, `git push` all pass with other agents live — which is the point.
@@ -1293,8 +1336,10 @@ genuinely alive — check with `ps -p <pid>`.
     ~/agent-board/test/name-pool.sh        # a full name pool, a claim killed
                                            # part-way, an empty session file,
                                            # the Stop hook's repair
+    ~/agent-board/test/worktrees-clean.sh  # worktrees --clean and --dry-run
+    ~/agent-board/test/stacked-merge.sh    # the stacked-PR merge gate, fake gh
 
-All four build their own throwaway git repos and fake agents in a throwaway
+All of them build their own throwaway git repos and fake agents in a throwaway
 `AGENT_BOARD_DIR`, so they neither read nor write the live board or the real
 checkouts. The tracked history is the real undo — `git -C ~/agent-board log bin/agentboard`,
 then `git checkout <rev> -- bin/agentboard`. `bin/agentboard.prev` is still written on
