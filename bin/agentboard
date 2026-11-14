@@ -341,7 +341,7 @@ theme_missing() {   # theme_missing <name> -> which required section is absent
 # — a mis-typed theme must not be able to stop sessions registering.
 theme_now() {
   local t
-  t=$(head -1 "$BOARD/theme" 2>/dev/null | tr -d ' \t\r')
+  t=""; [ -f "$BOARD/theme" ] && t=$(head -1 "$BOARD/theme" 2>/dev/null | tr -d ' \t\r')
   if [ -n "$t" ] && theme_valid "$t"; then printf '%s' "$t"
   else printf '%s' "$AB_THEME_DEFAULT"; fi
 }
@@ -579,7 +579,7 @@ detect_agent() {
 }
 
 # --- field helpers ---------------------------------------------------------
-get_field() { sed -n "s/^$2: //p" "$1" 2>/dev/null | head -1; }
+get_field() { [ -f "$1" ] || return 0; sed -n "s/^$2: //p" "$1" 2>/dev/null | head -1; }
 
 # Replaces the key in place, or adds it at the end of the frontmatter block if
 # this file predates the field (session files outlive script changes).
@@ -749,19 +749,33 @@ ws_list() {   # ws_list <section> -> the repo names in it, one per line
   ini_section "$WORKSPACE" "$1" | tr -s '[:space:]' '\n' | grep . || true
 }
 
-# grep for the decisions a gate makes. Exit 1 is "no match"; exit 2 or more is a
-# failure. Many of these run in a pipeline or $( ), where an exit would leave only
-# that subshell, so a failure is recorded in a flag file instead, and hook_pretool
-# refuses the call when it sees the flag (see AB_GREP_FAIL there).
-gq() {
-  grep "$@"
-  local rc=$?
-  if [ "$rc" -gt 1 ] && [ -n "${AB_GREP_FAIL:-}" ]; then : > "$AB_GREP_FAIL"; fi
-  return "$rc"
+# Checked tools for the gate. A gate decision reads the output of grep, sed, awk
+# and the rest, often in a pipeline or $( ), where an exit leaves only that
+# subshell. So, while hook_pretool runs, each of these tools is a function that
+# runs the real one and, on an exit outside its normal set, appends a line to a
+# flag file; hook_pretool's EXIT trap refuses the call when the flag is there.
+# Normal: 0 for all; 1 for grep (no match) and python3 (our own "no" answer);
+# 3 for python3 (our "nothing readable" answer, which the callers refuse); 141,
+# SIGPIPE, when a reader such as head -1 stopped early. A read of a file that
+# may be missing tests for the file first, so an error exit is a real failure.
+ab_tool_failed() {   # ab_tool_failed <what> <exit>: record it, inside the gate only
+  [ -n "${AB_CHECK_FAIL:-}" ] || return 0
+  printf '%s exited %s\n' "$1" "$2" >> "$AB_CHECK_FAIL" 2>/dev/null || :
+}
+ab_check_tools() {
+  local t
+  for t in grep sed awk cut tr sort comm head tail uniq wc python3; do
+    eval "$t() {
+      command $t \"\$@\"
+      local rc=\$?
+      case $t:\$rc in *:0|*:141|grep:1|python3:1|python3:3) ;; *) ab_tool_failed $t \$rc ;; esac
+      return \$rc
+    }"
+  done
 }
 
 ws_has() {   # ws_has <section> <repo name>
-  ws_list "$1" | gq -qx "$2"
+  ws_list "$1" | grep -qx "$2"
 }
 
 repo_policy() {
@@ -807,7 +821,7 @@ dirty_paths() {   # dirty_paths <repo> -> uncommitted paths, one per line
   [ -n "$repo" ] || return 0
   if [ "$repo" != "$_DIRTY_REPO" ]; then
     _DIRTY_REPO=$repo
-    _DIRTY_VAL=$(git -C "$repo" status --porcelain -z 2>/dev/null | python3 -c '
+    _DIRTY_VAL=$( { git -C "$repo" status --porcelain -z 2>/dev/null || ab_tool_failed "git status" $?; } | python3 -c '
 import sys
 recs = sys.stdin.buffer.read().split(b"\0")
 i = 0
@@ -848,9 +862,9 @@ live_paths() {   # live_paths <pid> <repo> -> observed AND still uncommitted
   cand=$(awk -F'\t' -v r="$repo" 'NF==2 && $1==r {print $2}' "$pf" | sort -u)
   [ -n "$cand" ] || return 0
   dirty=$(dirty_paths "$repo"); [ -n "$dirty" ] || return 0
-  exact=$(printf '%s\n' "$dirty" | gq -v '/$')
-  dirs=$(printf '%s\n' "$dirty" | gq '/$')
-  out=$(printf '%s\n' "$cand" | gq -Fxf <(printf '%s\n' "$exact") 2>/dev/null)
+  exact=$(printf '%s\n' "$dirty" | grep -v '/$')
+  dirs=$(printf '%s\n' "$dirty" | grep '/$')
+  out=$(printf '%s\n' "$cand" | grep -Fxf <(printf '%s\n' "$exact") 2>/dev/null)
   # git reports an untracked DIRECTORY rather than the files inside it, so a file
   # we were seen to create in a brand-new directory only matches by prefix.
   if [ -n "$dirs" ]; then
@@ -861,7 +875,7 @@ live_paths() {   # live_paths <pid> <repo> -> observed AND still uncommitted
       done <<< "$cand"
     done <<< "$dirs"
   fi
-  printf '%s\n' "$out" | gq . | sort -u
+  printf '%s\n' "$out" | grep . | sort -u
   return 0
 }
 
@@ -892,7 +906,8 @@ vault_in_head() {   # vault_in_head <repo> <relpath>
   [ "$h" = "$VAULT_HDR" ]
 }
 vault_encrypted_now() {   # vault_encrypted_now <repo> <relpath>
-  head -c 14 "$1/$2" 2>/dev/null | gq -qF "$VAULT_HDR"
+  [ -f "$1/$2" ] || return 1
+  head -c 14 "$1/$2" 2>/dev/null | grep -qF "$VAULT_HDR"
 }
 vault_files() {   # vault_files <repo> -> encrypted-in-HEAD paths
   git -C "$1" grep -l -F -e "$VAULT_HDR" HEAD -- . 2>/dev/null | sed 's/^HEAD://' |
@@ -932,11 +947,11 @@ env_ok_name() {   # a name that is safe as a path segment and as a word in a reg
 env_owner() {   # env_owner <name> -> owner record of a LIVE lease, else clears it
   local d; d=$(env_dir "$1")
   [ -d "$d" ] || return 1
-  local pid exp; pid=$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)
+  local pid="" exp; [ -f "$d/owner" ] && pid=$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)
   case "$pid" in
     *:*)   # held here for a peer, whose pid this machine cannot see: it lives
            # while the peer's relay keeps renewing it
-      exp=$(sed -n 's/^expires: //p' "$d/owner" 2>/dev/null | head -1 | tr -dc 0-9)
+      exp=""; [ -f "$d/owner" ] && exp=$(sed -n 's/^expires: //p' "$d/owner" 2>/dev/null | head -1 | tr -dc 0-9)
       if [ -z "$exp" ] || [ "$exp" -le "$(now_e)" ]; then
         rm -rf "$d" 2>/dev/null
         return 1
@@ -952,7 +967,7 @@ env_owner() {   # env_owner <name> -> owner record of a LIVE lease, else clears 
 
 env_i_hold() {   # env_i_hold <name>
   local d; d=$(env_dir "$1")
-  [ -d "$d" ] || return 1
+  [ -f "$d/owner" ] || return 1
   is_my_ancestor "$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)"
 }
 
@@ -963,7 +978,7 @@ env_i_hold() {   # env_i_hold <name>
 # bbb-xn-vm-odoo-dev-bramble, bramble.dev.bbb.systems), which is the name people
 # lease. Shared and prod names are left out: no single test cycle owns them.
 dev_write_targets() {
-  printf '%s' "$1" | gq -Eq 'amafu[[:space:]]+deploy|odoo_dev_refresh|ssh[[:space:]]' || return 0
+  printf '%s' "$1" | grep -Eq 'amafu[[:space:]]+deploy|odoo_dev_refresh|ssh[[:space:]]' || return 0
   SCAN=$1 CMD=$2 python3 -c '
 import os, re
 scan, cmd = os.environ["SCAN"], os.environ["CMD"]
@@ -1045,8 +1060,8 @@ env_free_mine() {   # every lease this session holds — called on session end
 
 vault_owner() {   # -> the owner record of a LIVE lease, or nothing
   [ -d "$VLEASE" ] || return 1
-  local pid
-  pid=$(sed -n 's/^pid: //p' "$VLEASE/owner" 2>/dev/null | head -1)
+  local pid=""
+  [ -f "$VLEASE/owner" ] && pid=$(sed -n 's/^pid: //p' "$VLEASE/owner" 2>/dev/null | head -1)
   if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
     rm -rf "$VLEASE" 2>/dev/null
     return 1
@@ -1966,7 +1981,7 @@ peer_labels() {   # every [peer] label in machines.local
 }
 
 peer_age() {   # peer_age <label> -> seconds since that mirror was refreshed, or nothing
-  local t; t=$(head -1 "$REMOTED/$1/synced" 2>/dev/null | tr -dc 0-9)
+  local t=""; [ -f "$REMOTED/$1/synced" ] && t=$(head -1 "$REMOTED/$1/synced" 2>/dev/null | tr -dc 0-9)
   [ -n "$t" ] && printf '%s' "$(( $(now_e) - t ))"
 }
 
@@ -1997,10 +2012,10 @@ peer_status_line() {   # peer_status_line <label> -> one line on how fresh that 
   a=$(peer_age "$l")
   if [ -z "$a" ]; then printf '  %s%s: never synced — is the relay running?%s\n' "$C_DIM" "$l" "$C_R"; return; fi
   if peer_fresh "$l"; then
-    n=$(grep -c . "$REMOTED/$l/sessions.tsv" 2>/dev/null || true)
+    n=0; [ -f "$REMOTED/$l/sessions.tsv" ] && n=$(grep -c . "$REMOTED/$l/sessions.tsv" 2>/dev/null || true)
     printf '  %s%s: %s agent(s), synced %s ago%s\n' "$C_DIM" "$l" "${n:-0}" "$(secs_h "$a")" "$C_R"
   else
-    t=$(head -1 "$REMOTED/$l/synced" 2>/dev/null | tr -dc 0-9)
+    t=""; [ -f "$REMOTED/$l/synced" ] && t=$(head -1 "$REMOTED/$l/synced" 2>/dev/null | tr -dc 0-9)
     printf '  %s%s: not seen since %s — its agents are not shown%s\n' "$C_DIM" "$l" \
       "$(date -r "$t" +%H:%M 2>/dev/null || date -d "@$t" +%H:%M 2>/dev/null)" "$C_R"
   fi
@@ -3362,7 +3377,7 @@ except Exception: sys.exit(0)
 cur=d
 for p in sys.argv[1].split("."):
     cur = cur.get(p) if isinstance(cur,dict) else None
-print(cur if isinstance(cur,str) else "")' "$1" 2>/dev/null; }
+print(cur if isinstance(cur,str) else "")' "$1" 2>/dev/null || ab_tool_failed jget $?; }
 
 # Tool names that run a shell command. Their command must be readable, or the
 # call is refused: a gate that cannot read the command cannot judge it.
@@ -3588,7 +3603,7 @@ m() {
   local subject=$1
   shift
   [ "$1" = "--" ] && shift
-  printf '%s' "$subject" | gq -Eq -- "$1"
+  printf '%s' "$subject" | grep -Eq -- "$1"
   local rc=$?
   [ "$rc" -le 1 ] && return "$rc"
   [ -n "${AB_IN_PRETOOL:-}" ] && hook_refuse "a pattern check failed (grep exit $rc)"
@@ -3602,8 +3617,8 @@ whole_tree_op() {
   # Only the commit's own arguments count: `git commit -m x && git log --all`
   # names its paths, and the --all belongs to the log.
   local seg
-  seg=$(printf '%s' "$1" | gq -oE '(^|[;&|(])[[:space:]]*git[[:space:]]+commit([[:space:]][^;&|)]*)?' 2>/dev/null)
-  local src=$?   # 1 is "no git commit here"; more is a failure (gq flags it too)
+  seg=$(printf '%s' "$1" | grep -oE '(^|[;&|(])[[:space:]]*git[[:space:]]+commit([[:space:]][^;&|)]*)?' 2>/dev/null)
+  local src=$?   # 1 is "no git commit here"; more is a failure (the checked grep flags it too)
   [ "$src" -le 1 ] || { [ -n "${AB_IN_PRETOOL:-}" ] && hook_refuse "a pattern check failed (grep exit $src)"; return 0; }
   [ -n "$seg" ] && m "$seg" -- '(^|[[:space:]])(-a|-am|-ma|--all)([[:space:]]|$)' && return 0
   m "$1" '(^|[;&|(])[[:space:]]*git[[:space:]]+add[[:space:]]+(-A|--all|\.|:/)([[:space:]]|$)' && return 0
@@ -3691,7 +3706,7 @@ gate_file_write() {
     [ "$(get_field "$f" repo)" = "$repo" ] || continue
     [ -n "$me" ] && [ "$f" = "$me" ] && continue
     pid=$(get_field "$f" pid)
-    if live_paths "$pid" "$repo" | gq -qxF -- "$rel"; then
+    if live_paths "$pid" "$repo" | grep -qxF -- "$rel"; then
       owners="$owners, $(label_of "$f")"; n=$((n+1))
     fi
   done
@@ -3735,21 +3750,24 @@ hook_pretool() {
   local payload tool cmd cwd scan repo policy conflicts path
   payload=$(cat)
   AB_IN_PRETOOL=1
-  # A gate grep that fails anywhere, even in a subshell, leaves this flag, and
-  # the EXIT trap turns whatever answer follows into a refusal.
+  # A gate tool that fails anywhere, even in a subshell, leaves this flag (see
+  # ab_check_tools), and the EXIT trap turns whatever answer follows into a
+  # refusal.
   local fd
   fd=$(mktemp -d "${TMPDIR:-/tmp}/ab-pretool.XXXXXX" 2>/dev/null) && [ -d "$fd" ] \
     || hook_refuse "the gate could not make its scratch directory"
-  AB_GREP_FAIL=$fd/grep-failed
-  trap '_ab_rc=$?; _ab_f=0; [ -e "$AB_GREP_FAIL" ] && _ab_f=1; rm -rf "${AB_GREP_FAIL%/*}"
-    if [ "$_ab_f" = 1 ] && [ "$_ab_rc" != 2 ]; then
-      printf "BLOCKED: a pattern check inside the agent board gate failed, so it could not decide on this call.\nThe gates fail closed: a call they cannot check is refused, not let through.\n" >&2
+  AB_CHECK_FAIL=$fd/check-failed
+  trap '_ab_rc=$?; _ab_f=""; [ -e "$AB_CHECK_FAIL" ] && _ab_f=$(command head -3 "$AB_CHECK_FAIL" 2>/dev/null | command tr "\n" ";"); [ -e "$AB_CHECK_FAIL" ] && [ -z "$_ab_f" ] && _ab_f="?"
+    rm -rf "${AB_CHECK_FAIL%/*}"
+    if [ -n "$_ab_f" ] && [ "$_ab_rc" != 2 ]; then
+      printf "BLOCKED: a check inside the agent board gate failed (%s), so it could not decide on this call.\nThe gates fail closed: a call they cannot check is refused, not let through.\n" "${_ab_f%;}" >&2
       exit 2
     fi
     exit "$_ab_rc"' EXIT
   # A signal would skip the EXIT trap and leave the scratch dir; exit through it,
   # as a refusal.
   trap 'printf "BLOCKED: the agent board gate was interrupted before it could decide.\n" >&2; exit 2' TERM INT HUP
+  ab_check_tools
   printf '%s' "$payload" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -3890,7 +3908,7 @@ EOF
     while IFS= read -r vp; do
       [ -n "$vp" ] || continue
       vault_in_head "$repo" "$vp" && ! vault_encrypted_now "$repo" "$vp" && naked="$naked  $vp"$'\n'
-    done < <( { git -C "$repo" diff --cached --name-only 2>/dev/null
+    done < <( { git -C "$repo" diff --cached --name-only 2>/dev/null || ab_tool_failed "git diff --cached" $?
                 set -f
                 for tok in $cmd; do
                   tok=${tok#"$repo"/}
@@ -4065,7 +4083,11 @@ case "$sub" in
         printf 'BLOCKED: the agent board hook could not make a temp dir, so it cannot check this call.\n' >&2; exit 2; }
       # TMPDIR inside our dir: a child killed outright cannot clean its own
       # scratch, so the rm -rf below does it.
-      AB_HOOK_CHILD=1 TMPDIR="$_ab_d" timeout -k 2 "$_ab_budget" "$0" hook-pretool --codex >"$_ab_d/out" 2>"$_ab_d/err"
+      # Codex starts hooks with SIGPIPE ignored. Then a writer whose reader stops
+      # early (sed ... | head -1) exits with an error instead of SIGPIPE, and the
+      # checked tools would refuse the call. Give the child the default back.
+      _ab_env=env; env --default-signal=PIPE true 2>/dev/null && _ab_env="env --default-signal=PIPE"
+      AB_HOOK_CHILD=1 TMPDIR="$_ab_d" $_ab_env timeout -k 2 "$_ab_budget" "$0" hook-pretool --codex >"$_ab_d/out" 2>"$_ab_d/err"
       _ab_rc=$?
       _ab_why=""
       if [ -s "$_ab_d/out" ]; then

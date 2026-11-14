@@ -1063,12 +1063,27 @@ closed on their own side. What they do:
   (`Bash`, `shell`, `local_shell`, `exec_command`) whose command is missing or not
   a string or argv list: refused with exit 2.
 - A parser or the command scanner inside the gate that exits with an error:
-  refused with exit 2. The `grep` calls that the gate decisions use (the command
-  patterns, the `git commit` segment, the peer, workspace and vault checks) go
-  through one helper. A grep error there leaves a flag file, also from a
-  subshell, and on exit the gate turns any answer into a refusal. A signal
-  (TERM, INT, HUP) to the gate is also a refusal. This covers the failures the
-  code checks for; it is not a proof that no failure can slip through.
+  refused with exit 2.
+- While the gate runs, `grep`, `sed`, `awk`, `cut`, `tr`, `sort`, `comm`,
+  `head`, `tail`, `uniq`, `wc` and `python3` are shell functions that run the
+  real tool and check its exit. An exit outside the tool's normal set (0; 1 for
+  grep; 1 and 3 for our own python answers; 141 when a reader stopped early)
+  leaves a flag file, also from a subshell or pipeline. On exit the gate turns
+  any answer into a refusal that names the tool. A file that may be missing is
+  tested before it is read, so its absence is not a failure. `git status` and
+  `git diff --cached`, which the peer and vault checks read, are checked too.
+  A signal (TERM, INT, HUP) to the gate is also a refusal.
+- `test/codex-hooks.sh` fails each call of each of these tools in turn, in six
+  calls the gate refuses (a peer-held file, a vault file, `git commit -a`,
+  `ansible-playbook` without the lock, `ansible-vault` without the lease, a
+  branch switch in a no-branch repo), and checks that every one stays refused.
+- Not checked: other commands (`git rev-parse`, `ps`, `kill`, `date`, `stat`
+  and the like) whose failure the code reads as an ordinary answer, such as "not
+  in a repo" or "that process is gone". The sweep covers the six calls above,
+  not every input. So this is not a proof that no failure can slip through.
+- Codex starts hooks with SIGPIPE ignored. The gate child gets the default back
+  (`env --default-signal=PIPE`), so a writer that a reader cut short is not taken
+  for a failure.
 - Patch headers: each line is trimmed, then the marker
   (`*** Add File: `, `*** Update File: `, `*** Delete File: `, `*** Move to: `)
   is cut off, and the rest is the path, unchanged, as in Codex 0.169.0. A patch

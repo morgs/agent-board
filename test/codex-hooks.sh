@@ -193,14 +193,14 @@ pre_gone Bash "$(shell 'git status')"
 [ "$(decision)" = deny ] && ok '    and a harmless command is refused too: the gate could not check it' || bad "commit seg grep, status: rc=$RC"
 grep_fails_on '-qxF'
 pre_gone apply_patch "$(patch Update shared.yml)"
-[ "$(decision)" = deny ] && printf '%s' "$ERR" | grep -q 'pattern check' && ok 'only the peer-path grep fails (in a pipeline): refused, not allowed' || bad "peer grep: rc=$RC err=$ERR"
+[ "$(decision)" = deny ] && printf '%s' "$ERR" | grep -q 'check inside the agent board gate failed (grep exited 2' && ok 'only the peer-path grep fails (in a pipeline): refused, not allowed' || bad "peer grep: rc=$RC err=$ERR"
 cat > "$T/grepone/grep" <<'SH'
 #!/bin/bash
 [ "$1" = -qx ] && exit 2
 exec /usr/bin/grep "$@"
 SH
 pre_gone apply_patch "$(patch Update shared.yml)"
-[ "$(decision)" = deny ] && printf '%s' "$ERR" | grep -q 'pattern check' && ok 'only the workspace-list grep fails: a peer-held file is refused' || bad "ws grep: rc=$RC err=$ERR"
+[ "$(decision)" = deny ] && printf '%s' "$ERR" | grep -q 'check inside the agent board gate failed (grep exited 2' && ok 'only the workspace-list grep fails: a peer-held file is refused' || bad "ws grep: rc=$RC err=$ERR"
 cat > "$T/grepone/grep" <<'SH'
 #!/bin/bash
 [ "$1" = -qF ] && exit 2
@@ -208,6 +208,91 @@ exec /usr/bin/grep "$@"
 SH
 pre_gone apply_patch "$(patch Update vault.yml)"
 [ "$(decision)" = deny ] && ok 'only the vault-header grep fails: refused' || bad "vault grep: rc=$RC err=$ERR"
+# Recheck 3: ws_list's `grep .` fails alone, on the [shared-main] list (the first
+# `grep .` whose input names infra; the [content] list before it is empty). Before
+# the fix, ws_has then saw an empty list, the repo read as branch-pr, and the
+# peer-held file was allowed.
+cat > "$T/grepone/grep" <<'SH'
+#!/bin/bash
+if [ "$*" = . ] && [ ! -e "$T/grepone/done" ]; then
+  in=$(cat)
+  case "$in" in *infra*) : > "$T/grepone/done"; exit 2 ;; esac
+  printf '%s' "$in" | exec /usr/bin/grep "$@"
+fi
+exec /usr/bin/grep "$@"
+SH
+rm -f "$T/grepone/done"
+pre_gone apply_patch "$(patch Update shared.yml)"
+[ -e "$T/grepone/done" ] && [ "$(decision)" = deny ] && printf '%s' "$ERR" | grep -q 'grep exited 2' \
+  && ok 'only the workspace-list `grep .` fails: a peer-held file is refused (recheck 3)' || bad "ws_list grep .: rc=$RC err=$ERR"
+
+# Fault injection over every checked tool: each call of each tool fails in turn
+# (exit 2), and a call the gate refuses when all is well must stay refused. A
+# shim per tool counts its calls under a lock and fails only call INJ_K of INJ_TOOL.
+INJ="$T/inj"; mkdir -p "$INJ/real" "$INJ/bin"
+INJ_TOOLS="grep sed awk cut tr sort comm head tail uniq wc python3"
+for t in $INJ_TOOLS; do
+  ln -s "$(command -v "$t")" "$INJ/real/$t"
+  cat > "$INJ/bin/$t" <<'SH'
+#!/bin/bash
+t=${0##*/}
+{ flock 9; n=$(( $(cat "$INJ/n.$t" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$INJ/n.$t"; } 9>>"$INJ/lock"
+[ "$t" = "${INJ_TOOL:-}" ] && [ "$n" = "${INJ_K:-0}" ] && exit 2
+exec "$INJ/real/$t" "$@"
+SH
+  chmod +x "$INJ/bin/$t"
+done
+export INJ
+inj_run() {   # inj_run <tool> <k> <tool name> <tool_input>: the gate child, call k of tool failing
+  rm -f "$INJ"/n.*
+  P=$(payload PreToolUse "$3" "$4")
+  OUT=$(cd "$D" && printf '%s' "$P" | INJ_TOOL=$1 INJ_K=$2 AB_HOOK_CHILD=1 PATH="$INJ/bin:$PATH" "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
+  ERR=$(cat "$T/err")
+}
+inj_n=0; inj_open=""
+inj_case() {   # inj_case <label> <tool name> <tool_input>
+  local t k n
+  inj_run none 0 "$2" "$3"
+  [ "$(decision)" = deny ] || { bad "fault sweep: $1 is not refused even with no fault (rc=$RC)"; return; }
+  declare -A cnt=()
+  for t in $INJ_TOOLS; do cnt[$t]=$(cat "$INJ/n.$t" 2>/dev/null || echo 0); done
+  for t in $INJ_TOOLS; do
+    n=${cnt[$t]}
+    for ((k=1; k<=n; k++)); do
+      inj_run "$t" "$k" "$2" "$3"; inj_n=$((inj_n+1))
+      [ "$(decision)" = deny ] || inj_open="$inj_open $1:$t#$k(rc=$RC)"
+    done
+  done
+}
+inj_case 'patch of a peer-held file' apply_patch "$(patch Update shared.yml)"
+inj_case 'patch of a vault file' apply_patch "$(patch Update vault.yml)"
+inj_case 'git commit -a with a peer live' Bash "$(shell 'git commit -a -m x')"
+inj_case 'ansible-playbook without the lock' Bash "$(shell 'ansible-playbook site.yml')"
+inj_case 'ansible-vault edit without the lease' Bash "$(shell 'ansible-vault edit vault.yml')"
+inj_case 'git switch in a no-branch repo' Bash "$(shell 'git switch -c x')"
+[ -z "$inj_open" ] && [ "$inj_n" -gt 100 ] && ok "fault sweep: $inj_n single-call failures across 6 refused calls, every one still refused" \
+  || bad "fault sweep ($inj_n runs) let through:$inj_open"
+# ...and with no fault, an ordinary call still passes through the shims.
+inj_run none 0 Bash "$(shell 'git status')"
+[ "$(decision)" = allow ] && ok '    with no fault, git status still passes' || bad "sweep control: rc=$RC err=$ERR"
+
+# Codex starts hooks with SIGPIPE ignored; the gate child gets the default back,
+# or a writer cut short by head -1 would exit with an error and refuse the call.
+mkdir -p "$T/tshim"
+cat > "$T/tshim/timeout" <<SH
+#!/bin/bash
+grep SigIgn /proc/self/status > "$T/tshim/sigign"
+exec $(command -v timeout) "\$@"
+SH
+chmod +x "$T/tshim/timeout"
+OUT=$(cd "$D" && payload PreToolUse Bash "$(shell 'git status')" | PATH="$T/tshim:$PATH" python3 -c '
+import signal, subprocess, sys
+signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+sys.exit(subprocess.run(sys.argv[1:], restore_signals=False).returncode)' "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
+ign=$(awk '{print $2}' "$T/tshim/sigign" 2>/dev/null)
+[ -n "$ign" ] && [ $(( 0x$ign & 0x1000 )) = 0 ] && [ "$RC" = 0 ] && [ -z "$OUT" ] \
+  && ok 'under an ignored SIGPIPE, the gate child runs with the default and allows git status' || bad "sigpipe: ign=$ign rc=$RC $(cat "$T/err")"
+
 ls -d "${TMPDIR:-/tmp}"/ab-pretool.* >/dev/null 2>&1 && bad 'the gate left a scratch directory' || ok '    the gate cleans up its scratch directory'
 
 # Claude side of hook_decide: a renderer that fails must not leave a silent allow.
