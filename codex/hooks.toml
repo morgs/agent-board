@@ -2,7 +2,7 @@
 #
 # The same five hooks Claude Code runs from ~/.claude/settings.json, called with
 # --codex so that agentboard answers in the form Codex accepts:
-#   - PreToolUse: only "deny" (with a reason) or exit 2 + stderr. Codex has no
+#   - PreToolUse: a refusal is always exit 2 + a reason on stderr. Codex has no
 #     "ask", so a decision that needs the user becomes a deny that tells the agent
 #     to stop and ask, then `agentboard allow-edit <path>` or AGENT_BOARD_OVERRIDE=1.
 #   - Stop: the inbox comes back as {"decision":"block","reason": ...}.
@@ -25,9 +25,12 @@
 #
 # Codex does not block a call when this hook times out (default 600s) or crashes.
 # `hook-pretool --codex` therefore runs the gate under its own budget
-# (AGENT_BOARD_HOOK_BUDGET, 20s) and turns a timeout, a crash or an unusable answer
-# into a refusal. If this command cannot start at all (the path is gone, the hook
-# is untrusted), Codex runs the call unchecked: see README, "Fail closed".
+# (AGENT_BOARD_HOOK_BUDGET, default 20s, clamped to 1..300) and passes on only
+# exit 0 with no stdout (allow) or exit 2 with a reason (deny). A timeout, a crash
+# or any other answer becomes a refusal. If this command cannot start at all (the
+# path is gone, the hook is untrusted), Codex runs the call unchecked: see README,
+# "Fail closed". `timeout` (coreutils) must be installed; without it every call
+# is refused.
 
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]

@@ -99,18 +99,13 @@ shim() {
   printf '#!/bin/bash\ncase "$2" in *%q*) %s ;; esac\nexec %q "$@"\n' "$1" "$2" "$REALPY" > "$T/shim/python3"
   chmod +x "$T/shim/python3"
 }
-decision() { printf '%s' "$OUT" | python3 -c '
-import json, sys
-s = sys.stdin.read().strip()
-if not s: print("allow"); sys.exit()
-d = json.loads(s)
-h = d["hookSpecificOutput"]
-# What Codex accepts: deny with a non-empty reason, nothing else.
-assert set(d) == {"hookSpecificOutput"}, d
-assert set(h) <= {"hookEventName", "permissionDecision", "permissionDecisionReason"}, h
-assert h["hookEventName"] == "PreToolUse"
-assert h["permissionDecision"] == "deny" and h["permissionDecisionReason"].strip()
-print("deny")' 2>/dev/null || echo unparseable; }
+# What Codex honours, and all the watchdog lets through: allow is exit 0 with
+# nothing on stdout; deny is exit 2 with a reason on stderr and nothing on stdout.
+decision() {
+  if [ "$RC" = 0 ] && [ -z "$OUT" ]; then echo allow
+  elif [ "$RC" = 2 ] && [ -z "$OUT" ] && printf '%s' "$ERR" | grep -q '[^[:space:]]'; then echo deny
+  else echo "unusable(rc=$RC out=$OUT)"; fi
+}
 
 echo 'SessionStart registers the session as codex and injects context'
 OUT=$(cd "$D" && payload SessionStart '' '' | "$AB" hook-start --codex)
@@ -168,6 +163,22 @@ pre apply_patch "$(patch Update mine.yml)"
 PATH=$OLDPATH
 [ "$RC" = 2 ] && ok 'patch parser process fails: refused' || bad "patch parser fail rc=$RC"
 
+shim 'out, delim = [], None' 'exit 1'
+PATH="$T/shim:$PATH"
+pre Bash "$(shell 'git status')"
+PATH=$OLDPATH
+[ "$RC" = 2 ] && printf '%s' "$ERR" | grep -q 'scanner failed' && ok 'command scanner fails: refused (recheck R2)' || bad "scanner fail rc=$RC"
+mkdir -p "$T/grepshim"; printf '#!/bin/bash\nexit 2\n' > "$T/grepshim/grep"; chmod +x "$T/grepshim/grep"
+OUT=$(cd "$D" && payload PreToolUse Bash "$(shell 'git stash')" | AB_HOOK_CHILD=1 PATH="$T/grepshim:$PATH" "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
+[ "$RC" = 2 ] && grep -q 'pattern check failed' "$T/err" && ok 'a failing grep inside the gate: refused' || bad "grep fail rc=$RC $(cat "$T/err")"
+# Claude side of hook_decide: a renderer that fails must not leave a silent allow.
+shim 'permissionDecisionReason": os.environ' 'exit 1'
+PATH="$T/shim:$PATH"
+pl=$(payload PreToolUse apply_patch "$(patch Update shared.yml)")
+OUT=$(cd "$D" && printf '%s' "$pl" | "$AB" hook-pretool 2>"$T/err"); RC=$?
+PATH=$OLDPATH
+[ "$RC" = 2 ] && [ -z "$OUT" ] && grep -q 'uncommitted changes' "$T/err" && ok 'deny renderer fails (Claude form): exit 2 with the reason (recheck R2)' || bad "renderer fail rc=$RC out=$OUT"
+
 echo 'Patch headers are read as Codex reads them (review #1)'
 ind() { V=$1 P=$2 python3 -c '
 import json, os
@@ -181,6 +192,13 @@ pre apply_patch '{"command": "*** Begin Patch\n*** Frobnicate File: shared.yml\n
 [ "$RC" = 2 ] && ok 'a patch that names no file the hook can read: refused' || bad "no-path patch rc=$RC"
 pre apply_patch '{"command": "*** Begin Patch\n*** Update File:   \n*** End Patch\n"}'
 [ "$RC" = 2 ] && ok 'a header with an empty path: refused' || bad "empty path rc=$RC"
+# Recheck R1: Codex trims the line, then takes everything after the marker as is.
+printf 'x\n' > "$D/ leading.yml"; printf 'x\n' > "$D/leading.yml"
+printf 'peer\n' >> "$D/ leading.yml"; printf '%s\t%s\n' "$D" ' leading.yml' >> "$AGENT_BOARD_DIR/paths/$PEER"
+pre apply_patch '{"command": "*** Begin Patch\n*** Update File:  leading.yml\n@@\n-x\n+y\n*** End Patch\n"}'
+[ "$(decision)" = deny ] && ok 'a file name that starts with a space is gated as that file (recheck R1)' || bad "leading space: rc=$RC $OUT"
+pre apply_patch '{"command": "*** Begin Patch\n*** Update File: leading.yml\n@@\n-x\n+y\n*** End Patch\n"}'
+[ "$(decision)" = allow ] && ok '    and the name without the space is a different, free file' || bad "no-space: rc=$RC $ERR"
 pre Bash "$(shell "grep -n '*** Begin Patch' notes.txt")"
 [ "$RC" = 0 ] && ok '    a shell command that only mentions the marker passes' || bad "mention rc=$RC"
 
@@ -197,7 +215,7 @@ pre apply_patch "$(patch Update vault.yml)"
 pre apply_patch "$(patch Update mine.yml)"
 [ "$(decision)" = allow ] && ok 'patch to a file nobody else holds: allowed (silent)' || bad "mine patch: $OUT"
 pre apply_patch "$(patch Update shared.yml)"
-[ "$(decision)" = deny ] && printf '%s' "$OUT" | grep -q 'allow-edit' \
+[ "$(decision)" = deny ] && printf '%s' "$ERR" | grep -q 'allow-edit' \
   && ok 'patch to a peer-held file: deny, not ask, and names allow-edit' || bad "overlap: $OUT"
 (cd "$D" && "$AB" allow-edit shared.yml) >/dev/null
 pre apply_patch "$(patch Update shared.yml)"
@@ -208,13 +226,37 @@ pre apply_patch "$(patch Update shared.yml)"
 pl=$(payload PreToolUse apply_patch "$(patch Update shared.yml)")
 mkdir -p "$T/race"
 for i in $(seq 1 20); do
-  (cd "$D" && printf '%s' "$pl" | "$AB" hook-pretool --codex >"$T/race/$i" 2>/dev/null) &
+  (cd "$D" && printf '%s' "$pl" | "$AB" hook-pretool --codex >/dev/null 2>&1; echo $? >"$T/race/$i") &
 done
 wait
-n=0; for i in $(seq 1 20); do [ -s "$T/race/$i" ] || n=$((n+1)); done
+n=0; for i in $(seq 1 20); do [ "$(cat "$T/race/$i")" = 0 ] && n=$((n+1)); done
 [ "$n" = 1 ] && ok 'one grant, 20 concurrent edits: exactly one passes (review #4)' || bad "race: $n passed"
 pre Edit "$(patch Update shared.yml)"
 [ "$(decision)" = deny ] && ok 'the same patch under the Edit tool name is gated too' || bad "Edit alias: $OUT"
+
+# Recheck R5: a sweep must leave a live session's grant lock in place. Hold the
+# lock, sweep, and check that a second taker still waits for the holder.
+(cd "$D" && "$AB" allow-edit shared.yml mine.yml) >/dev/null
+GF=$(ls "$AGENT_BOARD_DIR"/locks/allow-edit.* 2>/dev/null | grep -v '\.lock$' | head -1)
+python3 - "$GF.lock" <<'PY' &
+import fcntl, sys, time
+with open(sys.argv[1], "a") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX); open(sys.argv[1] + ".held", "w").close(); time.sleep(3)
+PY
+HOLDER=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$GF.lock.held" ] && break; sleep 0.2; done
+"$AB" sweep >/dev/null 2>&1
+[ -e "$GF.lock" ] && ok 'sweep keeps the lock file of a live session (R5)' || bad 'sweep removed a live lock'
+s0=$(date +%s%N)
+python3 -c 'import fcntl,sys; fcntl.flock(open(sys.argv[1],"a"), fcntl.LOCK_EX)' "$GF.lock"
+w=$(( ($(date +%s%N) - s0) / 1000000 ))
+wait "$HOLDER"
+[ "$w" -gt 1000 ] && ok "    a second taker after the sweep still waits for the holder (${w}ms)" || bad "lock split: waited ${w}ms"
+mkdir -p "$AGENT_BOARD_DIR/locks"; : > "$AGENT_BOARD_DIR/locks/allow-edit.999999"; : > "$AGENT_BOARD_DIR/locks/allow-edit.999999.lock"
+"$AB" sweep >/dev/null 2>&1
+[ ! -e "$AGENT_BOARD_DIR/locks/allow-edit.999999" ] && [ ! -e "$AGENT_BOARD_DIR/locks/allow-edit.999999.lock" ] \
+  && ok '    a dead session'"'"'s grant and lock are both swept' || bad 'dead grant/lock left'
+rm -f "$GF" "$GF.lock.held"
 
 echo 'The Codex gate is bounded: a hang, a crash or bad output is a refusal (review #3)'
 shim 'import json, os, shlex, sys' 'sleep 30'
@@ -230,11 +272,43 @@ PATH="$T/shim:$PATH"
 pre Bash "$(shell 'git status')"
 PATH=$OLDPATH
 [ "$RC" = 2 ] && printf '%s' "$ERR" | grep -q 'was killed' && ok 'a gate killed mid-run is refused' || bad "crash rc=$RC $ERR"
-shim 'permissionDecisionReason": os.environ' 'echo not-json; exit 0'
+# The parent passes on only "exit 0, no stdout" and "exit 2 with a reason". A
+# stand-in for the gate (via a fake timeout that runs a script instead) shows it
+# refusing the shapes Codex would take as a non-blocking error (recheck R3).
+fake_gate() {   # fake_gate <bash body>: the child's whole behaviour
+  mkdir -p "$T/fakegate"
+  printf '#!/bin/bash\ncat >/dev/null\n%s\n' "$1" > "$T/fakegate/timeout"
+  chmod +x "$T/fakegate/timeout"
+}
+gate_with() {   # gate_with <bash body> -> RC OUT ERR, from the real parent
+  fake_gate "$1"
+  OUT=$(cd "$D" && payload PreToolUse Bash "$(shell 'git status')" | PATH="$T/fakegate:$PATH" "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
+  ERR=$(cat "$T/err")
+}
+gate_with 'echo "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"x\"},\"continue\":false}"; exit 0'
+[ "$(decision)" = deny ] && printf '%s' "$ERR" | grep -q 'stdout' && ok 'a JSON answer with extra fields is refused afresh, not forwarded (R3)' || bad "json+continue: rc=$RC out=$OUT"
+gate_with 'echo not-json; exit 0'
+[ "$(decision)" = deny ] && ok 'plain non-JSON stdout is refused' || bad "non-json: rc=$RC"
+gate_with 'printf "  \n" >&2; exit 2'
+[ "$(decision)" = deny ] && printf '%s' "$ERR" | grep -q 'without a reason' && ok 'exit 2 with a blank reason is refused with a reason of its own (R3)' || bad "blank exit2: rc=$RC err=$ERR"
+gate_with 'exit 127'
+[ "$(decision)" = deny ] && printf '%s' "$ERR" | grep -q 'exit 127' && ok 'timeout missing (exit 127) is refused, not let through' || bad "127: rc=$RC"
+gate_with 'exit 0'
+[ "$(decision)" = allow ] && ok '    a clean allow passes' || bad "clean allow: rc=$RC out=$OUT"
+gate_with 'echo "refused for a reason" >&2; exit 2'
+[ "$(decision)" = deny ] && [ "$ERR" = 'refused for a reason' ] && ok '    a refusal with a reason passes through unchanged' || bad "exit2 passthrough: $ERR"
+# R4: the parent itself does no work that can stall after the child: no python.
+shim 'import json' 'sleep 30'
 PATH="$T/shim:$PATH"
-pre apply_patch "$(patch Update vault.yml)"
+fake_gate 'echo "refused" >&2; exit 2'
+s0=$(date +%s)
+OUT=$(cd "$D" && printf '{}' | PATH="$T/fakegate:$T/shim:$PATH" "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
+el=$(( $(date +%s) - s0 ))
 PATH=$OLDPATH
-[ "$RC" = 2 ] && printf '%s' "$ERR" | grep -q 'not a deny' && ok 'an answer Codex could not use is turned into a refusal' || bad "bad output rc=$RC $OUT"
+[ "$RC" = 2 ] && [ "$el" -lt 5 ] && ok "the parent answers without python, even when python hangs (${el}s) (R4)" || bad "parent stall rc=$RC el=$el"
+grep -q 'python3' <(sed -n '/AB_HOOK_CHILD:-}" \]; then/,/^    fi$/p' "$AB") && bad 'the watchdog parent calls python3' || ok '    the watchdog parent block has no python3 call'
+OUT=$(cd "$D" && payload PreToolUse Bash "$(shell 'git status')" | AGENT_BOARD_HOOK_BUDGET=9999 "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
+[ "$RC" = 0 ] && ok '    an out-of-range budget is clamped, and the gate still runs' || bad "budget clamp rc=$RC"
 
 echo 'PostToolUse records the files a patch touched'
 printf 'c\n' > "$D/mine.yml"

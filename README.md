@@ -1029,8 +1029,8 @@ Codex takes different answers:
 | | Claude Code | Codex (`--codex`) |
 |---|---|---|
 | PreToolUse allow | silent | silent |
-| PreToolUse deny | `permissionDecision: "deny"` or exit 2 | the same |
-| PreToolUse ask | `permissionDecision: "ask"` | **no ask in Codex**: a deny that tells the agent to stop and ask the user |
+| PreToolUse deny | `permissionDecision: "deny"` or exit 2 | always exit 2 with the reason on stderr (Codex accepts both forms; the watchdog passes on only this one) |
+| PreToolUse ask | `permissionDecision: "ask"` | **no ask in Codex**: an exit-2 refusal that tells the agent to stop and ask the user |
 | Stop, messages waiting | `additionalContext` | `{"decision": "block", "reason": ...}` |
 | SessionEnd | sweeps, then marks DONE | marks DONE only: Codex allows one second |
 
@@ -1056,32 +1056,44 @@ tests the Codex answers under a process named `codex`.
 ### Fail closed, and where it cannot
 
 Codex does not block a tool call when its PreToolUse hook times out, crashes or
-answers in a form Codex cannot use: the call runs. So the gates fail closed on
-their own side:
+answers in a form Codex cannot use: the call runs. So the gates try to fail
+closed on their own side. What they do:
 
-- A payload that is not a JSON object with a `tool_name`, a shell call
+- A payload that is not a JSON object with a `tool_name`, and a shell call
   (`Bash`, `shell`, `local_shell`, `exec_command`) whose command is missing or not
-  a string or argv list, and a parser that fails: all refused with exit 2.
-- A patch is read as Codex reads it: each line trimmed, then the marker
-  (`*** Add File: `, `*** Update File: `, `*** Delete File: `, `*** Move to: `).
-  A patch that names no file the hook can read is refused.
+  a string or argv list: refused with exit 2.
+- A parser, the command scanner or a pattern match (`grep`) inside the gate that
+  exits with an error: refused with exit 2. This covers the failures the code
+  checks for; it is not a proof that no failure can slip through.
+- Patch headers: each line is trimmed, then the marker
+  (`*** Add File: `, `*** Update File: `, `*** Delete File: `, `*** Move to: `)
+  is cut off, and the rest is the path, unchanged, as in Codex 0.169.0. A patch
+  that names no file the hook can read is refused. This follows the Codex source
+  we read; a later Codex can change it.
 - Only the pure patch tools (`apply_patch`, and the Claude edit tools) skip the
   command gates. Any other tool name with a command goes through them.
 - Under `--codex`, PreToolUse runs the gate as a child under a time budget
-  (`AGENT_BOARD_HOOK_BUDGET`, 20 seconds; Codex waits 600). A child that runs past
-  it, is killed, or answers with anything but silence, a deny or exit 2 becomes a
-  refusal.
-- `allow-edit` grants are added and spent under an flock, so one grant passes one
-  edit even when hooks run at the same time.
+  (`AGENT_BOARD_HOOK_BUDGET`, default 20 seconds, clamped to 1..300 so that it
+  stays below the 600 seconds Codex waits). The parent is plain bash. It passes
+  on only two answers: exit 0 with nothing on stdout (allow), and exit 2 with a
+  reason on stderr (deny). Anything else (a timeout, a kill, other exit codes,
+  any stdout, exit 2 with a blank reason) becomes a refusal with a reason of its
+  own. Under `--codex` the gate always refuses with exit 2 and stderr, never JSON.
+- `allow-edit` grants are added and spent under an flock on a sidecar lock file.
+  `sweep` removes a grant and its lock only when the session that owns them has
+  died. This narrows the race between hooks that run at the same time; the tests
+  show one pass for 20 concurrent edits on one grant.
 
 What the board still cannot make fail closed, because the hook never runs or
 dies before it can answer:
 
 - The hook command cannot start: the script path is gone (a removed worktree),
-  `bash` or `timeout` is missing, or the hook is not trusted or is disabled in
-  `config.toml`. Codex then runs the call unchecked.
+  `bash` is missing, or the hook is not trusted or is disabled in `config.toml`.
+  Codex then runs the call unchecked. (`timeout` is an install dependency, but a
+  missing one is not fail-open: the parent sees exit 127 and refuses.)
 - The watchdog process itself is killed (SIGKILL, the OOM killer) before it
-  answers.
+  answers, or the host is so slow that the parent cannot finish within the 600
+  seconds Codex waits.
 - A tool that Codex does not pass through PreToolUse, or a command that the model
   runs some way other than a tool call the hook sees.
 
@@ -1199,7 +1211,7 @@ exactly the failure this board exists to prevent.
 | `AGENT_BOARD_SSH` | `ssh` | the ssh client the relay, `deploylock` and `env take` use to reach a peer |
 | `AGENT_BOARD_AGENT` | board name | override the holder name `deploylock` records (default: `agentboard whoami --known`) |
 | `AGENT_BOARD_HOOK_LOG` | unset | append each hook's stdin to this file (debugging a host's payloads) |
-| `AGENT_BOARD_HOOK_BUDGET` | `20` | seconds the Codex PreToolUse gate may take before the call is refused |
+| `AGENT_BOARD_HOOK_BUDGET` | `20` | seconds the Codex PreToolUse gate may take before the call is refused (clamped to 1..300, below Codex's 600) |
 
 ## Troubleshooting
 

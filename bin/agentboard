@@ -3225,9 +3225,14 @@ cmd_sweep() {
     [ -e "$f" ] || continue
     kill -0 "$(basename "$f")" 2>/dev/null || rm -f "$f"
   done
+  # allow-edit.<pid> and its allow-edit.<pid>.lock go together, and only once
+  # <pid> is dead: unlinking a lock a live session may hold splits it in two.
+  local ae_pid
   for f in "$LOCKS"/allow-edit.*; do
     [ -e "$f" ] || continue
-    kill -0 "${f##*.}" 2>/dev/null || rm -f "$f"
+    ae_pid=${f##*/allow-edit.}; ae_pid=${ae_pid%%.*}
+    case "$ae_pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$ae_pid" 2>/dev/null || rm -f "$f"
   done
   vault_owner >/dev/null 2>&1        # clears the lease if its owner has gone
   env_live >/dev/null 2>&1           # same, for every dev environment lease
@@ -3413,7 +3418,7 @@ for line in t.splitlines():
     s = line.strip()
     for mk in markers:
         if s.startswith(mk):
-            rel = s[len(mk):].strip()
+            rel = s[len(mk):]   # as Codex: the trimmed line, minus the marker, as is
             if not rel:
                 empty = True
                 break
@@ -3456,14 +3461,27 @@ hook_decide() {   # hook_decide <allow|deny|ask> <reason>
     reason="$reason
 This needs the user's decision, and a Codex hook cannot ask. Stop and ask the user. If they say it is safe: for a file, run  agentboard allow-edit <path>  and edit again; for a shell command, prefix it with AGENT_BOARD_OVERRIDE=1."
   fi
-  [ "$dec" = allow ] && [ "$AB_HOST" = codex ] && exit 0
-  DEC=$dec REASON=$reason python3 -c '
+  if [ "$AB_HOST" = codex ]; then
+    [ "$dec" = allow ] && exit 0
+    # Exit 2 with the reason on stderr: the one refusal form Codex honours that
+    # needs no renderer, and the only one the watchdog lets through.
+    printf '%s\n' "${reason:-Refused by the agent board.}" >&2
+    exit 2
+  fi
+  local out
+  if out=$(DEC=$dec REASON=$reason python3 -c '
 import json, os
 print(json.dumps({"hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": os.environ["DEC"],
-    "permissionDecisionReason": os.environ["REASON"]}}))'
-  exit 0
+    "permissionDecisionReason": os.environ["REASON"]}}))') && [ -n "$out" ]; then
+    printf '%s\n' "$out"
+    exit 0
+  fi
+  # The renderer failed. An allow can stay silent; anything else fails closed.
+  [ "$dec" = allow ] && exit 0
+  printf '%s\n' "${reason:-Refused by the agent board.}" >&2
+  exit 2
 }
 
 hook_start() {
@@ -3560,6 +3578,10 @@ m() {
   shift
   [ "$1" = "--" ] && shift
   printf '%s' "$subject" | grep -Eq -- "$1"
+  local rc=$?
+  [ "$rc" -le 1 ] && return "$rc"
+  [ -n "${AB_IN_PRETOOL:-}" ] && hook_refuse "a pattern check failed (grep exit $rc)"
+  return "$rc"
 }
 
 # Operations that act on the whole working tree rather than named paths, so they
@@ -3699,6 +3721,7 @@ EOF
 hook_pretool() {
   local payload tool cmd cwd scan repo policy conflicts path
   payload=$(cat)
+  AB_IN_PRETOOL=1
   printf '%s' "$payload" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -3743,7 +3766,9 @@ EOF
   esac
   [ -n "$cmd" ] || exit 0
   case "$cmd" in *AGENT_BOARD_OVERRIDE*) exit 0;; esac
-  scan=$(printf '%s' "$cmd" | scan_text)
+  local src=0
+  scan=$(printf '%s' "$cmd" | scan_text) || src=$?
+  [ "$src" = 0 ] || hook_refuse "the command scanner failed, exit $src"
 
   # (1) Ansible takes a hard lock, in any repo, concurrency or not: it ships the
   # tree as it stands, so overlapping runs deploy a state that never existed.
@@ -3981,7 +4006,7 @@ hook_end() {
   vault_i_hold && cmd_vault free >/dev/null 2>&1
   env_free_mine >/dev/null 2>&1
   cmd_done
-  rm -f "$(allow_edit_file)" "$(allow_edit_file).lock"
+  rm -f "$(allow_edit_file)"   # the .lock goes in a sweep, once this pid is dead
   # Codex gives SessionEnd one second. The sweep is not urgent: the next
   # session start runs one anyway.
   [ "$AB_HOST" = codex ] || cmd_sweep
@@ -3992,47 +4017,54 @@ hook_end() {
 sub=${1:-check}; shift 2>/dev/null
 case "$sub" in
   hook-*) [ "${1:-}" = "--codex" ] && { AB_HOST=codex; shift; }
-    # Debugging a host's payloads: AGENT_BOARD_HOOK_LOG=<file> in the agent's
-    # environment appends each hook's stdin there, one line per call.
-    if [ -n "${AGENT_BOARD_HOOK_LOG:-}" ]; then
-      _ab_in=$(cat)
-      printf '%s %s %s\t%s\n' "$(now_h 2>/dev/null)" "$AB_HOST" "$sub" "$(printf '%s' "$_ab_in" | tr '\n' ' ')" \
-        >> "$AGENT_BOARD_HOOK_LOG" 2>/dev/null
-      exec < <(printf '%s' "$_ab_in")
-    fi
     # Codex does not block a tool call when its PreToolUse hook times out,
     # crashes or answers in a form it cannot use: the call runs. So the Codex
-    # gate runs as a child under a time budget (well inside Codex's 600s), and
-    # anything but a clean allow (exit 0, no output), a deny (exit 0 + deny
-    # JSON) or a refusal (exit 2) is turned into a refusal here.
+    # gate runs as a child under a time budget, and this parent, which runs no
+    # python and nothing that can stall, passes on exactly two results:
+    #   exit 0 with nothing on stdout  -> allow
+    #   exit 2 with a reason on stderr -> refuse
+    # Anything else (a timeout, a kill, any stdout, exit 2 without a reason) is
+    # refused here, with a reason of its own.
     if [ "$sub" = hook-pretool ] && [ "$AB_HOST" = codex ] && [ -z "${AB_HOOK_CHILD:-}" ]; then
       _ab_budget=${AGENT_BOARD_HOOK_BUDGET:-20}
+      # Whole seconds, 1..300: Codex gives up at 600, and an allow it never
+      # hears is a call that runs unchecked.
+      case "$_ab_budget" in ''|*[!0-9]*) _ab_budget=20 ;; esac
+      [ "$_ab_budget" -ge 1 ] 2>/dev/null || _ab_budget=20
+      [ "$_ab_budget" -le 300 ] || _ab_budget=300
       _ab_d=$(mktemp -d "${TMPDIR:-/tmp}/agentboard-hook.XXXXXX") || {
         printf 'BLOCKED: the agent board hook could not make a temp dir, so it cannot check this call.\n' >&2; exit 2; }
       AB_HOOK_CHILD=1 timeout -k 2 "$_ab_budget" "$0" hook-pretool --codex >"$_ab_d/out" 2>"$_ab_d/err"
       _ab_rc=$?
       _ab_why=""
-      case $_ab_rc in
-        0) if [ -s "$_ab_d/out" ] && ! python3 -c '
-import json, sys
-d = json.load(open(sys.argv[1]))
-h = d["hookSpecificOutput"]
-assert h["permissionDecision"] == "deny" and h["permissionDecisionReason"].strip()' "$_ab_d/out" 2>/dev/null; then
-             _ab_why="its answer was not a deny Codex accepts"
-           fi ;;
-        2) ;;
-        124) _ab_why="it ran past its ${_ab_budget}s budget" ;;
-        137) _ab_why="it was killed (exit 137), or ran past its ${_ab_budget}s budget" ;;
-        *) _ab_why="it failed with exit $_ab_rc" ;;
-      esac
+      if [ -s "$_ab_d/out" ]; then
+        _ab_why="it wrote an answer on stdout, which this gate never does (exit $_ab_rc)"
+      else
+        case $_ab_rc in
+          0) ;;
+          2) grep -q '[^[:space:]]' "$_ab_d/err" 2>/dev/null || _ab_why="it refused without a reason" ;;
+          124) _ab_why="it ran past its ${_ab_budget}s budget" ;;
+          137) _ab_why="it was killed (exit 137), or ran past its ${_ab_budget}s budget" ;;
+          *) _ab_why="it failed with exit $_ab_rc" ;;
+        esac
+      fi
       if [ -n "$_ab_why" ]; then
         printf 'BLOCKED: the agent board gate could not decide on this call: %s.\n' "$_ab_why" >&2
         printf 'The gates fail closed. Tell the user; they can check  agentboard check  and retry.\n' >&2
         [ -s "$_ab_d/err" ] && { printf '\nThe gate said:\n' >&2; head -c 2000 "$_ab_d/err" >&2; }
         rm -rf "$_ab_d"; exit 2
       fi
-      cat "$_ab_d/out"; cat "$_ab_d/err" >&2
+      [ "$_ab_rc" = 2 ] && cat "$_ab_d/err" >&2
       rm -rf "$_ab_d"; exit "$_ab_rc"
+    fi
+    # Debugging a host's payloads: AGENT_BOARD_HOOK_LOG=<file> in the agent's
+    # environment appends each hook's stdin there, one line per call. For the
+    # Codex gate this runs in the child, inside the budget.
+    if [ -n "${AGENT_BOARD_HOOK_LOG:-}" ]; then
+      _ab_in=$(cat)
+      printf '%s %s %s\t%s\n' "$(now_h 2>/dev/null)" "$AB_HOST" "$sub" "$(printf '%s' "$_ab_in" | tr '\n' ' ')" \
+        >> "$AGENT_BOARD_HOOK_LOG" 2>/dev/null
+      exec < <(printf '%s' "$_ab_in")
     fi ;;
 esac
 case "$sub" in
