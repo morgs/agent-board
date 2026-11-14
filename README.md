@@ -1067,19 +1067,26 @@ closed on their own side. What they do:
 - While the gate runs, `grep`, `sed`, `awk`, `cut`, `tr`, `sort`, `comm`,
   `head`, `tail`, `uniq`, `wc` and `python3` are shell functions that run the
   real tool and check its exit. An exit outside the tool's normal set (0; 1 for
-  grep; 1 and 3 for our own python answers; 141 when a reader stopped early)
-  leaves a flag file, also from a subshell or pipeline. On exit the gate turns
+  grep; 141 when a reader stopped early) leaves a flag file, also from a
+  subshell or pipeline. Python exits 1 on any uncaught exception, so a python
+  helper's own "no" answer (1 or 3) counts as normal only at the one call that
+  defines it; everywhere else, 1 is a failure. The dirty-path and dev-box
+  parsers must finish with 0: an empty answer then means "nothing", and a
+  failure refuses. On exit the gate turns
   any answer into a refusal that names the tool. A file that may be missing is
   tested before it is read, so its absence is not a failure. `git status` and
   `git diff --cached`, which the peer and vault checks read, are checked too.
   A signal (TERM, INT, HUP) to the gate is also a refusal.
-- `test/codex-hooks.sh` fails each call of each of these tools in turn, in six
-  calls the gate refuses (a peer-held file, a vault file, `git commit -a`,
-  `ansible-playbook` without the lock, `ansible-vault` without the lease, a
-  branch switch in a no-branch repo), and checks that every one stays refused.
+- `test/codex-hooks.sh` fails each call of each of these tools in turn with
+  exit 2, in seven calls the gate refuses (a peer-held file, a vault file,
+  `git commit -a`, `ansible-playbook` without the lock, `ansible-vault` without
+  the lease, a branch switch in a no-branch repo, an `ssh` to a dev box without
+  its lease), and checks that every one stays refused. It then makes each
+  `python3` call in those seven raise an exception (exit 1), with the same
+  check. Other exit codes of the other tools are not swept.
 - Not checked: other commands (`git rev-parse`, `ps`, `kill`, `date`, `stat`
   and the like) whose failure the code reads as an ordinary answer, such as "not
-  in a repo" or "that process is gone". The sweep covers the six calls above,
+  in a repo" or "that process is gone". The sweep covers the seven calls above,
   not every input. So this is not a proof that no failure can slip through.
 - Codex starts hooks with SIGPIPE ignored. The gate child gets the default back
   (`env --default-signal=PIPE`), so a writer that a reader cut short is not taken

@@ -237,7 +237,11 @@ for t in $INJ_TOOLS; do
 #!/bin/bash
 t=${0##*/}
 { flock 9; n=$(( $(cat "$INJ/n.$t" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$INJ/n.$t"; } 9>>"$INJ/lock"
-[ "$t" = "${INJ_TOOL:-}" ] && [ "$n" = "${INJ_K:-0}" ] && exit 2
+if [ "$t" = "${INJ_TOOL:-}" ] && [ "$n" = "${INJ_K:-0}" ]; then
+  # INJ_EXC=1: python3 raises an ordinary exception (exit 1) after it read stdin.
+  [ "$t" = python3 ] && [ "${INJ_EXC:-}" = 1 ] && exec "$INJ/real/python3" -c 'import sys; sys.stdin.buffer.read(); raise RuntimeError("injected")'
+  exit 2
+fi
 exec "$INJ/real/$t" "$@"
 SH
   chmod +x "$INJ/bin/$t"
@@ -246,17 +250,17 @@ export INJ
 inj_run() {   # inj_run <tool> <k> <tool name> <tool_input>: the gate child, call k of tool failing
   rm -f "$INJ"/n.*
   P=$(payload PreToolUse "$3" "$4")
-  OUT=$(cd "$D" && printf '%s' "$P" | INJ_TOOL=$1 INJ_K=$2 AB_HOOK_CHILD=1 PATH="$INJ/bin:$PATH" "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
+  OUT=$(cd "$D" && printf '%s' "$P" | INJ_TOOL=$1 INJ_K=$2 INJ_EXC=${INJ_EXC:-} AB_HOOK_CHILD=1 PATH="$INJ/bin:$PATH" "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
   ERR=$(cat "$T/err")
 }
 inj_n=0; inj_open=""
-inj_case() {   # inj_case <label> <tool name> <tool_input>
-  local t k n
+inj_case() {   # inj_case <label> <tool name> <tool_input> [tools to fail]
+  local t k n tools=${4:-$INJ_TOOLS}
   inj_run none 0 "$2" "$3"
   [ "$(decision)" = deny ] || { bad "fault sweep: $1 is not refused even with no fault (rc=$RC)"; return; }
   declare -A cnt=()
   for t in $INJ_TOOLS; do cnt[$t]=$(cat "$INJ/n.$t" 2>/dev/null || echo 0); done
-  for t in $INJ_TOOLS; do
+  for t in $tools; do
     n=${cnt[$t]}
     for ((k=1; k<=n; k++)); do
       inj_run "$t" "$k" "$2" "$3"; inj_n=$((inj_n+1))
@@ -270,8 +274,23 @@ inj_case 'git commit -a with a peer live' Bash "$(shell 'git commit -a -m x')"
 inj_case 'ansible-playbook without the lock' Bash "$(shell 'ansible-playbook site.yml')"
 inj_case 'ansible-vault edit without the lease' Bash "$(shell 'ansible-vault edit vault.yml')"
 inj_case 'git switch in a no-branch repo' Bash "$(shell 'git switch -c x')"
-[ -z "$inj_open" ] && [ "$inj_n" -gt 100 ] && ok "fault sweep: $inj_n single-call failures across 6 refused calls, every one still refused" \
+inj_case 'ssh to a dev box without its lease' Bash "$(shell "ssh bramble.dev.bbb.systems 'systemctl restart example'")"
+[ -z "$inj_open" ] && [ "$inj_n" -gt 100 ] && ok "fault sweep: $inj_n single-call failures (exit 2) across 7 refused calls, every one still refused" \
   || bad "fault sweep ($inj_n runs) let through:$inj_open"
+# The same calls, with each python3 call in turn raising an ordinary exception
+# (exit 1). Before #532, exit 1 was a normal python3 exit everywhere, and the
+# dirty-path and dev-box parsers read the failure as an empty answer.
+inj_n=0; inj_open=""; export INJ_EXC=1
+inj_case 'patch of a peer-held file' apply_patch "$(patch Update shared.yml)" python3
+inj_case 'patch of a vault file' apply_patch "$(patch Update vault.yml)" python3
+inj_case 'git commit -a with a peer live' Bash "$(shell 'git commit -a -m x')" python3
+inj_case 'ansible-playbook without the lock' Bash "$(shell 'ansible-playbook site.yml')" python3
+inj_case 'ansible-vault edit without the lease' Bash "$(shell 'ansible-vault edit vault.yml')" python3
+inj_case 'git switch in a no-branch repo' Bash "$(shell 'git switch -c x')" python3
+inj_case 'ssh to a dev box without its lease' Bash "$(shell "ssh bramble.dev.bbb.systems 'systemctl restart example'")" python3
+unset INJ_EXC
+[ -z "$inj_open" ] && [ "$inj_n" -gt 10 ] && ok "fault sweep: $inj_n python3 exceptions (exit 1) across 7 refused calls, every one still refused" \
+  || bad "python3 exception sweep ($inj_n runs) let through:$inj_open"
 # ...and with no fault, an ordinary call still passes through the shims.
 inj_run none 0 Bash "$(shell 'git status')"
 [ "$(decision)" = allow ] && ok '    with no fault, git status still passes' || bad "sweep control: rc=$RC err=$ERR"
