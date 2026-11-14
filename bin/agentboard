@@ -21,6 +21,8 @@
 #   agentboard paths                files I am sitting on, and anyone overlapping
 #   agentboard editing <path>...    declare a file as mine (agents without hooks)
 #   agentboard worktrees            worktrees whose branch is merged (safe to remove)
+#   agentboard worktrees --clean    run that printed cleanup for each MERGED-and-clean one
+#   agentboard worktrees --dry-run  print what --clean would do, and do nothing
 #   agentboard workspace            which repos here are worked which way
 #
 # Dev environments — a shared box is one database and one app, one tester at a time:
@@ -1745,8 +1747,10 @@ cmd_paths() {
 # --- worktree lifecycle ----------------------------------------------------
 # A worktree exists so one agent can branch while another holds the main
 # checkout. Once its branch is merged it is dead weight, and the next agent that
-# needs a tree should reuse the slot rather than pile up another. Reported only,
-# never removed: a worktree can hold uncommitted work the board never saw.
+# needs a tree should reuse the slot rather than pile up another. The report only
+# prints the cleanup. `--clean` runs exactly that cleanup for the MERGED-and-clean
+# verdicts and nothing else: a worktree can hold work the board never saw, so
+# anything dirty, unmerged, untracked or ignored-but-not-a-cache is skipped.
 default_branch() {
   local repo=$1 b
   b=$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
@@ -1767,58 +1771,109 @@ live_repo_dirs() {
   done
 }
 
-worktrees_report() {   # worktrees_report <repo> [only-this-path]
-  local repo=$1 only=${2:-} base
+worktrees_report() {   # worktrees_report <repo> [only-this-path] [report|dry|clean]
+  local repo=$1 only=${2:-} mode=${3:-report} base self=""
   base=$(default_branch "$repo")
   [ -n "$base" ] || return 0
+  # --clean is run by the agent that made the worktree, so its own session is not
+  # "an agent working here". Its tree counts as live only while it stands in it.
+  if [ "$mode" != report ]; then
+    self=$(find_file 2>/dev/null) && self=$(get_field "$self" repo)
+  fi
   # A stale local main hides a merge, so test against a fresh origin as well.
   GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch -q origin 2>/dev/null
   WT="$(git -C "$repo" worktree list --porcelain 2>/dev/null)" \
   MERGED="$(git -C "$repo" branch --merged "$base" --format='%(refname:short)' 2>/dev/null
             git -C "$repo" branch --merged "origin/$base" --format='%(refname:short)' 2>/dev/null)" \
-  LIVE="$(live_repo_dirs)" ONLY="$only" BASE="$base" REPO="$repo" python3 <<'PY'
-import json, os, shutil, subprocess
+  LIVE="$(live_repo_dirs)" ONLY="$only" BASE="$base" MODE="$mode" SELF="$self" \
+  HERE="$(pwd -P)" python3 <<'PY'
+import json, os, shutil, subprocess, sys
 
 base = os.environ["BASE"]
-repo = os.environ["REPO"]
+mode = os.environ["MODE"]          # report | dry | clean
 merged = {b.strip() for b in os.environ["MERGED"].splitlines() if b.strip()}
 
-def merged_pr(br):
-    """A squash merge, a cherry-pick or a merge into another branch (19.0-dev)
-    leaves no ancestry for `git branch --merged` to see; GitHub still knows."""
+def git(*args, cwd=None):
+    return subprocess.run(["git"] + list(args), cwd=cwd, capture_output=True, text=True)
+
+def gh(main, *args):
+    """gh run in the main checkout, so it resolves that repo. None if gh is
+    missing, fails or answers with something that is not JSON."""
     if not shutil.which("gh"):
         return None
     try:
-        r = subprocess.run(["gh", "pr", "list", "--head", br, "--state", "merged",
-                            "--json", "number,baseRefName", "--limit", "1"],
-                           cwd=repo, capture_output=True, text=True, timeout=20)
-        prs = json.loads(r.stdout or "[]") if r.returncode == 0 else []
-    except (subprocess.SubprocessError, ValueError):
+        r = subprocess.run(["gh"] + list(args), cwd=main, capture_output=True,
+                           text=True, timeout=20,
+                           env=dict(os.environ, GH_PROMPT_DISABLED="1"))
+        return json.loads(r.stdout or "[]") if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
         return None
+
+def merged_pr(main, br):
+    """A squash merge, a cherry-pick or a merge into another branch (19.0-dev)
+    leaves no ancestry for `git branch --merged` to see; GitHub still knows."""
+    prs = gh(main, "pr", "list", "--head", br, "--state", "merged",
+             "--json", "number,baseRefName", "--limit", "1")
     return prs[0] if prs else None
 
-def cherry_picked(br):
+def cherry_picked(main, br):
     """Commits landed on the base by cherry-pick, with no PR: `git cherry` marks a
     commit `-` when an equivalent patch is already upstream. Every one `-` means
     nothing on the branch is left to lose."""
     up = "origin/" + base
-    if subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", up],
-                      capture_output=True).returncode != 0:
+    if git("-C", main, "rev-parse", "--verify", "--quiet", up).returncode != 0:
         up = base
-    r = subprocess.run(["git", "-C", repo, "cherry", up, br],
-                       capture_output=True, text=True)
+    r = git("-C", main, "cherry", up, br)
     marks = [l[:1] for l in r.stdout.splitlines() if l.strip()]
     return r.returncode == 0 and bool(marks) and set(marks) == {"-"}
 
 def is_dirty(path):
-    return bool(subprocess.run(["git", "-C", path, "status", "--porcelain"],
-                               capture_output=True, text=True).stdout.strip())
+    return bool(git("-C", path, "status", "--porcelain").stdout.strip())
 
-def cleanup(path, br, flag):
+# `git worktree remove` without --force still deletes ignored files, and a local DB
+# copy or an .env is usually ignored. Only caches that rebuild themselves may go.
+CACHES = {"__pycache__", "node_modules", ".pytest_cache", ".mypy_cache",
+          ".ruff_cache", ".tox", ".venv", "venv", ".DS_Store", ".eslintcache",
+          ".next", ".parcel-cache"}
+def ignored_keep(path):
+    out = git("-C", path, "status", "--porcelain", "--ignored").stdout
+    keep = []
+    for l in out.splitlines():
+        if not l.startswith("!! "):
+            continue
+        p = l[3:].rstrip("/")
+        parts = p.split("/")
+        if any(x in CACHES for x in parts) or p.endswith((".pyc", ".pyo")):
+            continue
+        keep.append(p)
+    return keep
+
+def cleanup(main, path, br, flag):
     return ("git worktree remove %s && git -C %s branch %s %s && git -C %s push origin --delete %s"
-            % (path, repo, flag, br, repo, br))
+            % (path, main, flag, br, main, br))
+
+def remote_verdict(main, br):
+    """(delete?, why not). The report always prints the remote delete; --clean
+    runs it only when the branch is on origin and no open PR is based on it:
+    deleting the base of an open PR makes GitHub close that PR."""
+    r = git("-C", main, "ls-remote", "--exit-code", "--heads", "origin", br)
+    if r.returncode == 2:
+        return False, "not on origin"
+    if r.returncode != 0:
+        return False, "origin could not be read, so origin/%s is left" % br
+    ups = gh(main, "pr", "list", "--base", br, "--state", "open",
+             "--json", "number", "--limit", "20")
+    if ups is None:
+        return False, "GitHub could not say whether an open PR is based on it, so origin/%s is left" % br
+    if ups:
+        return False, "origin/%s is left: open PR %s is based on it" % (
+            br, ", ".join("#%s" % u["number"] for u in ups))
+    return True, ""
+
 live = {d.strip() for d in os.environ["LIVE"].splitlines() if d.strip()}
 only = os.environ["ONLY"].rstrip("/")
+self_repo = os.environ["SELF"].rstrip("/")
+here = os.environ["HERE"].rstrip("/")
 
 trees, cur = [], None
 for line in os.environ["WT"].splitlines():
@@ -1828,12 +1883,18 @@ for line in os.environ["WT"].splitlines():
     elif line.startswith("branch ") and cur is not None:
         cur["branch"] = line.split(" ", 1)[1].replace("refs/heads/", "")
 
+# Branch commands run in the main checkout: run from inside a linked worktree,
+# `git -C <that worktree>` would point at the tree being removed.
+main = trees[0]["path"].rstrip("/") if trees else ""
+
+# Each row: (path, branch, note, flag). flag is "-d" or "-D" for a MERGED-and-clean
+# verdict, the only kind --clean acts on; None for every other verdict.
 rows = []
 # Agents are told to take `../<repo>-<name>`, so a sibling of the main checkout is
 # one of ours. Everything else — another agent tool's own worktree directory,
 # .claude/worktrees/..., a scratchpad under /private/tmp — belongs to that tool,
 # which keeps its own state about it. Reported, never recommended for removal.
-ours = os.path.dirname(trees[0]["path"].rstrip("/")) if trees else ""
+ours = os.path.dirname(main)
 
 for i, t in enumerate(trees):
     if i == 0:
@@ -1842,47 +1903,123 @@ for i, t in enumerate(trees):
     if only and path != only:
         continue
     br = t["branch"] or "(detached)"
-    if path in live:
-        rows.append((path, br, "an agent is working here"))
+    mine = mode != "report" and path == self_repo
+    if mode != "report" and (here == path or here.startswith(path + "/")):
+        rows.append((path, br, "you are standing in it — cd %s and run it again" % main, None))
+    elif path in live and not mine:
+        rows.append((path, br, "an agent is working here", None))
     elif os.path.dirname(path) != ours:
         note = "another tool manages this one — leave it to that tool"
         if br in merged and br != base:
             note += " (its branch is merged)"
-        rows.append((path, br, note))
+        rows.append((path, br, note, None))
     elif br in merged and br != base:
         if is_dirty(path):
-            rows.append((path, br, "branch merged BUT the tree is dirty — look before removing"))
+            rows.append((path, br, "branch merged BUT the tree is dirty — look before removing", None))
         else:
-            rows.append((path, br, "MERGED and clean -> " + cleanup(path, br, "-d")))
-    elif br != "(detached)" and (pr := merged_pr(br)):
+            rows.append((path, br, "MERGED and clean -> " + cleanup(main, path, br, "-d"), "-d"))
+    elif br != "(detached)" and (pr := merged_pr(main, br)):
         how = "MERGED via PR #%s into %s" % (pr["number"], pr["baseRefName"])
         if is_dirty(path):
-            rows.append((path, br, how + " BUT the tree is dirty — look before removing"))
+            rows.append((path, br, how + " BUT the tree is dirty — look before removing", None))
         else:
             # -D, because git sees no ancestry; the merged PR is the proof.
-            rows.append((path, br, how + " and clean -> " + cleanup(path, br, "-D")))
-    elif br != "(detached)" and cherry_picked(br):
+            rows.append((path, br, how + " and clean -> " + cleanup(main, path, br, "-D"), "-D"))
+    elif br != "(detached)" and cherry_picked(main, br):
         how = "MERGED by cherry-pick: every commit is already on %s" % base
         if is_dirty(path):
-            rows.append((path, br, how + " BUT the tree is dirty — look before removing"))
+            rows.append((path, br, how + " BUT the tree is dirty — look before removing", None))
         else:
-            rows.append((path, br, how + " and clean -> " + cleanup(path, br, "-D")))
+            rows.append((path, br, how + " and clean -> " + cleanup(main, path, br, "-D"), "-D"))
     else:
-        rows.append((path, br, "branch not merged into %s yet" % base))
+        rows.append((path, br, "branch not merged into %s yet" % base, None))
 
+home = os.path.expanduser("~")
+def short(p):
+    return p.replace(home, "~", 1) if p.startswith(home) else p
+
+if mode == "report":
+    if not rows:
+        if not only:
+            print("no worktrees besides the main checkout")
+    else:
+        for path, br, note, _ in rows:
+            print("  %s  [%s]  %s" % (short(path), br, note))
+    sys.exit(0)
+
+# --clean / --dry-run: one line per worktree, and only the printed cleanup is run.
 if not rows:
-    if not only:
-        print("no worktrees besides the main checkout")
-else:
-    for path, br, note in rows:
-        print("  %s  [%s]  %s" % (path.replace(os.path.expanduser("~"), "~"), br, note))
+    print("no worktrees besides the main checkout")
+    sys.exit(0)
+failed = False
+for path, br, note, flag in rows:
+    item = "%s [%s]" % (short(path), br)
+    if flag is None:
+        print("skipped  %s  (%s)" % (item, note.replace("MERGED and clean -> ", "")))
+        continue
+    keep = ignored_keep(path)
+    if keep:
+        print("skipped  %s  (ignored files that are not a cache: %s%s — look, then remove it yourself)"
+              % (item, ", ".join(keep[:3]), " …" if len(keep) > 3 else ""))
+        continue
+    rdel, rwhy = remote_verdict(main, br)
+    steps = ["git worktree remove %s" % path, "git -C %s branch %s %s" % (main, flag, br)]
+    if rdel:
+        steps.append("git -C %s push origin --delete %s" % (main, br))
+    if mode == "dry":
+        print("would remove  %s  %s%s" % (item, " && ".join(steps),
+                                         "  (%s)" % rwhy if rwhy else ""))
+        continue
+    # As the printed && chain: stop at the first step that fails. No --force, and
+    # never -D where the verdict said -d.
+    r = git("-C", main, "worktree", "remove", path)
+    if r.returncode != 0:
+        failed = True
+        print("skipped  %s  (git worktree remove refused: %s)"
+              % (item, " ".join(r.stderr.strip().splitlines()[-1:]) or "?"))
+        continue
+    r = git("-C", main, "branch", flag, br)
+    if r.returncode != 0:
+        failed = True
+        print("stopped  %s  (worktree removed, but git branch %s failed: %s)"
+              % (item, flag, " ".join(r.stderr.strip().splitlines()[-1:])))
+        continue
+    done = "worktree, branch %s" % br
+    if rdel:
+        r = git("-C", main, "push", "origin", "--delete", br)
+        if r.returncode != 0:
+            failed = True
+            print("stopped  %s  (%s removed, but the push to delete origin/%s failed: %s)"
+                  % (item, done, br, " ".join(r.stderr.strip().splitlines()[-1:])))
+            continue
+        done += ", origin/%s" % br
+    print("removed  %s  (%s%s)" % (item, done, "; " + rwhy if rwhy else ""))
+sys.exit(1 if failed else 0)
 PY
 }
 
-cmd_worktrees() {
-  local repo; repo=$(repo_of "${1:-$PWD}")
+cmd_worktrees() {   # cmd_worktrees [--clean|--dry-run] [dir]
+  local mode=report dry=0 dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --clean)   mode=clean ;;
+      --dry-run) dry=1 ;;
+      -h|--help)
+        printf 'usage: agentboard worktrees [--clean [--dry-run]] [dir]\n'
+        printf '  no flag    report each worktree and its verdict\n'
+        printf '  --clean    run the printed cleanup for each MERGED-and-clean worktree\n'
+        printf '  --dry-run  print what --clean would do, and do nothing\n'
+        return 0 ;;
+      -*) printf 'unknown flag: %s\n' "$1" >&2; return 1 ;;
+      *)  dir=$1 ;;
+    esac
+    shift
+  done
+  # --dry-run, alone or with --clean, acts on nothing.
+  [ "$dry" = 1 ] && mode=dry
+  local repo; repo=$(repo_of "${dir:-$PWD}")
   [ -n "$repo" ] || { printf 'not in a git repo\n' >&2; return 1; }
-  worktrees_report "$repo"
+  worktrees_report "$repo" "" "$mode"
 }
 
 worktree_hint() { worktrees_report "$1" "$1"; }
@@ -3570,6 +3707,122 @@ PY
   exit 0
 }
 
+# --- stacked PRs: merging the lower one must not close the upper one ----------
+# In a hand-chained stack the upper PR has the lower PR's head branch as its base.
+# `gh pr merge <lower> --delete-branch` deletes that branch, and GitHub then
+# closes the upper PR; a reopen does not bring back a valid CI run. Asked of
+# GitHub only when the command is a gh pr merge that deletes the branch, in two
+# gh calls under a short timeout. Anything that goes wrong (no gh, offline, an
+# answer that is not JSON) lets the command through: this gate prevents one
+# mistake, it is not a reason to stop every merge when GitHub is slow.
+stacked_merge_uppers() {   # stacked_merge_uppers <cmd> <cwd> -> the refusal text, or nothing
+  CMD=$1 CWD=$2 python3 - <<'PY' 2>/dev/null || :
+import json, os, re, shlex, shutil, subprocess, sys
+
+def done(): sys.exit(0)
+try:
+    lex = shlex.shlex(os.environ["CMD"], posix=True, punctuation_chars=";&|()")
+    lex.whitespace_split = True
+    toks = list(lex)
+except ValueError:
+    done()
+
+# Split into simple commands; a leading `cd <dir>` sets where gh runs.
+cwd = os.environ.get("CWD") or os.getcwd()
+seg, segs = [], []
+for t in toks + [";"]:
+    if t and set(t) <= set(";&|()"):
+        if seg: segs.append(seg)
+        seg = []
+    else:
+        seg.append(t)
+
+VALUED = {"-A", "--author-email", "-b", "--body", "-F", "--body-file", "-t",
+          "--subject", "-R", "--repo", "--match-head-commit"}
+hit = None
+for s in segs:
+    if s[:1] == ["cd"] and len(s) > 1:
+        cwd = os.path.join(cwd, os.path.expanduser(s[1]))
+        continue
+    i = 0
+    while i < len(s) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", s[i]):
+        i += 1                          # FOO=bar gh pr merge ...
+    if s[i:i+3] != ["gh", "pr", "merge"]:
+        continue
+    args, repo, pr, delete = s[i+3:], None, None, False
+    j = 0
+    while j < len(args):
+        a = args[j]
+        if a == "--":
+            if j + 1 < len(args) and pr is None: pr = args[j+1]
+            break
+        if a.startswith("--delete-branch"):
+            delete = a in ("--delete-branch", "--delete-branch=true")
+        elif a.startswith("--repo="):
+            repo = a.split("=", 1)[1]
+        elif a in VALUED:
+            if a in ("-R", "--repo") and j + 1 < len(args): repo = args[j+1]
+            j += 1
+        elif a.startswith("-R") and len(a) > 2:
+            repo = a[2:]
+        elif re.match(r"^-[dmrs]+$", a):
+            if "d" in a: delete = True
+        elif a.startswith("-"):
+            pass
+        elif pr is None:
+            pr = a
+        j += 1
+    if delete:
+        hit = (repo, pr, cwd)
+        break
+if not hit or not shutil.which("gh"):
+    done()
+repo, pr, cwd = hit
+if not os.path.isdir(cwd):
+    cwd = os.environ.get("CWD") or os.getcwd()
+
+def gh(*a):
+    r = subprocess.run(["gh"] + list(a), cwd=cwd, capture_output=True, text=True,
+                       timeout=6, env=dict(os.environ, GH_PROMPT_DISABLED="1"))
+    if r.returncode != 0: done()
+    return json.loads(r.stdout)
+
+try:
+    view = ["pr", "view"] + ([pr] if pr else []) + (["-R", repo] if repo else [])
+    v = gh(*view, "--json", "number,headRefName,baseRefName,url,isCrossRepository")
+    if not isinstance(v, dict) or v.get("isCrossRepository"): done()
+    head, lbase = v.get("headRefName"), v.get("baseRefName") or "main"
+    m = re.match(r"https://[^/]+/([^/]+/[^/]+)/pull/\d+", v.get("url") or "")
+    if not head or not m: done()
+    nwo = m.group(1)
+    ups = gh("pr", "list", "-R", nwo, "--base", head, "--state", "open",
+             "--json", "number,title", "--limit", "20")
+except Exception:
+    done()
+if not isinstance(ups, list) or not ups:
+    done()
+lines = ["STACKED PR: merging #%s with --delete-branch would close the PR(s) built on it." % v.get("number"), "",
+         "These open PRs have %s (its head branch) as their base:" % head]
+lines += ["  #%s  %s" % (u.get("number"), u.get("title", "")) for u in ups]
+lines += ["", "Deleting %s makes GitHub close them, and a reopen does not start a valid CI run." % head,
+          "Retarget each one first, then merge:", ""]
+lines += ["  gh api -X PATCH repos/%s/pulls/%s -f base=%s" % (nwo, u.get("number"), lbase) for u in ups]
+lines += ["", "or merge without --delete-branch and delete %s once nothing is based on it." % head,
+          "Then  gh pr update-branch <upper>  starts CI on the new base.",
+          "Team reference: akili/docs/GitHub-Stacked-PRs.md"]
+print("\n".join(lines))
+PY
+}
+
+gate_stacked_merge() {   # gate_stacked_merge <scan> <cmd> <cwd>: refuses, or returns
+  m "$1" '(^|[;&|(])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)' || return 0
+  m "$1" -- '(^|[[:space:]])(--delete-branch|-[dmrs]*d[dmrs]*)([[:space:]=]|$)' || return 0
+  local why; why=$(stacked_merge_uppers "$2" "$3")
+  [ -n "$why" ] || return 0
+  printf '%s\n' "$why" >&2
+  exit 2
+}
+
 # What the gates match on. Two kinds of text in a command line are DATA, not
 # commands, and matching them produced false positive after false positive:
 #   - heredoc bodies      (a commit message or a doc that mentions "git commit")
@@ -3895,6 +4148,9 @@ EOF
       printf 'If the box name is wrong for this command, prefix AGENT_BOARD_OVERRIDE=1.\n'; } >&2
     exit 2
   done
+
+  # (2d) The lower PR of a hand-chained stack, merged with --delete-branch.
+  gate_stacked_merge "$scan" "$cmd" "$cwd"
 
   repo=$(repo_of "${cwd:-$PWD}")
   [ -n "$repo" ] || exit 0
