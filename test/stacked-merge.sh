@@ -89,6 +89,13 @@ grep -q 'pr list -R acme/app --base feat/lower --state open' "$GH_LOG" && ok 'as
 run stacked 'cd /tmp && gh pr merge 5 --delete-branch' 2
 run stacked 'GH_REPO=acme/app gh pr merge 5 --delete-branch' 2
 
+GH_MODE=stacked; : > "$GH_LOG"
+payload=$(CWD="$R" CMD='gh pr merge 5 --delete-branch' python3 -c \
+  'import json,os;print(json.dumps({"cwd":os.environ["CWD"],"tool_name":"Bash","tool_input":{"command":os.environ["CMD"]}}))')
+OUT=$(printf '%s' "$payload" | (cd "$R" && PATH="$T/bin:$PATH" "$AB" hook-pretool --codex) 2>&1 >/dev/null); got=$?
+[ "$got" = 2 ] && ok '(2) under Codex hooks too' || bad "under --codex: want 2 got $got"
+want 'with the same reason'          'gh api -X PATCH repos/acme/app/pulls/6' "$OUT"
+
 echo
 echo 'allowed'
 run none    'gh pr merge 5 --merge --delete-branch' 0
