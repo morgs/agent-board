@@ -195,7 +195,7 @@ is_my_ancestor() {   # is_my_ancestor <pid>
 cc_meta() {   # cc_meta <pid> <key>
   local j="${AGENT_BOARD_CC_SESSIONS:-$HOME/.claude/sessions}/$1.json"
   [ -f "$j" ] || return 1
-  python3 -c '
+  AB_PY_OK=1 python3 -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -756,9 +756,10 @@ ws_list() {   # ws_list <section> -> the repo names in it, one per line
 # subshell. So, while hook_pretool runs, each of these tools is a function that
 # runs the real one and, on an exit outside its normal set, appends a line to a
 # flag file; hook_pretool's EXIT trap refuses the call when the flag is there.
-# Normal: 0 for all; 1 for grep (no match) and python3 (our own "no" answer);
-# 3 for python3 (our "nothing readable" answer, which the callers refuse); 141,
-# SIGPIPE, when a reader such as head -1 stopped early. A read of a file that
+# Normal: 0 for all; 1 for grep (no match); 141, SIGPIPE, when a reader such as
+# head -1 stopped early. python3 exits 1 on any uncaught exception, so a python
+# helper's own "no" answer is normal only at the call that defines it: that call
+# names its answer codes in AB_PY_OK (AB_PY_OK=1 python3 ...). A read of a file that
 # may be missing tests for the file first, so an error exit is a real failure.
 ab_tool_failed() {   # ab_tool_failed <what> <exit>: record it, inside the gate only
   [ -n "${AB_CHECK_FAIL:-}" ] || return 0
@@ -770,7 +771,11 @@ ab_check_tools() {
     eval "$t() {
       command $t \"\$@\"
       local rc=\$?
-      case $t:\$rc in *:0|*:141|grep:1|python3:1|python3:3) ;; *) ab_tool_failed $t \$rc ;; esac
+      case $t:\$rc in
+        *:0|*:141|grep:1) ;;
+        python3:*) case \" \${AB_PY_OK:-} \" in *\" \$rc \"*) ;; *) ab_tool_failed $t \$rc ;; esac ;;
+        *) ab_tool_failed $t \$rc ;;
+      esac
       return \$rc
     }"
   done
@@ -837,7 +842,7 @@ while i < len(recs):
         if i < len(recs) and recs[i]:
             print(recs[i].decode("utf-8", "replace"))
         i += 1
-' 2>/dev/null)
+' 2>/dev/null) || ab_tool_failed "the dirty-path parser" $?
   fi
   [ -n "$_DIRTY_VAL" ] && printf '%s\n' "$_DIRTY_VAL"
   return 0
@@ -3529,7 +3534,7 @@ PATCH_TOOLS='apply_patch|Edit|Write|MultiEdit|NotebookEdit'
 # cannot be read, anything else if the parser itself failed. Fail closed on all
 # but 0.
 tool_command() {
-  SHELL_TOOLS=$SHELL_TOOLS python3 -c '
+  SHELL_TOOLS=$SHELL_TOOLS AB_PY_OK=3 python3 -c '
 import json, os, shlex, sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit(3)
@@ -3560,7 +3565,7 @@ print(c)'
 # trimmed, then the marker. Exit 3 for a patch that names no file the hook can
 # read, so the caller refuses it rather than let an unread patch through.
 patch_paths() {   # stdin = hook payload
-  SHELL_TOOLS=$SHELL_TOOLS python3 -c '
+  SHELL_TOOLS=$SHELL_TOOLS AB_PY_OK=3 python3 -c '
 import json, os, sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit(3)
@@ -3893,7 +3898,7 @@ allow_edit_file() { local p; p=$(agent_pid); printf '%s/allow-edit.%s' "$LOCKS" 
 allow_edit_take() {   # allow_edit_take <abs path>: 0 and spent if granted
   local f; f=$(allow_edit_file)
   [ -f "$f" ] || return 1
-  F=$f P=$1 python3 -c '
+  F=$f P=$1 AB_PY_OK=1 python3 -c '
 import fcntl, os, sys
 f, p = os.environ["F"], os.environ["P"]
 with open(f + ".lock", "a") as lk:
@@ -4138,7 +4143,10 @@ EOF
   # unleased box looks free to the next agent, who deploys over your test. A
   # box someone else holds was handled by (2b), so only a free one reaches here.
   local box
-  for box in $(dev_write_targets "$scan" "$cmd"); do
+  local boxes brc=0
+  boxes=$(dev_write_targets "$scan" "$cmd") || brc=$?
+  [ "$brc" = 0 ] || hook_refuse "the dev-box target parser failed, exit $brc"
+  for box in $boxes; do
     env_i_hold "$box" && continue
     env_owner "$box" >/dev/null 2>&1 && continue
     { printf 'LEASE FIRST: that command changes the %s dev box, and you do not hold its lease.\n\n' "$box"
