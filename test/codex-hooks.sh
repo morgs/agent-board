@@ -171,6 +171,45 @@ PATH=$OLDPATH
 mkdir -p "$T/grepshim"; printf '#!/bin/bash\nexit 2\n' > "$T/grepshim/grep"; chmod +x "$T/grepshim/grep"
 OUT=$(cd "$D" && payload PreToolUse Bash "$(shell 'git stash')" | AB_HOOK_CHILD=1 PATH="$T/grepshim:$PATH" "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
 [ "$RC" = 2 ] && grep -q 'pattern check failed' "$T/err" && ok 'a failing grep inside the gate: refused' || bad "grep fail rc=$RC $(cat "$T/err")"
+# Recheck 2: one gate grep fails and every other works. The shim fails only when
+# its arguments contain the given pattern, so no earlier guarded check catches it.
+grep_fails_on() {   # grep_fails_on <fixed string in the args>
+  mkdir -p "$T/grepone"
+  cat > "$T/grepone/grep" <<SH
+#!/bin/bash
+case "\$*" in *'$1'*) exit 2 ;; esac
+exec /usr/bin/grep "\$@"
+SH
+  chmod +x "$T/grepone/grep"
+}
+pre_gone() {   # pre_gone <tool> <tool_input>: pre, with only that grep failing
+  OUT=$(cd "$D" && payload PreToolUse "$1" "$2" | PATH="$T/grepone:$PATH" "$AB" hook-pretool --codex 2>"$T/err"); RC=$?
+  ERR=$(cat "$T/err")
+}
+grep_fails_on 'git[[:space:]]+commit'
+pre_gone Bash "$(shell 'git commit -a -m x')"
+[ "$(decision)" = deny ] && printf '%s' "$ERR" | grep -q 'pattern check failed' && ok 'only the commit-segment grep fails: git commit -a refused (recheck 2)' || bad "commit seg grep: rc=$RC err=$ERR"
+pre_gone Bash "$(shell 'git status')"
+[ "$(decision)" = deny ] && ok '    and a harmless command is refused too: the gate could not check it' || bad "commit seg grep, status: rc=$RC"
+grep_fails_on '-qxF'
+pre_gone apply_patch "$(patch Update shared.yml)"
+[ "$(decision)" = deny ] && printf '%s' "$ERR" | grep -q 'pattern check' && ok 'only the peer-path grep fails (in a pipeline): refused, not allowed' || bad "peer grep: rc=$RC err=$ERR"
+cat > "$T/grepone/grep" <<'SH'
+#!/bin/bash
+[ "$1" = -qx ] && exit 2
+exec /usr/bin/grep "$@"
+SH
+pre_gone apply_patch "$(patch Update shared.yml)"
+[ "$(decision)" = deny ] && printf '%s' "$ERR" | grep -q 'pattern check' && ok 'only the workspace-list grep fails: a peer-held file is refused' || bad "ws grep: rc=$RC err=$ERR"
+cat > "$T/grepone/grep" <<'SH'
+#!/bin/bash
+[ "$1" = -qF ] && exit 2
+exec /usr/bin/grep "$@"
+SH
+pre_gone apply_patch "$(patch Update vault.yml)"
+[ "$(decision)" = deny ] && ok 'only the vault-header grep fails: refused' || bad "vault grep: rc=$RC err=$ERR"
+ls -d "${TMPDIR:-/tmp}"/ab-pretool.* >/dev/null 2>&1 && bad 'the gate left a scratch directory' || ok '    the gate cleans up its scratch directory'
+
 # Claude side of hook_decide: a renderer that fails must not leave a silent allow.
 shim 'permissionDecisionReason": os.environ' 'exit 1'
 PATH="$T/shim:$PATH"

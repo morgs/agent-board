@@ -1062,9 +1062,13 @@ closed on their own side. What they do:
 - A payload that is not a JSON object with a `tool_name`, and a shell call
   (`Bash`, `shell`, `local_shell`, `exec_command`) whose command is missing or not
   a string or argv list: refused with exit 2.
-- A parser, the command scanner or a pattern match (`grep`) inside the gate that
-  exits with an error: refused with exit 2. This covers the failures the code
-  checks for; it is not a proof that no failure can slip through.
+- A parser or the command scanner inside the gate that exits with an error:
+  refused with exit 2. The `grep` calls that the gate decisions use (the command
+  patterns, the `git commit` segment, the peer, workspace and vault checks) go
+  through one helper. A grep error there leaves a flag file, also from a
+  subshell, and on exit the gate turns any answer into a refusal. A signal
+  (TERM, INT, HUP) to the gate is also a refusal. This covers the failures the
+  code checks for; it is not a proof that no failure can slip through.
 - Patch headers: each line is trimmed, then the marker
   (`*** Add File: `, `*** Update File: `, `*** Delete File: `, `*** Move to: `)
   is cut off, and the rest is the path, unchanged, as in Codex 0.169.0. A patch
@@ -1074,7 +1078,8 @@ closed on their own side. What they do:
   command gates. Any other tool name with a command goes through them.
 - Under `--codex`, PreToolUse runs the gate as a child under a time budget
   (`AGENT_BOARD_HOOK_BUDGET`, default 20 seconds, clamped to 1..300 so that it
-  stays below the 600 seconds Codex waits). The parent is plain bash. It passes
+  stays below the 600 seconds Codex waits). The parent is plain bash, with no
+  python and only short shell steps, but it has no deadline of its own. It passes
   on only two answers: exit 0 with nothing on stdout (allow), and exit 2 with a
   reason on stderr (deny). Anything else (a timeout, a kill, other exit codes,
   any stdout, exit 2 with a blank reason) becomes a refusal with a reason of its

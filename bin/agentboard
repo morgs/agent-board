@@ -749,8 +749,19 @@ ws_list() {   # ws_list <section> -> the repo names in it, one per line
   ini_section "$WORKSPACE" "$1" | tr -s '[:space:]' '\n' | grep . || true
 }
 
+# grep for the decisions a gate makes. Exit 1 is "no match"; exit 2 or more is a
+# failure. Many of these run in a pipeline or $( ), where an exit would leave only
+# that subshell, so a failure is recorded in a flag file instead, and hook_pretool
+# refuses the call when it sees the flag (see AB_GREP_FAIL there).
+gq() {
+  grep "$@"
+  local rc=$?
+  if [ "$rc" -gt 1 ] && [ -n "${AB_GREP_FAIL:-}" ]; then : > "$AB_GREP_FAIL"; fi
+  return "$rc"
+}
+
 ws_has() {   # ws_has <section> <repo name>
-  ws_list "$1" | grep -qx "$2"
+  ws_list "$1" | gq -qx "$2"
 }
 
 repo_policy() {
@@ -837,9 +848,9 @@ live_paths() {   # live_paths <pid> <repo> -> observed AND still uncommitted
   cand=$(awk -F'\t' -v r="$repo" 'NF==2 && $1==r {print $2}' "$pf" | sort -u)
   [ -n "$cand" ] || return 0
   dirty=$(dirty_paths "$repo"); [ -n "$dirty" ] || return 0
-  exact=$(printf '%s\n' "$dirty" | grep -v '/$')
-  dirs=$(printf '%s\n' "$dirty" | grep '/$')
-  out=$(printf '%s\n' "$cand" | grep -Fxf <(printf '%s\n' "$exact") 2>/dev/null)
+  exact=$(printf '%s\n' "$dirty" | gq -v '/$')
+  dirs=$(printf '%s\n' "$dirty" | gq '/$')
+  out=$(printf '%s\n' "$cand" | gq -Fxf <(printf '%s\n' "$exact") 2>/dev/null)
   # git reports an untracked DIRECTORY rather than the files inside it, so a file
   # we were seen to create in a brand-new directory only matches by prefix.
   if [ -n "$dirs" ]; then
@@ -850,7 +861,7 @@ live_paths() {   # live_paths <pid> <repo> -> observed AND still uncommitted
       done <<< "$cand"
     done <<< "$dirs"
   fi
-  printf '%s\n' "$out" | grep . | sort -u
+  printf '%s\n' "$out" | gq . | sort -u
   return 0
 }
 
@@ -881,7 +892,7 @@ vault_in_head() {   # vault_in_head <repo> <relpath>
   [ "$h" = "$VAULT_HDR" ]
 }
 vault_encrypted_now() {   # vault_encrypted_now <repo> <relpath>
-  head -c 14 "$1/$2" 2>/dev/null | grep -qF "$VAULT_HDR"
+  head -c 14 "$1/$2" 2>/dev/null | gq -qF "$VAULT_HDR"
 }
 vault_files() {   # vault_files <repo> -> encrypted-in-HEAD paths
   git -C "$1" grep -l -F -e "$VAULT_HDR" HEAD -- . 2>/dev/null | sed 's/^HEAD://' |
@@ -952,7 +963,7 @@ env_i_hold() {   # env_i_hold <name>
 # bbb-xn-vm-odoo-dev-bramble, bramble.dev.bbb.systems), which is the name people
 # lease. Shared and prod names are left out: no single test cycle owns them.
 dev_write_targets() {
-  printf '%s' "$1" | grep -Eq 'amafu[[:space:]]+deploy|odoo_dev_refresh|ssh[[:space:]]' || return 0
+  printf '%s' "$1" | gq -Eq 'amafu[[:space:]]+deploy|odoo_dev_refresh|ssh[[:space:]]' || return 0
   SCAN=$1 CMD=$2 python3 -c '
 import os, re
 scan, cmd = os.environ["SCAN"], os.environ["CMD"]
@@ -3577,7 +3588,7 @@ m() {
   local subject=$1
   shift
   [ "$1" = "--" ] && shift
-  printf '%s' "$subject" | grep -Eq -- "$1"
+  printf '%s' "$subject" | gq -Eq -- "$1"
   local rc=$?
   [ "$rc" -le 1 ] && return "$rc"
   [ -n "${AB_IN_PRETOOL:-}" ] && hook_refuse "a pattern check failed (grep exit $rc)"
@@ -3591,7 +3602,9 @@ whole_tree_op() {
   # Only the commit's own arguments count: `git commit -m x && git log --all`
   # names its paths, and the --all belongs to the log.
   local seg
-  seg=$(printf '%s' "$1" | grep -oE '(^|[;&|(])[[:space:]]*git[[:space:]]+commit([[:space:]][^;&|)]*)?' 2>/dev/null)
+  seg=$(printf '%s' "$1" | gq -oE '(^|[;&|(])[[:space:]]*git[[:space:]]+commit([[:space:]][^;&|)]*)?' 2>/dev/null)
+  local src=$?   # 1 is "no git commit here"; more is a failure (gq flags it too)
+  [ "$src" -le 1 ] || { [ -n "${AB_IN_PRETOOL:-}" ] && hook_refuse "a pattern check failed (grep exit $src)"; return 0; }
   [ -n "$seg" ] && m "$seg" -- '(^|[[:space:]])(-a|-am|-ma|--all)([[:space:]]|$)' && return 0
   m "$1" '(^|[;&|(])[[:space:]]*git[[:space:]]+add[[:space:]]+(-A|--all|\.|:/)([[:space:]]|$)' && return 0
   m "$1" '(^|[;&|(])[[:space:]]*git[[:space:]]+reset[[:space:]]+--hard([[:space:]]|$)' && return 0
@@ -3678,7 +3691,7 @@ gate_file_write() {
     [ "$(get_field "$f" repo)" = "$repo" ] || continue
     [ -n "$me" ] && [ "$f" = "$me" ] && continue
     pid=$(get_field "$f" pid)
-    if live_paths "$pid" "$repo" | grep -qxF "$rel"; then
+    if live_paths "$pid" "$repo" | gq -qxF -- "$rel"; then
       owners="$owners, $(label_of "$f")"; n=$((n+1))
     fi
   done
@@ -3722,6 +3735,21 @@ hook_pretool() {
   local payload tool cmd cwd scan repo policy conflicts path
   payload=$(cat)
   AB_IN_PRETOOL=1
+  # A gate grep that fails anywhere, even in a subshell, leaves this flag, and
+  # the EXIT trap turns whatever answer follows into a refusal.
+  local fd
+  fd=$(mktemp -d "${TMPDIR:-/tmp}/ab-pretool.XXXXXX" 2>/dev/null) && [ -d "$fd" ] \
+    || hook_refuse "the gate could not make its scratch directory"
+  AB_GREP_FAIL=$fd/grep-failed
+  trap '_ab_rc=$?; _ab_f=0; [ -e "$AB_GREP_FAIL" ] && _ab_f=1; rm -rf "${AB_GREP_FAIL%/*}"
+    if [ "$_ab_f" = 1 ] && [ "$_ab_rc" != 2 ]; then
+      printf "BLOCKED: a pattern check inside the agent board gate failed, so it could not decide on this call.\nThe gates fail closed: a call they cannot check is refused, not let through.\n" >&2
+      exit 2
+    fi
+    exit "$_ab_rc"' EXIT
+  # A signal would skip the EXIT trap and leave the scratch dir; exit through it,
+  # as a refusal.
+  trap 'printf "BLOCKED: the agent board gate was interrupted before it could decide.\n" >&2; exit 2' TERM INT HUP
   printf '%s' "$payload" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -4020,7 +4048,8 @@ case "$sub" in
     # Codex does not block a tool call when its PreToolUse hook times out,
     # crashes or answers in a form it cannot use: the call runs. So the Codex
     # gate runs as a child under a time budget, and this parent, which runs no
-    # python and nothing that can stall, passes on exactly two results:
+    # python and only short shell steps (it has no deadline of its own, so a host
+    # too slow for Codex's 600 s can still beat it), passes on exactly two results:
     #   exit 0 with nothing on stdout  -> allow
     #   exit 2 with a reason on stderr -> refuse
     # Anything else (a timeout, a kill, any stdout, exit 2 without a reason) is
@@ -4034,7 +4063,9 @@ case "$sub" in
       [ "$_ab_budget" -le 300 ] || _ab_budget=300
       _ab_d=$(mktemp -d "${TMPDIR:-/tmp}/agentboard-hook.XXXXXX") || {
         printf 'BLOCKED: the agent board hook could not make a temp dir, so it cannot check this call.\n' >&2; exit 2; }
-      AB_HOOK_CHILD=1 timeout -k 2 "$_ab_budget" "$0" hook-pretool --codex >"$_ab_d/out" 2>"$_ab_d/err"
+      # TMPDIR inside our dir: a child killed outright cannot clean its own
+      # scratch, so the rm -rf below does it.
+      AB_HOOK_CHILD=1 TMPDIR="$_ab_d" timeout -k 2 "$_ab_budget" "$0" hook-pretool --codex >"$_ab_d/out" 2>"$_ab_d/err"
       _ab_rc=$?
       _ab_why=""
       if [ -s "$_ab_d/out" ]; then
