@@ -985,11 +985,14 @@ env_i_hold() {   # env_i_hold <name>
 # bbb-xn-vm-odoo-dev-bramble, bramble.dev.bbb.systems), which is the name people
 # lease. Shared and prod names are left out: no single test cycle owns them.
 dev_write_targets() {
-  printf '%s' "$1" | grep -Eq 'amafu[[:space:]]+deploy|odoo_dev_refresh|ssh[[:space:]]' || return 0
+  printf '%s' "$2" | grep -Eq 'amafu[[:space:]]+deploy|odoo_dev_refresh|ssh[[:space:]]' || return 0
   SCAN=$1 CMD=$2 python3 -c '
-import os, re
+import os, re, shlex
 scan, cmd = os.environ["SCAN"], os.environ["CMD"]
 SKIP = {"prod", "preprod", "website", "staging", "clearance", "dev", "worker", "main", ""}
+DEVHOST = re.compile(r"([a-z0-9-]+\.dev\.(?:bbb|asuer)\.systems|(?:bbb|asuer)-xn-vm-odoo-dev-[a-z0-9]+)")
+CHANGE = re.compile(r"odoo-upgrade|amafu-deploy|deploy\.sh|systemctl\s+(re)?start|systemctl\s+stop|"
+                    r"service\s+\S+\s+(re)?start|git\s+(pull|reset|checkout|merge)")
 def box(name):
     name = re.sub(r"\.dev\.(bbb|asuer)\.systems$", "", name.lower())
     name = re.sub(r"-insights$", "", name)
@@ -999,25 +1002,177 @@ def box(name):
         t = "dev" + m.group(1)
     return None if t in SKIP or not re.fullmatch(r"[a-z][a-z0-9]*", t) else t
 out = []
-# amafu deploy [opts] <env>; a --check run deploys nothing.
-for m in re.finditer(r"(?:^|[;&|(\s])amafu\s+deploy\s+([^;&|]*)", scan):
-    args = m.group(1).split()
-    if "--check" in args:
-        continue
-    env = next((a for a in args if not a.startswith("-")), "")
-    out.append(box(env))
-# the dev refresh play, by its -l / --limit hosts
-if re.search(r"ansible-playbook\b", scan) and "odoo_dev_refresh" in scan \
-   and not re.search(r"--(syntax-check|list-)", scan):
-    for m in re.finditer(r"(?:\s-l\s*|\s--limit[=\s])(\S+)", scan):
-        out += [box(h) for h in re.split(r"[,:]", m.group(1)) if h and h[0] not in "!&"]
-# ssh to a dev host with a command that changes it (the remote command is quoted,
-# so it is read from the raw command, not the scan).
-if re.search(r"(?:^|[;&|(\s])ssh\s", scan) and re.search(
-        r"odoo-upgrade|amafu-deploy|deploy\.sh|systemctl\s+(re)?start|systemctl\s+stop|"
-        r"service\s+\S+\s+(re)?start|git\s+(pull|reset|checkout|merge)", cmd):
-    for m in re.finditer(r"([a-z0-9-]+\.dev\.(?:bbb|asuer)\.systems|(?:bbb|asuer)-xn-vm-odoo-dev-[a-z0-9]+)", scan):
-        out.append(box(m.group(1)))
+
+def unknown(word):
+    # A name the shell fills in later: the gate cannot tell which box it is.
+    out.append("?" + word)
+
+def strip_heredocs(text):
+    keep, ends = [], []
+    for line in text.split("\n"):
+        if ends:
+            if line.strip() == ends[0]:
+                ends.pop(0)
+            continue
+        keep.append(line)
+        ends = [m.group(2) for m in re.finditer(r"<<(-?)\s*[\x27\"]?([A-Za-z_][A-Za-z0-9_]*)[\x27\"]?", line)]
+    return "\n".join(keep)
+
+VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+def subst(word, env):
+    """-> the word with known variables filled in, or None when it holds one we
+    cannot see, a command substitution or a glob."""
+    w = VAR.sub(lambda m: env.get(m.group(1) or m.group(2), "\0"), word)
+    if "\0" in w or "$" in w or "`" in w or re.search(r"[*?\[]", w):
+        return None
+    return w
+
+ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
+SSH_VALUE = set("-b -c -D -E -e -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w -B".split())
+AMAFU_VALUE = {"--sha", "--script", "--playbook", "--var"}
+LIMIT_SPLIT = re.compile(r"[,:]")
+
+def one(words, env):
+    i = 0
+    # leading assignments, and the prefixes that run the next word as the command
+    while i < len(words):
+        w = words[i]
+        m = ASSIGN.match(w)
+        if m:
+            v = subst(m.group(2), env)
+            env[m.group(1)] = v if v is not None else "\0"
+            i += 1
+            continue
+        b = os.path.basename(w)
+        if w in ("if", "then", "else", "elif", "do", "while", "until", "{", "!"):
+            # a shell keyword: the command is the next word
+            i += 1
+            continue
+        if b in ("export", "local", "declare", "readonly", "typeset"):
+            for a in words[i + 1:]:
+                m = ASSIGN.match(a)
+                if m:
+                    v = subst(m.group(2), env)
+                    env[m.group(1)] = v if v is not None else "\0"
+            return
+        if b in ("sudo", "env", "command", "exec", "time", "nohup", "nice", "timeout",
+                 "deploylock"):
+            i += 1
+            while i < len(words) and (words[i].startswith("-") or
+                                      (b == "env" and ASSIGN.match(words[i]))):
+                if b == "deploylock" and words[i] in ("--explain", "--status", "--sweep"):
+                    return
+                if (b, words[i]) in (("sudo", "-u"), ("deploylock", "--wait"),
+                                     ("deploylock", "--name"), ("deploylock", "--keys"),
+                                     ("nice", "-n")):
+                    i += 1
+                i += 1
+            if b == "timeout" and i < len(words):
+                i += 1
+            continue
+        break
+    if i >= len(words):
+        return
+    prog, args = os.path.basename(words[i]), words[i + 1:]
+    if prog in ("bash", "sh", "zsh") and "-c" in args:
+        k = args.index("-c")
+        if k + 1 < len(args):
+            walk(args[k + 1], env)
+        return
+    if prog == "amafu" and args[:1] == ["deploy"]:
+        rest, env_word, k = args[1:], None, 0
+        while k < len(rest):
+            a = rest[k]
+            if a == "--" or a == "--check":
+                if a == "--check":
+                    return
+                break
+            if a in AMAFU_VALUE:
+                k += 2
+                continue
+            if not a.startswith("-") and env_word is None:
+                env_word = a
+            k += 1
+        if env_word is None:
+            return
+        v = subst(env_word, env)
+        if v is None:
+            unknown(env_word)
+        else:
+            out.append(box(v))
+        return
+    if prog == "ansible-playbook" and any("odoo_dev_refresh" in a for a in args) \
+            and not any(re.match(r"--(syntax-check|list-)", a) for a in args):
+        vals, k = [], 0
+        while k < len(args):
+            a = args[k]
+            if a in ("-l", "--limit") and k + 1 < len(args):
+                vals.append(args[k + 1]); k += 2; continue
+            if a.startswith("--limit="):
+                vals.append(a[8:])
+            elif a.startswith("-l") and len(a) > 2 and not a.startswith("--"):
+                vals.append(a[2:])
+            elif a in ("-e", "--extra-vars") and k + 1 < len(args):
+                m = re.search(r"\btarget_host=(\S+)", args[k + 1])
+                if m:
+                    vals.append(m.group(1))
+                k += 2; continue
+            k += 1
+        for raw in vals:
+            v = subst(raw, env)
+            if v is None:
+                unknown(raw)
+                continue
+            out.extend(box(h) for h in LIMIT_SPLIT.split(v) if h and h[0] not in "!&")
+        return
+    if prog == "ssh":
+        k, dest = 0, None
+        while k < len(args):
+            a = args[k]
+            if a in SSH_VALUE:
+                k += 2
+                continue
+            if a.startswith("-"):
+                k += 1
+                continue
+            dest = a
+            break
+        if dest is None or not CHANGE.search(" ".join(args[k + 1:])):
+            return
+        v = subst(dest, env)
+        if v is None:
+            unknown(dest)
+            return
+        m = DEVHOST.search(v.split("@")[-1].lower())
+        if m:
+            out.append(box(m.group(1)))
+
+PUNCT = set(";&|()\n")
+def walk(text, env):
+    # a backslash-newline joins two lines into one command
+    lex = shlex.shlex(strip_heredocs(text).replace("\\\n", " "), posix=True, punctuation_chars=";&|()\n")
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    lex.commenters = ""
+    words = []
+    for tok in lex:
+        if tok and set(tok) <= PUNCT:
+            one(words, env)
+            words = []
+        else:
+            words.append(tok)
+    one(words, env)
+
+try:
+    walk(cmd, {})
+except ValueError:
+    # Unbalanced quotes: fall back to the plain scan, read at command position.
+    for m in re.finditer(r"(?:^|[;&|(])\s*amafu\s+deploy\s+([^;&|]*)", scan):
+        a = m.group(1).split()
+        if "--check" not in a:
+            out.append(box(next((x for x in a if not x.startswith("-")), "")))
+    if re.search(r"(?:^|[;&|(])\s*ssh\s", scan) and CHANGE.search(cmd):
+        out.extend(box(m.group(1)) for m in DEVHOST.finditer(scan))
 for b in dict.fromkeys(x for x in out if x):
     print(b)
 ' 2>/dev/null
@@ -3116,7 +3271,7 @@ locks_panel() {
     if [ "$kind" = global ]; then
       printf '       %sanything else waits — deploylock --wait forever <cmd>, in the background%s\n' "$C_DIM" "$C_R"
     else
-      printf '       %sother hosts deploy alongside; multi-host runs wait%s\n' "$C_DIM" "$C_R"
+      printf '       %sruns on other hosts deploy alongside; global runs wait%s\n' "$C_DIM" "$C_R"
     fi
   elif [ "$rc" = 0 ]; then
     printf '   %s○ deploy   free — run ansible through deploylock%s\n' "$C_DIM" "$C_R"
@@ -4146,7 +4301,17 @@ EOF
   local boxes brc=0
   boxes=$(dev_write_targets "$scan" "$cmd") || brc=$?
   [ "$brc" = 0 ] || hook_refuse "the dev-box target parser failed, exit $brc"
-  for box in $boxes; do
+  while IFS= read -r box; do
+    [ -n "$box" ] || continue
+    case "$box" in
+      '?'*)
+        { printf 'NAME THE BOX: that command changes a dev box, but its name is held in %s,\n' "${box#?}"
+          printf 'which this gate cannot see, so it cannot check the lease.\n\n'
+          printf 'Write the box name out in the command, take its lease, and run it again:\n\n'
+          printf '  agentboard env take <box> --for "<TID> · <what you are testing>"\n\n'
+          printf 'If the target is not a dev box, prefix AGENT_BOARD_OVERRIDE=1.\n'; } >&2
+        exit 2 ;;
+    esac
     env_i_hold "$box" && continue
     env_owner "$box" >/dev/null 2>&1 && continue
     { printf 'LEASE FIRST: that command changes the %s dev box, and you do not hold its lease.\n\n' "$box"
@@ -4155,7 +4320,9 @@ EOF
       printf 'Free it when the test cycle is done: agentboard env free %s\n' "$box"
       printf 'If the box name is wrong for this command, prefix AGENT_BOARD_OVERRIDE=1.\n'; } >&2
     exit 2
-  done
+  done <<EOF
+$boxes
+EOF
 
   # (2d) The lower PR of a hand-chained stack, merged with --delete-branch.
   gate_stacked_merge "$scan" "$cmd" "$cwd"
