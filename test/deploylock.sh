@@ -71,9 +71,24 @@ case $pb in
     if [ "$pb" = delegating.yml ]; then play 3 all relay "$@"; fi ;;
 esac
 FAKE
+# Ad-hoc ansible: --list-hosts expands a pattern (a group or a comma list), and a
+# real run logs like the playbook does.
 cat > "$T/bin/ansible" <<'FAKE'
 #!/bin/bash
-case $1 in backups) printf '  hosts (1):\n    backup1\n' ;; *) exit 1 ;; esac
+pat=$1; list=0
+for a in "$@"; do [ "$a" = --list-hosts ] && list=1; done
+if [ "$list" = 0 ]; then
+  echo "start adhoc $pat" >> "$FAKE_LOG"; sleep "${FAKE_SLEEP:-0}"
+  echo "end adhoc $pat" >> "$FAKE_LOG"; exit 0
+fi
+case $pat in
+  backups) set -- backup1 ;;
+  web)     set -- app1 app2 ;;
+  all)     set -- app1 app2 dev1 dev2 backup1 ;;
+  nosuch|relays) exit 1 ;;
+  *)       IFS=, read -r -a hs <<< "$pat"; set -- "${hs[@]}" ;;
+esac
+printf '  hosts (%s):\n' "$#"; for h in "$@"; do printf '    %s\n' "$h"; done
 FAKE
 chmod +x "$T/bin/ansible-playbook" "$T/bin/ansible"
 export PATH="$T/bin:$PATH"
@@ -98,8 +113,19 @@ echo 'resolution — which lock a command gets'
 want 'one host in --limit is an environment'   'environment lock on app1' "$(x ansible-playbook site.yml -l app1)"
 want 'so is --limit=host'                      'environment lock on app1' "$(x ansible-playbook site.yml --limit=app1)"
 want 'an inventory file is not a playbook'     'environment lock on app1' "$(x ansible-playbook -i inv.yml site.yml -l app1)"
-want 'a comma list is global'                  'global lock — 2 target hosts' "$(x ansible-playbook site.yml -l app1,app2)"
-want 'a group that expands to two is global'   'global lock — 2 target hosts' "$(x ansible-playbook site.yml -l web)"
+want 'a comma list locks each of its hosts'     'environment lock on app1, app2 — 2 target hosts' "$(x ansible-playbook site.yml -l app1,app2)"
+want 'so does a group that expands to two'     'environment lock on app1, app2 — 2 target hosts' "$(x ansible-playbook site.yml -l web)"
+want 'a limit of all is global'                'global lock — the limit targets all hosts' "$(x ansible-playbook site.yml -l all)"
+want 'and so is all with exclusions'           'global lock — the limit targets all hosts' "$(x ansible-playbook site.yml -l 'all:!dev2')"
+want 'a limit holding a shell variable is global' 'global lock — the limit is not expanded' "$(x ansible-playbook site.yml -l '$HOST')"
+want 'so is one holding a template'            'global lock — the limit is not expanded' "$(x ansible-playbook site.yml -l '{{ h }}')"
+want 'a fleet of hosts is global'              'global lock — 11 target hosts' \
+  "$(x ansible-playbook site.yml -l h1,h2,h3,h4,h5,h6,h7,h8,h9,h10,h11)"
+want 'an ad-hoc run on one host is an environment' 'environment lock on app1 — one target host' "$(x ansible app1 -m ping)"
+want 'an ad-hoc run on two hosts locks both'   'environment lock on app1, app2' "$(x ansible web -b -m reboot)"
+want 'an ad-hoc run on all hosts is global'    'global lock — the pattern targets all hosts' "$(x ansible all -m ping)"
+want 'an ad-hoc pattern that does not resolve is global' 'global lock — target could not be resolved' "$(x ansible nosuch -m ping)"
+want 'an ad-hoc run with a variable is global' 'global lock — the pattern is not expanded' "$(x ansible '$H' -m ping)"
 want 'no --limit is global'                    'global lock — no --limit' "$(x ansible-playbook site.yml)"
 want 'an unresolvable limit is global'         'global lock — target could not be resolved' "$(x ansible-playbook site.yml -l nosuch)"
 want 'a role that delegates away is global'    'delegates to {{ hub }}' "$(x ansible-playbook delegating.yml -l app1)"
@@ -141,6 +167,23 @@ out=$("$DL" ansible-playbook site.yml -l app2 2>&1); rc=$?
 want 'a global run keeps environment runs out' '1' "$rc"
 want 'and says so'                             'held by a global run' "$out"
 want 'status shows the global holder'          "lock 'deploy': global, held by pid" "$("$DL" --status)"
+idle
+
+echo
+echo 'several hosts in one run'
+FAKE_SLEEP=3 "$DL" ansible-playbook site.yml -l app1,app2 >/dev/null 2>&1 & BG+=($!)
+wait_owner deploy.app2.owner
+out=$("$DL" ansible-playbook site.yml -l dev1 2>&1); rc=$?
+want 'a run on a host outside the set goes alongside' '0' "$rc"
+out=$("$DL" ansible-playbook site.yml -l app2 2>&1); rc=$?
+want 'a run on one of its hosts is refused'    '1' "$rc"
+out=$("$DL" ansible dev2,app1 -m ping 2>&1); rc=$?
+want 'and so is an ad-hoc run that shares a host' '1' "$rc"
+out=$("$DL" ansible-playbook site.yml 2>&1); rc=$?
+want 'a global run is refused'                 '1' "$rc"
+out=$("$DL" --status 2>&1)
+want 'status names every host of the run'      'env app1, app2: held by pid' "$out"
+want 'brief status gives the hosts as its scope' "$(printf 'app1,app2\tTester · t1')" "$("$DL" --status --brief)"
 idle
 
 echo
@@ -213,6 +256,38 @@ i=0; while pgrep -f "$T/bin/ansible-playbook site.yml -l app1" >/dev/null && [ "
 want 'once it ends, the lock is free'        "lock 'deploy': free" "$("$DL" --status)"
 want 'and sweep clears the orphaned owner'   'orphaned deploy-lock owner' "$("$AB" sweep)"
 want 'leaving the lock files in place'       'deploy.app1.lock' "$(ls "$AGENT_BOARD_DIR/locks")"
+
+echo
+echo 'the shared working tree'
+G="$T/gitdeploy"
+mkdir -p "$G" && cd "$G" || exit 1
+git init -q -b main . && cp "$T/deploy/site.yml" . && git add site.yml && git -c user.name=t -c user.email=t@t commit -qm init
+out=$("$DL" ansible-playbook site.yml -l app1 2>&1); rc=$?
+want 'a clean tree on main deploys'            '0' "$rc"
+echo '# edit' >> site.yml
+out=$("$DL" ansible-playbook site.yml -l app1 2>&1); rc=$?
+want 'uncommitted changes still deploy'        '0' "$rc"
+want 'but the run names them'                  'uncommitted changes: site.yml' "$out"
+git checkout -q -- site.yml
+echo junk > untracked.txt
+want 'an untracked file is not mentioned'      'nothing' "$("$DL" ansible-playbook site.yml -l app1 2>&1 | grep -q uncommitted && echo said || echo nothing)"
+git checkout -q -b feat/x
+out=$("$DL" ansible-playbook site.yml -l app1 2>&1); rc=$?
+want 'the main checkout on a branch is refused' '1' "$rc"
+want 'and says why'                            'on branch feat/x, not main' "$out"
+want '--explain says so too'                   'on branch feat/x, not main' "$(x ansible-playbook site.yml -l app1)"
+out=$(AGENT_BOARD_OVERRIDE=1 "$DL" ansible-playbook site.yml -l app1 2>&1); rc=$?
+want 'AGENT_BOARD_OVERRIDE=1 runs it anyway'   '0' "$rc"
+git checkout -q main
+git worktree add -q -b feat/y "$T/gitdeploy-wt" 2>/dev/null
+out=$(cd "$T/gitdeploy-wt" && "$DL" ansible-playbook site.yml -l app1 2>&1); rc=$?
+want 'a linked worktree on a branch may deploy' '0' "$rc"
+: > .git/MERGE_HEAD
+out=$("$DL" ansible-playbook site.yml -l app1 2>&1); rc=$?
+want 'a merge in progress is refused'          '1' "$rc"
+want 'and says so'                             'a merge is in progress' "$out"
+rm -f .git/MERGE_HEAD
+cd "$T/deploy" || exit 1
 
 echo
 echo 'naming the holder'

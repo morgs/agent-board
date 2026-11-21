@@ -328,6 +328,14 @@ no list either. Prod and shared names (`preprod`, `staging`, a bare `dev`) are l
 out. Reads over ssh need no lease. A wrong guess at the name is passed with
 `AGENT_BOARD_OVERRIDE=1`.
 
+The gate reads the command the way the shell will: only a word in command position
+counts (after `sudo`, `env`, `deploylock [opts]`, `bash -c` and the like), so the
+words in a heredoc body, an `echo`, a commit message or a board message do not.
+Quotes are removed, and a variable set earlier in the same command (`E=dev-bramble;
+amafu deploy "$E"`, `export E=...`) is filled in. A name the gate cannot see — a
+variable set outside the command, a command substitution, a glob — is refused with
+**NAME THE BOX**: write the box out, take its lease, and run it again.
+
 `agentboard check` reports leases above everything else, and does so outside a git
 repo too — an agent testing `sandbox` from its home directory still needs to know.
 
@@ -900,15 +908,30 @@ can never be.
 The lock is reader-writer, so that work on different hosts does not queue behind
 one another:
 
-- **An environment run** touches exactly one host. It takes the global lock
-  (`locks/deploy.lock`) *shared* and that host's lock (`locks/deploy.<host>.lock`)
-  *exclusive*. Two of them on different hosts run in parallel; two on the same host
-  queue.
+- **An environment run** touches a known set of hosts, at most 10. An environment
+  is one inventory host: an Amafu environment is one VM, and the inventory has no
+  grouping above that. The run takes the global lock (`locks/deploy.lock`) *shared*
+  and each host's lock (`locks/deploy.<host>.lock`) *exclusive*. Runs with no host
+  in common run in parallel; runs that share a host queue. So `-l app1,app2` and
+  `-l app3` go side by side, and `-l app2` waits for the first.
 - **A global run** is everything else. It takes the global lock *exclusive*, so it
   waits for every environment run to finish and keeps new ones out while it runs.
 
 A queued global run holds `locks/deploy.gate`, and new environment runs wait behind
 it, so a steady stream of small deploys cannot starve a site-wide one.
+
+### The working tree
+
+Concurrent runs share one working tree (`~/code/asuer/deploy`), but they only read
+it, so the tree is no reason to make them global. What matters is that the tree is
+the one everyone expects. A run from the main checkout of a git repo is refused
+while that checkout is on a branch other than its default one, or detached, or in
+the middle of a merge, rebase, cherry-pick or revert: the next run anyone starts
+there would ship it. A linked worktree may be on any branch, because nobody else
+runs from it. Uncommitted changes to tracked files are named on stderr and the run
+goes ahead (a `--check` before the commit is normal); untracked files are not
+mentioned. `--explain` shows the verdict. `AGENT_BOARD_OVERRIDE=1` runs it anyway.
+Outside a git checkout there is no check, and `--hold` (the hub path) never checks.
 
 ### The queue: first in, first out
 
@@ -941,7 +964,9 @@ the hub through `deploylock --hold`, so the hub's queue orders runs from every
 machine. The hub must run this version before a machine sends `--wait forever` to it.
 
 `deploylock` finds the target by asking Ansible: it runs the same command with
-`--list-hosts --list-tasks` added. That applies `-l`/`--limit`, `-e target_host=...`,
+`--list-hosts --list-tasks` added. An ad-hoc `ansible <pattern> -m ...` resolves its
+pattern with `ansible <pattern> --list-hosts`, so a one-host reboot is an
+environment run too. That applies `-l`/`--limit`, `-e target_host=...`,
 groups, patterns, comma lists and `@file` limits against the real inventory —
 a dynamic one included — exactly as the run will, so there is no second parser to
 drift from Ansible's. It costs about a second; `site.yml` on a large inventory, a few.
@@ -950,9 +975,13 @@ drift from Ansible's. It costs about a second; `site.yml` on a large inventory, 
 
 **Global is the default whenever the target is not certain.** The run is global if:
 
-- it is not `ansible-playbook`, or names no playbook;
+- it is neither `ansible-playbook` nor ad-hoc `ansible`, or names no playbook or
+  pattern;
 - it has no `--limit` and the playbook has no `deploylock:` directive;
-- the limit resolves to more than one host, to none, or cannot be resolved at all;
+- the limit or pattern reached deploylock unexpanded — a shell variable (`$HOST`), a
+  command substitution, or a `{{ template }}` — so nobody can say which hosts it is;
+- the limit or pattern takes in `all` or `*`, even with exclusions (`all:!dev2`);
+- it resolves to more than 10 hosts (a fleet run), to none, or cannot be resolved;
 - the playbook, or a role in a play that still has hosts after the limit, has a
   `delegate_to:` that points anywhere but localhost — and no directive.
 
@@ -1300,8 +1329,8 @@ themselves are never removed — unlinking one that another process has open spl
 the lock in two — and an empty file per host costs nothing.
 
 **"My run went global and I expected one environment."** `deploylock --explain
-<command>` prints the reason: no `--limit`, several hosts, an unresolvable target, or
-a `delegate_to` in a role. Narrow the limit, or declare the playbook's shared hosts
+<command>` prints the reason: no `--limit`, an unexpanded or all-hosts limit, more
+than 10 hosts, an unresolvable target, or a `delegate_to` in a role. Narrow the limit, or declare the playbook's shared hosts
 with a `# deploylock:` directive.
 
 **The vault lease is held by a session that is gone.** It should clear itself: reading

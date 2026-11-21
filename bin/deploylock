@@ -9,17 +9,31 @@ clear, and then both write — the check and the write have to be one indivisibl
 
 Two kinds of hold:
 
-  environment  The run touches exactly one host. It takes the global lock SHARED and
-               that host's lock EXCLUSIVE (locks/deploy.<host>.lock). Runs on
-               different hosts go in parallel; runs on the same host queue.
-  global       Anything else: several hosts, no --limit, a target that cannot be
-               resolved for certain, or a command that is not ansible-playbook. It
-               takes the global lock EXCLUSIVE, so it waits for every environment
-               run to finish and keeps new ones out while it runs.
+  environment  The run touches a known set of hosts, at most 10. An environment
+               is one inventory host (an Amafu environment is one host; the
+               inventory has no grouping above that). The run takes the global lock
+               SHARED and each host's lock EXCLUSIVE (locks/deploy.<host>.lock).
+               Runs with no host in common go in parallel; runs that share a host
+               queue.
+  global       Anything else: no --limit, a limit that is not expanded (a shell
+               variable, a template) or that targets all hosts, a target that cannot
+               be resolved for certain, more than 10 hosts, or a command that
+               is neither ansible-playbook nor ad-hoc ansible. It takes the global
+               lock EXCLUSIVE, so it waits for every environment run to finish and
+               keeps new ones out while it runs.
 
-The target comes from asking ansible-playbook itself (--list-hosts --list-tasks with
-the same arguments), so -l/--limit, -e target_host=..., groups, patterns and comma
-lists resolve against the real inventory exactly as the run will.
+The target comes from asking Ansible itself (--list-hosts, and --list-tasks for a
+playbook, with the same arguments), so -l/--limit, -e target_host=..., groups,
+patterns, globs and comma lists resolve against the real inventory exactly as the
+run will. An ad-hoc `ansible <pattern> -m ...` resolves its pattern the same way.
+
+Concurrent runs share one working tree, and only read it, so the tree is not a
+reason to serialise them. What the tree does need is to be the state everyone
+expects: a run from the main checkout of a repo is refused while that checkout is
+on a branch other than the default one, or in the middle of a merge, rebase or
+cherry-pick. A linked worktree may be on any branch. Uncommitted changes to tracked
+files are named on stderr, not refused: --check before a commit is normal. Not in a
+git checkout at all: no check. AGENT_BOARD_OVERRIDE=1 skips the refusal.
 
 A playbook can carry directives in a comment, anywhere in the file:
 
@@ -117,6 +131,14 @@ DELEGATE = re.compile(r"^\s*delegate_to:\s*(.+?)\s*(#.*)?$")
 SAFE_MARK = re.compile(r"#\s*deploylock:\s*safe\b")
 SAFE_DELEGATES = LOCAL | {"{{ inventory_hostname }}", "{{inventory_hostname}}"}
 POLL = 1.0
+# More hosts than this in one run is a fleet run, and takes the global lock: it
+# would otherwise hold a lock on most of the estate one host at a time.
+FLEET = 10
+# Ad-hoc ansible: these take a value as well, so it is not taken for the pattern.
+ADHOC_VALUE_OPTS = VALUE_OPTS | {"-m", "--module-name", "-a", "--args"}
+# A limit or pattern the shell did not expand reaches us literally: a variable,
+# a command substitution, or a Jinja template.
+UNEXPANDED = re.compile(r"[$`]|\{\{")
 
 
 # ---------------------------------------------------------------- lock files
@@ -158,6 +180,18 @@ def alive(pid):
 
 def owner_alive(info):
     return bool(info) and (alive(info.get("pid")) or alive(info.get("child")))
+
+
+def targets_of(rec):
+    """The target hosts of an owner or queue record. An old record has one."""
+    t = rec.get("targets")
+    if t:
+        return list(t)
+    return [x for x in (rec.get("target") or "").split(",") if x]
+
+
+def shown(rec):
+    return ", ".join(targets_of(rec)) or "?"
 
 
 def env_keys(name):
@@ -308,6 +342,10 @@ def scope_of(rec):
         else ("env %s" % ",".join(rec["keys"]) if rec.get("keys") else "global")
 
 
+def first_key(rec):
+    return (rec.get("keys") or targets_of(rec) or ["?"])[0]
+
+
 def describe_waiter(n, rec):
     waited = fmt_secs(time.time() - rec.get("queued_epoch", time.time()))
     return ("%d. %s — %s, waiting %s\n       command: %s"
@@ -332,8 +370,8 @@ def describe(info, lockfile):
                                             ago(info)),
              "    agent:   %s" % info.get("agent", "?")]
     if info.get("mode") == "env":
-        lines.append("    env:     %s" % info.get("target", "?"))
-        extra = [k for k in info.get("keys", []) if k != info.get("target")]
+        lines.append("    env:     %s" % shown(info))
+        extra = [k for k in info.get("keys", []) if k not in targets_of(info)]
         if extra:
             lines.append("    shared:  %s" % ", ".join(extra))
         if info.get("waiting"):
@@ -411,8 +449,7 @@ def status(name, brief=False):
         n = len(runs) + len(unknown)
         print("lock %r: shared by %d environment run%s" % (name, n, "" if n == 1 else "s"))
     for r in runs:
-        t = r.get("target") or "?"
-        print("  env %s: %s" % (t, describe(r, lock_path(name, t))))
+        print("  env %s: %s" % (shown(r), describe(r, lock_path(name, first_key(r)))))
     for k in unknown:
         print("  env %s: %s" % (k, describe({}, lock_path(name, k))))
     print_queue(queue)
@@ -435,8 +472,9 @@ def find_tool(cmd0, tool, cwd):
     return cand if os.access(cand, os.X_OK) else None
 
 
-def parse_args(args):
-    playbooks, inventory, has_limit, cleaned = [], [], False, []
+def parse_args(args, value_opts=VALUE_OPTS):
+    """-> (positional words, inventory args, limit values, cleaned args)."""
+    playbooks, inventory, limits, cleaned = [], [], [], []
     i = 0
     while i < len(args):
         a = args[i]
@@ -444,15 +482,18 @@ def parse_args(args):
             i += 1
             continue
         cleaned.append(a)
-        if a in ("-l", "--limit") or a.startswith("--limit=") or \
-                (a.startswith("-l") and not a.startswith("--") and len(a) > 2):
-            has_limit = True
+        if a in ("-l", "--limit"):
+            limits.append(args[i + 1] if i + 1 < len(args) else "")
+        elif a.startswith("--limit="):
+            limits.append(a[len("--limit="):])
+        elif a.startswith("-l") and not a.startswith("--") and len(a) > 2:
+            limits.append(a[2:])
         if a in ("-i", "--inventory", "--inventory-file") and i + 1 < len(args):
             inventory += [a, args[i + 1]]
         elif a.startswith("--inventory=") or \
                 (a.startswith("-i") and not a.startswith("--") and len(a) > 2):
             inventory.append(a)
-        if a in VALUE_OPTS:
+        if a in value_opts:
             if i + 1 < len(args):
                 cleaned.append(args[i + 1])
             i += 2
@@ -460,7 +501,39 @@ def parse_args(args):
         if not a.startswith("-"):
             playbooks.append(a)
         i += 1
-    return playbooks, inventory, has_limit, cleaned
+    return playbooks, inventory, limits, cleaned
+
+
+def targets_all(pattern):
+    """True when a host pattern takes in the whole inventory: `all` or `*` as one
+    of its parts, not excluded. `all:!dev2` is still the fleet."""
+    for part in re.split(r"[,:]", pattern):
+        part = part.strip().lstrip("&")
+        if part in ("all", "*"):
+            return True
+    return False
+
+
+def check_patterns(limits, what="limit"):
+    """A reason the run must be global, from the limit values alone, or None."""
+    for lim in limits:
+        if UNEXPANDED.search(lim):
+            return "the %s is not expanded (%s)" % (what, lim)
+        if targets_all(lim):
+            return "the %s targets all hosts" % what
+    return None
+
+
+def hosts_listed(stdout):
+    """Host names from `ansible <pattern> --list-hosts`."""
+    out, take = [], False
+    for line in stdout.splitlines():
+        if re.match(r"^\s*hosts \(\d+\):", line):
+            take = True
+            continue
+        if take and line.strip():
+            out.append(line.strip())
+    return out
 
 
 def directives(paths):
@@ -545,48 +618,138 @@ def remote_delegation(playbooks, roles, cwd):
     return None
 
 
+def size_check(targets):
+    """-> (targets, shared-free reason) or ([], global reason)."""
+    if not targets:
+        return [], "no target host matched"
+    if len(targets) > FLEET:
+        more = ", ".join(targets[:4]) + (", ..." if len(targets) > 4 else "")
+        return [], "%d target hosts: %s" % (len(targets), more)
+    return targets, "one target host" if len(targets) == 1 \
+        else "%d target hosts" % len(targets)
+
+
+def resolve_adhoc(cmd, cwd):
+    """Ad-hoc `ansible <pattern> ...`: the pattern (and any --limit) is the target."""
+    words, _, limits, cleaned = parse_args(cmd[1:], ADHOC_VALUE_OPTS)
+    if not words:
+        return [], [], "no host pattern on the command line"
+    pattern = words[0]
+    if UNEXPANDED.search(pattern):
+        return [], [], "the pattern is not expanded (%s)" % pattern
+    why = check_patterns(limits)
+    if why:
+        return [], [], why
+    if targets_all(pattern) and not limits:
+        return [], [], "the pattern targets all hosts"
+    ansible_bin = find_tool(cmd[0], "ansible", cwd)
+    if not ansible_bin:
+        return [], [], "ansible not found to resolve the target"
+    try:
+        r = subprocess.run([ansible_bin] + cleaned + ["--list-hosts"], cwd=cwd,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=60)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return [], [], "target could not be resolved (%s)" % e
+    if r.returncode != 0:
+        tail = (r.stderr.strip() or r.stdout.strip()).splitlines()[-1:] or ["no output"]
+        return [], [], "target could not be resolved (ansible --list-hosts failed: %s)" \
+            % tail[0][:200]
+    targets, reason = size_check(sorted(set(hosts_listed(r.stdout)) - LOCAL))
+    return targets, [], reason
+
+
 def resolve(cmd, cwd):
-    """-> (target or None, shared keys, reason). None means take the global lock."""
+    """-> (target hosts, shared keys, reason). No targets means the global lock."""
+    if os.path.basename(cmd[0]) == "ansible":
+        return resolve_adhoc(cmd, cwd)
     if os.path.basename(cmd[0]) != "ansible-playbook":
-        return None, [], "not an ansible-playbook run"
-    playbooks, inventory, has_limit, cleaned = parse_args(cmd[1:])
+        return [], [], "not an ansible-playbook run"
+    playbooks, inventory, limits, cleaned = parse_args(cmd[1:])
     if not playbooks:
-        return None, [], "no playbook on the command line"
+        return [], [], "no playbook on the command line"
     paths = [os.path.join(cwd, p) for p in playbooks]
     dirs = directives(paths)
     words = [w for d in dirs for w in d]
     if "global" in words:
-        return None, [], "the playbook declares deploylock: global"
-    if not has_limit and not dirs:
-        return None, [], "no --limit, and the playbook has no deploylock directive"
+        return [], [], "the playbook declares deploylock: global"
+    why = check_patterns(limits)
+    if why:
+        return [], [], why
+    if not limits and not dirs:
+        return [], [], "no --limit, and the playbook has no deploylock directive"
 
     pb_bin = find_tool(cmd[0], "ansible-playbook", cwd)
     ansible_bin = find_tool(cmd[0], "ansible", cwd)
     if not pb_bin:
-        return None, [], "ansible-playbook not found to resolve the target"
+        return [], [], "ansible-playbook not found to resolve the target"
     try:
         hosts, roles = list_playbook(pb_bin, cleaned, cwd)
         shared = set()
         for d in dirs:
             if d and d[0] == "shared":
                 if not ansible_bin:
-                    return None, [], "ansible not found to expand shared hosts"
+                    return [], [], "ansible not found to expand shared hosts"
                 for pat in d[1:]:
                     shared.update(expand(ansible_bin, pat, inventory, cwd))
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
-        return None, [], "target could not be resolved (%s)" % e
+        return [], [], "target could not be resolved (%s)" % e
 
-    targets = sorted(hosts - LOCAL - shared)
+    targets, reason = size_check(sorted(hosts - LOCAL - shared))
     if not targets:
-        return None, [], "no target host matched"
-    if len(targets) > 1:
-        more = ", ".join(targets[:4]) + (", ..." if len(targets) > 4 else "")
-        return None, [], "%d target hosts: %s" % (len(targets), more)
+        return [], [], reason
     if not dirs:
         why = remote_delegation(paths, roles, cwd)
         if why:
-            return None, [], why + " (declare it with a deploylock directive)"
-    return targets[0], sorted(shared - {targets[0]}), "one target host"
+            return [], [], why + " (declare it with a deploylock directive)"
+    return targets, sorted(shared - set(targets)), reason
+
+
+# ---------------------------------------------------------------- the working tree
+
+def tree_check(cwd):
+    """-> (refusal or None, note or None) for the checkout the command runs in."""
+    def git(*a, raw=False):
+        try:
+            r = subprocess.run(["git", "-C", cwd] + list(a), capture_output=True,
+                               text=True, timeout=20, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if r.returncode != 0:
+            return None
+        # Porcelain status starts with a space for an unstaged change: keep it.
+        return r.stdout.rstrip("\n") if raw else r.stdout.strip()
+    top = git("rev-parse", "--show-toplevel")
+    if not top:
+        return None, None
+    gitdir = git("rev-parse", "--absolute-git-dir")
+    common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
+    if gitdir:
+        for marker, what in (("MERGE_HEAD", "a merge"), ("rebase-merge", "a rebase"),
+                             ("rebase-apply", "a rebase"),
+                             ("CHERRY_PICK_HEAD", "a cherry-pick"),
+                             ("REVERT_HEAD", "a revert")):
+            if os.path.exists(os.path.join(gitdir, marker)):
+                return "%s is in progress in %s" % (what, top), None
+    if gitdir and common and os.path.realpath(gitdir) == os.path.realpath(common):
+        # The main checkout. A branch left checked out here is what the next run
+        # anyone starts from here would ship.
+        default = (git("symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD")
+                   or "").split("/", 1)[-1]
+        if not default:
+            default = "main" if git("rev-parse", "--verify", "-q", "refs/heads/main") \
+                else "master"
+        branch = git("symbolic-ref", "--short", "-q", "HEAD")
+        if branch != default:
+            return "%s is %s, not %s" % (
+                top, "on branch %s" % branch if branch else "on a detached HEAD",
+                default), None
+    dirty = git("status", "--porcelain", "--untracked-files=no", raw=True)
+    if dirty:
+        names = [l[3:] for l in dirty.splitlines() if len(l) > 3]
+        more = ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
+        return None, "uncommitted changes: %s (the run ships them as they stand)" % more
+    return None, None
 
 
 # ---------------------------------------------------------------- acquiring
@@ -648,8 +811,7 @@ def global_busy(name):
             return "held by a global run, " + describe(gowner, lock_path(name))
         parts = ["shared by environment runs:"]
         for r in runs:
-            t = r.get("target") or "?"
-            parts.append("  env %s: %s" % (t, describe(r, lock_path(name, t))))
+            parts.append("  env %s: %s" % (shown(r), describe(r, lock_path(name, first_key(r)))))
         for k in unknown:
             parts.append("  env %s: %s" % (k, describe({}, lock_path(name, k))))
         return "\n".join(parts)
@@ -840,9 +1002,9 @@ def hold(name, keys, wait):
                 since=datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
                 since_epoch=int(time.time()))
     if not keys:
-        info["target"] = None
-    elif info.get("target") not in keys:
-        info["target"] = keys[0]
+        info["target"], info["targets"] = None, []
+    elif not targets_of(info) or not set(targets_of(info)) <= set(keys):
+        info["target"], info["targets"] = keys[0], [keys[0]]
     os.makedirs(LOCKS, exist_ok=True)
     held = take(name, keys, wait, info)
     if held is None:
@@ -932,19 +1094,38 @@ def main(argv):
 
     cwd = os.getcwd()
     if force_global:
-        target, shared, reason = None, [], "--global"
+        targets, shared, reason = [], [], "--global"
     else:
-        target, shared, reason = resolve(cmd, cwd)
-    keys = sorted([target] + shared) if target else []
-    if target:
+        targets, shared, reason = resolve(cmd, cwd)
+    keys = sorted(set(targets) | set(shared))
+    target = ",".join(targets) or None
+    if targets:
         plan = "environment lock on %s%s — %s" % (
-            target, " (shared: %s)" % ", ".join(shared) if shared else "", reason)
+            ", ".join(targets), " (shared: %s)" % ", ".join(shared) if shared else "",
+            reason)
     else:
         plan = "global lock — %s" % reason
+    refusal, note = tree_check(cwd)
     if explain:
         print(plan)
+        if refusal:
+            print("refused: %s" % refusal)
+        elif note:
+            print("note: %s" % note)
         return 0
     print("deploylock: %s" % plan, file=sys.stderr)
+    if refusal:
+        if os.environ.get("AGENT_BOARD_OVERRIDE") == "1":
+            print("deploylock: AGENT_BOARD_OVERRIDE=1 — running although %s" % refusal,
+                  file=sys.stderr)
+        else:
+            print("deploylock: not deploying — %s.\nEvery run ships the tree as it "
+                  "stands, and the main checkout is the tree everyone expects to be on "
+                  "its default branch. Switch back, or work in a linked worktree. "
+                  "AGENT_BOARD_OVERRIDE=1 runs it anyway." % refusal, file=sys.stderr)
+            return 1
+    if note:
+        print("deploylock: note — %s" % note, file=sys.stderr)
 
     os.makedirs(LOCKS, exist_ok=True)
     printable = " ".join(cmd)
@@ -955,6 +1136,7 @@ def main(argv):
         "agent": whoami(),
         "mode": "env" if target else "global",
         "target": target,
+        "targets": targets,
         "keys": keys,
         "reason": reason,
         "since": datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
