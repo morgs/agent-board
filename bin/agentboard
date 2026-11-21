@@ -1044,6 +1044,10 @@ def one(words, env):
             i += 1
             continue
         b = os.path.basename(w)
+        if w in ("if", "then", "else", "elif", "do", "while", "until", "{", "!"):
+            # a shell keyword: the command is the next word
+            i += 1
+            continue
         if b in ("export", "local", "declare", "readonly", "typeset"):
             for a in words[i + 1:]:
                 m = ASSIGN.match(a)
@@ -1059,6 +1063,7 @@ def one(words, env):
                 if b == "deploylock" and words[i] in ("--explain", "--status", "--sweep"):
                     return
                 if (b, words[i]) in (("sudo", "-u"), ("deploylock", "--wait"),
+                                     ("deploylock", "--name"), ("deploylock", "--keys"),
                                      ("nice", "-n")):
                     i += 1
                 i += 1
@@ -1144,7 +1149,8 @@ def one(words, env):
 
 PUNCT = set(";&|()\n")
 def walk(text, env):
-    lex = shlex.shlex(strip_heredocs(text), posix=True, punctuation_chars=";&|()\n")
+    # a backslash-newline joins two lines into one command
+    lex = shlex.shlex(strip_heredocs(text).replace("\\\n", " "), posix=True, punctuation_chars=";&|()\n")
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
     lex.commenters = ""

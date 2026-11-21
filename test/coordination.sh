@@ -379,6 +379,12 @@ wantnot 'the words inside a heredoc are not a command'   'LEASE FIRST' "$(pt "$(
 wantnot 'nor are words after echo'                       'LEASE FIRST' "$(pt 'echo then amafu deploy dev-sandbox')"
 wantnot 'nor a report in a board message'                'LEASE FIRST' "$(pt 'agentboard say "done: amafu deploy dev-sandbox --follow"')"
 wantnot 'an unresolved var in a message is no command'   'NAME THE BOX' "$(pt 'agentboard say "next: amafu deploy $ENV"')"
+want 'a deploy inside if/then is still a command'      'LEASE FIRST' "$(pt 'if true; then amafu deploy dev-sandbox; fi')"
+want 'and inside a for loop'                           'LEASE FIRST' "$(pt 'for h in x; do amafu deploy dev-sandbox --follow; done')"
+want 'and inside a brace group'                        'LEASE FIRST' "$(pt '{ amafu deploy dev-sandbox; }')"
+want 'a box on a continued line'                       'changes the sandbox dev box' "$(pt "$(printf 'amafu deploy \\\n  dev-sandbox --follow')")"
+want 'a refresh limit on a continued line'             'LEASE FIRST' "$(pt "$(printf 'deploylock ansible-playbook odoo_dev_refresh.yml \\\n  -l bbb-xn-vm-odoo-dev-sandbox')")"
+want 'deploylock --name before the refresh play'       'LEASE FIRST' "$(pt 'deploylock --name prod ansible-playbook odoo_dev_refresh.yml -l bbb-xn-vm-odoo-dev-sandbox')"
 "$AB" env take sandbox >/dev/null 2>&1
 wantnot 'with the lease the deploy goes through'         'LEASE FIRST' "$(pt 'amafu deploy dev-sandbox --follow')"
 "$AB" env free sandbox >/dev/null 2>&1
