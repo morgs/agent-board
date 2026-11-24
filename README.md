@@ -62,7 +62,8 @@ MIT — see [`LICENSE`](./LICENSE).
       paths/<pid>         files that session has been seen to edit, owned by it
       messages/<id>.md    one file per message, owned by the sender
       read/<pid>          message ids this session has already been shown
-      locks/              the deploy lock, the vault lease, and the board lock (board.flock)
+      locks/              the deploy lock, the vault lease, the board lock (board.flock),
+                          and session ends that wait for it (end.<pid>.<writer pid>)
       retired/            the person of each session that went, kept for the grace period
       theme               one line: which pack of names this machine uses
       themes.local/       packs written here — gitignored, override the shipped ones
@@ -438,7 +439,12 @@ scope. A shell call that runs a sign-off (`agentboard done`, `release`, `env fre
 `vault free`) and the `PostToolUse` and `Stop` hooks after it do not. Only a shell
 tool counts, and only when the command runs the sign-off: a `Read` of a file with
 "agentboard done" in its name, or a command that has the words in quotes, is a tool
-call like any other and makes the session ACTIVE. `sweep` keeps a
+call like any other and makes the session ACTIVE. The command is read as the shell
+reads it. Text after a `#` is a comment, so `pwd # then agentboard done` is not a
+sign-off. Quotes around the program do not hide it: `"$HOME/agent-board/bin/agentboard" release`
+is one. So is a sign-off after `;`, `&&` or `|`, in `$( )`, after `env`, `command`,
+`timeout` and the like, or in `bash -c '...'`. The text of a heredoc is data. A
+command with a quote that does not close is not read as a sign-off. `sweep` keeps a
 DONE file while its pid is still an agent process, however old the file is, and
 drops it when the process ends. Without this, a Codex session that ran
 `agentboard done` at the end of a task disappeared from the board for the rest of
@@ -513,23 +519,44 @@ and the name's claim stays in the ledger for the session that owns it.
 **The same pid is not the same process.** The system gives the pid of a process that
 ended to a new one. A session file records when its process started (`pstart`: the
 start time from `/proc/<pid>/stat`, or `ps -o lstart` where there is no `/proc`).
-A claim that finds a file under its pid compares the two:
+A claim that finds a file under its pid compares the two. So does every hook and
+command that looks for the session's file: a file with a different start is not
+this session's, so a tool hook does not make it ACTIVE again, and it claims a new
+one (with the thread's session id on Codex).
 
 - the same start: the same process. A new session id keeps the person (above).
 - a different start: the file is another process's. Its person goes to the ledger
   for its own session, the file is dropped, and the new session starts a file of
-  its own, without the old name, scope or hold.
+  its own, without the old name, scope or hold. If the person cannot be written to
+  the ledger, `claim` exits 1, makes no claim and leaves the old file as it is.
 - no start recorded (a file from before the field): no proof. A DONE file with
-  another session id is treated as another process's. An ACTIVE file gets the field
-  on its next claim.
+  another session id is treated as another process's, with the same rule for a
+  ledger that cannot be written. An ACTIVE file gets the field on its next claim.
 
 **Claims are one step at a time.** A claim reads which persons are held, then writes
 its file. Two claims that did this together drew the same person. Each now takes the
 board lock (`locks/board.flock`, an `flock`, so the kernel drops it when the holder
 dies) for the read and the write together. So do a revive, a redraw and the end of a
-Codex thread. A claim that cannot have the lock in 5 seconds goes on without it: a
-session without a file is worse than a rare shared person. Where there is no
-`flock(1)` (macOS), python's `fcntl` takes the same lock.
+session. Where there is no `flock(1)` (macOS), python's `fcntl` takes the same lock.
+
+**Nothing is written without the board lock.** Every write of a session file takes
+it: a field (`scope`, the heartbeat of a hook, the state), a log line, `done`. A
+write reads the whole file and moves a new one into its place, so a write that read
+the file before another write landed put the old text back. A process waits
+`AGENT_BOARD_LOCK_WAIT_SECS` (default 5) for the lock. When the wait runs out it
+writes nothing, and its later writes try once and do not wait:
+
+- `claim` exits 75 and makes no file. Run it again. A hook claims again on the
+  session's next tool call.
+- `scope`, `done`, `hold` and the other commands that write say "the board is busy"
+  on stderr and exit 1. Run them again.
+- A hook leaves out its heartbeat. The next hook writes it. The gates still run.
+- The end of a session is written down as `locks/end.<pid>.<writer pid>`: when the
+  process started and which session ended. The next step that has the lock for that
+  pid applies it before its own work: a hook or a claim under the pid, or `sweep`.
+  It frees the leases that the pid owns and marks the file DONE, unless the file
+  names another session by then. A record of a process that is gone, or of the
+  process that had the pid before, is dropped.
 
 **A claim is not used until its replacement is written.** A returning session's
 ledger entry is removed only after the new session file is in place. If the file
@@ -1179,7 +1206,7 @@ Codex takes different answers:
 | PreToolUse deny | `permissionDecision: "deny"` or exit 2 | always exit 2 with the reason on stderr (Codex accepts both forms; the watchdog passes on only this one) |
 | PreToolUse ask | `permissionDecision: "ask"` | **no ask in Codex**: an exit-2 refusal that tells the agent to stop and ask the user |
 | Stop, messages waiting | `additionalContext` | `{"decision": "block", "reason": ...}` |
-| SessionEnd | sweeps, then marks DONE | marks DONE only: Codex allows one second. The end of a different session id on the same process does nothing, and neither does an end that cannot have the board lock in 0.4 seconds |
+| SessionEnd | marks DONE, then sweeps | marks DONE only: Codex allows one second. The end of a different session id on the same process does nothing. An end that cannot have the board lock in 0.4 seconds (Claude Code: `AGENT_BOARD_LOCK_WAIT_SECS`) is written down and applied by the next step that has the lock (see Names) |
 
 Where Claude would ask, the Codex agent asks the user in the chat. If the user says
 yes, it runs `agentboard allow-edit <path>` (the next edit of that path passes the
@@ -1206,7 +1233,10 @@ session file has the daemon's pid, and all threads on that daemon share one file
 Three rules follow from that. A `SessionEnd` whose session id is not the one in the
 file is ignored: another thread ended, not this one. The comparison and the sign-off
 are one step under the board lock, and a claim writes the session id under the same
-lock, so a thread that starts while another one ends is not signed off by it. No
+lock, so a thread that starts while another one ends is not signed off by it. An
+end that cannot have the lock signs nothing off, whatever the file says: it is
+written down with its session id, and the same comparison is made when it is
+applied. No
 pane is recorded for such a session, because the daemon's environment has the pane
 of whoever started the daemon. And when the daemon restarts (it updates itself) the
 pid changes: the session gets a new file, and its session id gives it the person it
@@ -1389,6 +1419,7 @@ exactly the failure this board exists to prevent.
 | `AGENT_BOARD_STALE_SECS` | `7200` | how long without a heartbeat before an entry is ignored, unless its pid is still an agent |
 | `AGENT_BOARD_DONE_KEEP_SECS` | `3600` | how long finished entries linger before `sweep` drops them; one whose pid is still an agent process is kept |
 | `AGENT_BOARD_PERSON_GRACE_SECS` | `86400` | how long a person stays claimed after its session goes; `0` turns the grace period off |
+| `AGENT_BOARD_LOCK_WAIT_SECS` | `5` | how long a process waits for the board lock before it writes nothing (`claim` exits 75) |
 | `AGENT_BOARD_MSG_KEEP_SECS` | `86400` | how long messages live before `sweep` drops them |
 | `AGENT_BOARD_ANON_RETRY_SECS` | `60` | how often a session that drew `Anon` from a full pool looks for a free name |
 | `AGENT_BOARD_DELIVER_ON_STOP` | `1` | `0` stops messages being pushed at end of turn |

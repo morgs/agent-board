@@ -168,15 +168,27 @@ proc_start() {   # proc_start <pid> -> the same text for the whole life of that 
   fi
 }
 # Proof either way needs both sides. A file from before the field has none.
+# The recorded start is read in the shell itself: find_file asks on every call.
+pstart_of() {   # pstart_of <session file> -> sets PSTART_REC ("" when there is none)
+  local line
+  PSTART_REC=""
+  [ -f "$1" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      'pstart: '*) PSTART_REC=${line#pstart: }; break ;;
+      '') break ;;
+    esac
+  done < "$1" 2>/dev/null
+  [ "$PSTART_REC" = "-" ] && PSTART_REC=""
+  return 0
+}
 same_process() {    # same_process <session file> <proc_start of its pid now>
-  local rec; rec=$(get_field "$1" pstart)
-  case "$rec" in ''|'-') return 1 ;; esac
-  [ -n "${2:-}" ] && [ "$rec" = "$2" ]
+  pstart_of "$1"
+  [ -n "$PSTART_REC" ] && [ -n "${2:-}" ] && [ "$PSTART_REC" = "$2" ]
 }
 other_process() {   # other_process <session file> <proc_start of its pid now>
-  local rec; rec=$(get_field "$1" pstart)
-  case "$rec" in ''|'-') return 1 ;; esac
-  [ -n "${2:-}" ] && [ "$rec" != "$2" ]
+  pstart_of "$1"
+  [ -n "$PSTART_REC" ] && [ -n "${2:-}" ] && [ "$PSTART_REC" != "$2" ]
 }
 
 # --- the board lock ----------------------------------------------------------
@@ -185,24 +197,41 @@ other_process() {   # other_process <session file> <proc_start of its pid now>
 # person. So the read and the write are one step under this lock: a claim, a
 # revive, a late match on a name, a redraw, and the end of one session against the
 # start of the next under the same pid.
+# A session file is also written by many processes of its own session at once (a
+# hook, the next hook, a command the agent runs), and each write reads the whole
+# file and puts a new one in its place. A write that read before another one
+# landed put the old text back. So every such write takes this lock too
+# (set_field, append_log).
 # It is an flock on a file descriptor. The kernel drops it when the holder dies,
 # however it dies, so there is no stale lock to heal. A subshell inherits the
 # descriptor and the depth, so a nested call costs nothing.
 # A holder that hangs must not hang the board. After the wait the caller is told
-# (exit 1) and decides: a claim carries on without the lock, as it did before
-# there was one; the end of a Codex thread does not sign off.
+# (exit 1), and it writes nothing: no claim, no revive, no redraw, no field. A
+# write without the lock is what the lock is there to stop, and all of them can be
+# done again later. `claim` exits 75 then, and a hook claims again on the next
+# tool call. The end of a session waits in a file (defer_end).
+# Call it as:  board_lock || { board_unlock; ...; return 1; }   The depth counts a
+# failed call too, so every call has its board_unlock.
 BOARD_LOCK="$LOCKS/board.flock"   # not *.lock: those are deploylock's
+LOCK_WAIT_SECS="${AGENT_BOARD_LOCK_WAIT_SECS:-5}"
+case "$LOCK_WAIT_SECS" in ''|.|*[!0-9.]*|*.*.*) LOCK_WAIT_SECS=5 ;; esac
 AB_LOCK_DEPTH=0
 AB_LOCK_OK=0
-board_lock() {   # board_lock [<seconds to wait, default 5>] -> 0 with the lock, 1 without
-  local w=${1:-5}
+AB_LOCK_GAVE_UP=0   # a wait ran out in this process: the next calls try once and do not wait
+AB_BUSY_SAID=0
+board_lock() {   # board_lock [<seconds to wait>] -> 0 with the lock, 1 without
+  local w=${1:-$LOCK_WAIT_SECS}
   AB_LOCK_DEPTH=$((AB_LOCK_DEPTH+1))
   [ "$AB_LOCK_DEPTH" -gt 1 ] && { [ "$AB_LOCK_OK" = 1 ]; return; }
   AB_LOCK_OK=0
+  [ "$AB_LOCK_GAVE_UP" = 1 ] && w=0
   { : >> "$BOARD_LOCK"; } 2>/dev/null || return 1
   { exec 9>>"$BOARD_LOCK"; } 2>/dev/null || return 1
   if command -v flock >/dev/null 2>&1; then
-    command flock -w "$w" 9 2>/dev/null && AB_LOCK_OK=1
+    case "$w" in
+      0|0.0|0.|.0) command flock -n 9 2>/dev/null && AB_LOCK_OK=1 ;;
+      *)           command flock -w "$w" 9 2>/dev/null && AB_LOCK_OK=1 ;;
+    esac
   else
     AB_W=$w command python3 -c '
 import fcntl, os, sys, time
@@ -215,6 +244,7 @@ while True:
         time.sleep(0.05)' 2>/dev/null && AB_LOCK_OK=1
   fi
   [ "$AB_LOCK_OK" = 1 ] && return 0
+  AB_LOCK_GAVE_UP=1
   { exec 9>&-; } 2>/dev/null
   return 1
 }
@@ -231,6 +261,12 @@ board_unlock() {
   fi
   { exec 9>&-; } 2>/dev/null
   return 0
+}
+# Said once in a process, on stderr, when a write was left out for want of the lock.
+board_busy() {
+  [ "$AB_BUSY_SAID" = 1 ] && return 0
+  AB_BUSY_SAID=1
+  printf 'agentboard: the board is busy: another process has the board lock (%s). Nothing was written. Run it again.\n' "$BOARD_LOCK" >&2
 }
 
 # A session file is one that says whose it is. A hook killed part-way through a
@@ -255,6 +291,12 @@ find_file() {
     # a broken one would hand a nested agent its parent's identity.
     if [ -f "$SESS/$pid.md" ]; then
       session_ok "$SESS/$pid.md" || return 1
+      # The file says when its process started, and this pid started at another
+      # time: the system gave the pid out again, and the file is the old
+      # process's. Its person, its scope, its hold and its session id are not
+      # this session's. A claim puts the old claim in the ledger and starts a
+      # new file (cmd_claim); until then this session has none.
+      other_process "$SESS/$pid.md" "$(proc_start "$pid")" && return 1
       printf '%s' "$SESS/$pid.md"; return 0
     fi
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
@@ -781,10 +823,13 @@ claim_person() {   # claim_person <pid> <chosen session name> [<session id> <pan
 # stayed hidden for the rest of its life: off the list, deaf to `tell`, its hold
 # and its person gone.
 # Past the grace period somebody else may hold the person; then this one draws again.
+# Exit 1: nothing was changed. The file is another process's (a pid given out
+# again), or the board lock could not be had.
 revive() {   # revive <session file> — only ever this process's own
   [ "$(get_field "$1" status)" = DONE ] || return 0
   local person others
-  board_lock
+  other_process "$1" "$(proc_start "$(get_field "$1" pid)")" && return 1
+  board_lock || { board_unlock; return 1; }
   if [ "$(get_field "$1" status)" = DONE ]; then   # read again: it may have changed while this waited
     set_field "$1" status ACTIVE
     person=$(person_of "$1")
@@ -851,27 +896,43 @@ get_field() { [ -f "$1" ] || return 0; sed -n "s/^$2: //p" "$1" 2>/dev/null | he
 
 # Replaces the key in place, or adds it at the end of the frontmatter block if
 # this file predates the field (session files outlive script changes).
+# The file is read whole and a new one is moved into its place. That is one step
+# under the board lock: a write that read the file before another write landed
+# would put the old text back (a heartbeat that undid a claim's session id).
+# Without the lock nothing is written, and the exit is 1.
 set_field() {
-  local f=$1 k=$2 v=$3 tmp="$1.tmp.$$"
-  awk -v k="$k" -v v="$v" '
-    !seen && index($0, k": ")==1 { print k": " v; seen=1; next }
-    !seen && !added && $0 == "" { print k": " v; print ""; added=1; next }
-    { print }
-  ' "$f" > "$tmp" 2>/dev/null && mv "$tmp" "$f"
+  local f=$1 k=$2 v=$3 tmp="$1.tmp.$$" rc=1
+  if board_lock; then
+    awk -v k="$k" -v v="$v" '
+      !seen && index($0, k": ")==1 { print k": " v; seen=1; next }
+      !seen && !added && $0 == "" { print k": " v; print ""; added=1; next }
+      { print }
+    ' "$f" > "$tmp" 2>/dev/null && mv "$tmp" "$f" && rc=0
+  else
+    board_busy
+  fi
+  board_unlock
+  return "$rc"
 }
 
 touch_updated() {
+  # The lock is taken for each group of writes, not for the whole of this: what
+  # is between them reads other files, and every hook of every session runs it.
+  board_lock
   set_field "$1" updated "$(now_h)"
   set_field "$1" epoch   "$(now_e)"
+  board_unlock
   # Re-read the name rather than freezing it at claim time: /rename usually
   # happens a few minutes in, once the session's actual subject is clear.
   local pid name status
   pid=$(get_field "$1" pid)
   if [ -n "$pid" ]; then
     if name=$(cc_meta "$pid" name) && [ -n "$name" ]; then
-      set_field "$1" name "$name"; set_field "$1" name_source user
+      if [ "$(get_field "$1" name)" != "$name" ] || [ "$(get_field "$1" name_source)" != user ]; then
+        board_lock; set_field "$1" name "$name"; set_field "$1" name_source user; board_unlock
+      fi
     elif [ -z "$(name_of "$1")" ]; then
-      set_field "$1" name "$(auto_name "$pid")"; set_field "$1" name_source auto
+      board_lock; set_field "$1" name "$(auto_name "$pid")"; set_field "$1" name_source auto; board_unlock
     fi
     # A theme switch lands here, not in the switching process: a session file is
     # written only by its own agent, so everyone re-names on their own next hook
@@ -884,8 +945,9 @@ touch_updated() {
     if [ -n "$person" ] && [ "$person" != "$AB_PERSON_NONE" ] \
        && { [ "$person" = "$pin" ] || { [ -z "$pin" ] && person_in_theme "$person"; }; }; then
       :
+    elif ! board_lock; then
+      board_unlock   # no lock, no redraw: the next hook looks again
     else
-      board_lock
       if [ -n "$pin" ] && [ "$person" != "$pin" ] && ! person_taken "$pin"; then
         set_field "$1" person "$pin"; set_field "$1" person_source pin
       elif [ "$person" = "$AB_PERSON_NONE" ]; then
@@ -903,15 +965,24 @@ touch_updated() {
       fi
       board_unlock
     fi
-    status=$(cc_meta "$pid" status) && [ -n "$status" ] && set_field "$1" state "$status"
+    status=$(cc_meta "$pid" status) && [ -n "$status" ] \
+      && [ "$(get_field "$1" state)" != "$status" ] && set_field "$1" state "$status"
   fi
+  return 0
 }
 
 # The log is written only when an agent explicitly notes something, and it is no
 # longer injected into anyone's context — `agentboard log` reads it on demand.
 # Auto-written lines ("about to run: cd ...", intent toggling on and off) cost
 # every new session tokens to be told things it could not act on.
-append_log() { printf -- '- %s %s\n' "$(hhmm)" "$2" >> "$1"; }
+# Under the board lock: a line added while set_field has the old text in hand
+# would go with the old file.
+append_log() {
+  local rc=1
+  if board_lock; then printf -- '- %s %s\n' "$(hhmm)" "$2" >> "$1" && rc=0; else board_busy; fi
+  board_unlock
+  return "$rc"
+}
 
 is_live() {
   live_by "$1" "$(get_field "$1" status)" "$(get_field "$1" pid)" "$(get_field "$1" epoch)"
@@ -1832,7 +1903,100 @@ fmt_list() {   # fmt_list "<newline-separated>" [text when empty]
   printf '%s' "$v" | paste -sd, - | sed 's/,/, /g'
 }
 
+# --- the end of a session that could not have the board lock ------------------
+# A session end frees the session's leases and marks its file DONE. Both are done
+# under the board lock, so a session that starts under the same pid at that moment
+# (the next thread of a Codex daemon) is seen by the end, which then leaves the
+# file alone, or it sees the file signed off and starts its own.
+# A hook cannot wait long for the lock: Codex gives SessionEnd one second. An end
+# that did not have it in time did nothing, and the leases stayed with a process
+# that goes on running. Now the end is written down: locks/end.<pid>.<writer pid>,
+# with when the process started and which session ended. The next step that has
+# the lock for that pid applies it: a hook of a session under the pid, a claim
+# under the pid, a sweep. Each of them applies it before it does its own work, so
+# an end and the start after it keep the order they had.
+defer_end() {   # defer_end <agent pid> <session id, or nothing when the host gave none>
+  local ps; ps=$(proc_start "$1")
+  # One write, so a reader sees all of it or no `session:` line.
+  printf 'pstart: %s\nsession: %s\n' "${ps:--}" "${2:--}" > "$LOCKS/end.$1.$$" 2>/dev/null
+}
+
+# What an end does, for a pid: the same as hook_end with the lock, but keyed by
+# the pid in the record and not by who runs it. Called with the board lock held.
+end_pid() {   # end_pid <agent pid>
+  local p=$1 f="$SESS/$1.md" d o
+  if [ -f "$VLEASE/owner" ]; then
+    o=$(sed -n 's/^pid: //p' "$VLEASE/owner" 2>/dev/null | head -1)
+    [ "$o" = "$p" ] && rm -rf "$VLEASE"
+  fi
+  for d in "$ENVLEASES"/*.lease; do
+    [ -f "$d/owner" ] || continue
+    o=$(sed -n 's/^pid: //p' "$d/owner" 2>/dev/null | head -1)
+    [ "$o" = "$p" ] && rm -rf "$d"
+  done
+  if session_ok "$f" && ! other_process "$f" "$(proc_start "$p")" \
+     && [ "$(get_field "$f" status)" != DONE ]; then
+    set_field "$f" status DONE; set_field "$f" hold '-'
+    set_field "$f" updated "$(now_h)"; set_field "$f" epoch "$(now_e)"
+  fi
+  rm -f "$LOCKS/allow-edit.$p"
+  return 0
+}
+
+# Is a written-down end the end of the session the file describes? The same rule
+# as hook_end: yes, unless the file names a session and the record names another.
+# A record of a process that is gone, or of the process that had the pid before,
+# applies to nothing. A record with no `session:` line is half-written: it stays
+# while its writer runs.
+apply_ended() {   # apply_ended <agent pid> -> 1 when an end waits and the lock could not be had
+  local p=$1 f="$SESS/$1.md" m now line rps rsid stored hit=0
+  local -a seen=()
+  set -- "$LOCKS/end.$p."*
+  [ -e "$1" ] || return 0               # the usual case: nothing waits, no lock taken
+  board_lock || { board_unlock; return 1; }
+  now=$(proc_start "$p")
+  for m in "$LOCKS/end.$p."*; do
+    [ -e "$m" ] || continue
+    rps=""; rsid=""
+    while IFS= read -r line; do
+      case "$line" in
+        'pstart: '*)  rps=${line#pstart: } ;;
+        'session: '*) rsid=${line#session: } ;;
+      esac
+    done < "$m" 2>/dev/null
+    if [ -z "$rsid" ]; then
+      kill -0 "${m##*.}" 2>/dev/null || rm -f "$m"
+      continue
+    fi
+    seen+=("$m")
+    kill -0 "$p" 2>/dev/null || continue
+    [ "$rps" != "-" ] && [ -n "$now" ] && [ "$rps" != "$now" ] && continue
+    if session_ok "$f" && ! other_process "$f" "$now"; then
+      stored=$(get_field "$f" session)
+      case "$stored" in
+        ''|'-') hit=1 ;;
+        *) if [ "$rsid" = "-" ] || [ "$rsid" = "$stored" ]; then hit=1; fi ;;
+      esac
+    else
+      hit=1     # no file names another session: the leases under the pid are this one's
+    fi
+  done
+  [ "$hit" = 1 ] && end_pid "$p"
+  # The records go after the end is done: an end that was cut short is done again.
+  [ "${#seen[@]}" -gt 0 ] && rm -f "${seen[@]}"
+  board_unlock
+  return 0
+}
+
 # --- commands --------------------------------------------------------------
+# A claim that would replace the file of the session that had this pid before, and
+# could not put that session's person in the ledger first. Called under the lock.
+claim_kept_old() {   # claim_kept_old <session file>
+  board_unlock
+  printf 'agentboard: could not save the person of the session that had this pid before (%s cannot be written).\n' "$RETIRED" >&2
+  printf 'Its file stays (%s), and no claim was made. Run it again when the directory can be written.\n' "$1" >&2
+}
+
 cmd_claim() {
   local pid="" agent="" session="" cwd="" scope="" name="" named=0
   while [ $# -gt 0 ]; do
@@ -1857,7 +2021,7 @@ cmd_claim() {
   [ -n "$name" ] || name=$(cc_meta "$pid" name) || name=""
   local name_src=""; [ -n "$name" ] && name_src=user
 
-  local f="$SESS/$pid.md" pane had="" sid_new sid_old="" pstart have=0 st
+  local f="$SESS/$pid.md" pane had="" sid_new sid_old="" pstart have=0 st stopped
   pane=$(pane_id "$pid")
   pstart=$(proc_start "$pid")
   sid_new=$session; case "$sid_new" in '-') sid_new="" ;; esac
@@ -1865,7 +2029,18 @@ cmd_claim() {
   # read, and this session's file is written (see board_lock). The session id is
   # written in the same step, which is what the end of a Codex thread relies on
   # (hook_end).
-  board_lock
+  # Without the lock there is no claim. Two claims that both gave up the wait
+  # and went on drew the same person, which is the fault the lock is there for.
+  # Exit 75 (a failure that goes if the command is run again): the caller runs
+  # it again, and a hook does on the session's next tool call (reclaim_if_lost).
+  if ! board_lock; then
+    board_unlock
+    printf 'agentboard: the board is busy: another process has the board lock (%s). No claim was made. Run it again.\n' "$BOARD_LOCK" >&2
+    return 75
+  fi
+  # An end of a session under this pid that waited for the lock comes first: the
+  # order is then the one the events had (see defer_end).
+  apply_ended "$pid"
   session_ok "$f" && have=1
   if [ "$have" = 1 ]; then
     st=$(get_field "$f" status)
@@ -1877,8 +2052,11 @@ cmd_claim() {
       # this session starts a file of its own.
       # The old file goes once its claim is in the ledger. Left here it would
       # read as live, because the pid is, and keep its person from everyone.
-      if [ "$st" = DONE ]; then retire_person "$f" "$(get_field "$f" epoch)"
-      else retire_person "$f" "$(now_e)"; fi && rm -f "$f"
+      # It goes only then. If the ledger cannot be written, the old file is the
+      # one record of who had the person: it stays, and there is no claim.
+      if [ "$st" = DONE ]; then stopped=$(get_field "$f" epoch); else stopped=$(now_e); fi
+      retire_person "$f" "$stopped" || { claim_kept_old "$f"; return 1; }
+      rm -f "$f"
       have=0
     elif [ "$st" != "ACTIVE" ]; then
       # A file marked DONE under a pid that is claiming again. The same session,
@@ -1892,7 +2070,9 @@ cmd_claim() {
       elif same_process "$f" "$pstart"; then
         had=$(person_of "$f")
       else
-        retire_person "$f" "$(get_field "$f" epoch)" && rm -f "$f"
+        retire_person "$f" "$(get_field "$f" epoch)" || { claim_kept_old "$f"; return 1; }
+        rm -f "$f"
+        have=0
       fi
     fi
   fi
@@ -1978,19 +2158,25 @@ ensure_file() { find_file || { cmd_claim >/dev/null; find_file; }; }
 # them: releasing a lease writes a note, and that is part of signing off.
 working_file() {
   local f; f=$(ensure_file) || return 1
-  revive "$f" >/dev/null 2>&1
+  # A session that could not be made live again (no board lock) is not a working
+  # one: the command stops here, and says why.
+  revive "$f" >/dev/null 2>&1 || { board_busy; return 1; }
   printf '%s' "$f"
 }
 
 cmd_note() {
-  local f; f=$(ensure_file) || return 0
-  append_log "$f" "$*"; touch_updated "$f"
+  local f rc=0; f=$(ensure_file) || return 0
+  append_log "$f" "$*" || rc=1   # not written: append_log has said why
+  touch_updated "$f"
+  return "$rc"
 }
 
 cmd_set() { # cmd_set <field> <value...>
-  local k=$1; shift
-  local f; f=$(working_file) || return 0
-  set_field "$f" "$k" "$*"; touch_updated "$f"
+  local k=$1 rc=0; shift
+  local f; f=$(working_file) || return 1
+  set_field "$f" "$k" "$*" || rc=1   # not written: set_field has said why
+  touch_updated "$f"
+  return "$rc"
 }
 
 # `intent` was prose standing in for what hold/release and the file sets now say
@@ -2018,7 +2204,9 @@ cmd_log() {
 # ACTIVE again (revive). Its person stays its own for the grace period.
 cmd_done() {
   local f; f=$(find_file) || return 0
+  board_lock || { board_unlock; board_busy; return 1; }
   set_field "$f" status DONE; set_field "$f" hold '-'; touch_updated "$f"
+  board_unlock
 }
 
 cmd_heartbeat() { local f; f=$(find_file) || return 0; touch_updated "$f"; }
@@ -2032,10 +2220,14 @@ cmd_hold() {
   repo=$(repo_of "$PWD")
   [ -n "$repo" ] || { printf 'not in a git repo — nothing to hold.\n' >&2; return 1; }
   branch=$(branch_of "$PWD")
+  # All of the hold or none of it: "holding" is not said for a hold that was not
+  # written.
+  board_lock || { board_unlock; board_busy; return 1; }
   set_field "$f" hold "$repo"
   set_field "$f" hold_since "$(now_h)"
   set_field "$f" repo "$repo"; set_field "$f" branch "$branch"
   touch_updated "$f"
+  board_unlock
   printf 'holding %s @ %s\n' "$(basename "$repo")" "${branch:-?}"
   cmd_check
 }
@@ -2045,8 +2237,10 @@ cmd_release() {
   f=$(find_file) || { printf 'no session file\n' >&2; return 1; }
   repo=$(get_field "$f" hold)
   case "$repo" in ''|'-') repo=$(repo_of "$PWD") ;; esac
+  board_lock || { board_unlock; board_busy; return 1; }
   set_field "$f" hold '-'; set_field "$f" hold_since '-'
   touch_updated "$f"
+  board_unlock
   [ -n "$repo" ] || { printf 'released.\n'; return 0; }
   pid=$(get_field "$f" pid)
   left=$(live_paths "$pid" "$repo")
@@ -3890,6 +4084,15 @@ retire_and_drop() {   # retire_and_drop <session file> <epoch it stopped looking
 cmd_sweep() {
   local nowe; nowe=$(now_e)
   SW_S=0; SW_M=0; SW_R=0; SW_W=0; SW_L=0; SW_F=0
+  # Session ends that waited for the board lock (defer_end). One of a process
+  # that is gone has nothing left to do: its leases go with the pid.
+  local epid
+  for f in "$LOCKS"/end.*; do
+    [ -e "$f" ] || continue
+    epid=${f##*/end.}; epid=${epid%%.*}
+    case "$epid" in ''|*[!0-9]*) continue ;; esac
+    if kill -0 "$epid" 2>/dev/null; then apply_ended "$epid"; else rm -f "$f"; fi
+  done
   for f in "$SESS"/*.md; do
     [ -e "$f" ] || continue
     local st pid ep age
@@ -4551,17 +4754,35 @@ gate_file_write() {
 }
 
 # A live session whose file was lost (swept, deleted by hand) or left unusable
-# (find_file refuses one with no pid) registers again on its next hook, so its
-# claims and name come back without a restart. The new file's inbox floor is now:
-# what was broadcast before it is not delivered again.
+# (find_file refuses one with no pid, and one that another process wrote under the
+# same pid) registers again on its next hook, so its claims and name come back
+# without a restart. The new file's inbox floor is now: what was broadcast before
+# it is not delivered again.
 # The hook's payload says which session this is. It goes into the new file, and it
 # is what gives a Codex thread on a restarted daemon (a new pid, so no file) the
 # person it had: without the id the thread was a stranger and drew another.
+# Two more things are put right here, before the hook reads the board:
+# - an end of a session under this pid that waited for the board lock is applied
+#   (apply_ended);
+# - a file marked DONE that names another session than the one this hook is for.
+#   The session that started here after it has no file of its own (its start did
+#   not claim: the board was busy, or the host sent no start). A revive would give
+#   it the last session's id and scope. A claim starts its own file, with the
+#   same person when the process is the same one (cmd_claim).
 reclaim_if_lost() {   # reclaim_if_lost <hook payload>
-  local p sid cwd
-  find_file >/dev/null 2>&1 && return 0
-  p=$(agent_pid); is_agent_comm "$p" || return 0
-  sid=$(printf '%s' "${1:-}" | jget session_id 2>/dev/null) || sid=""
+  local p sid cwd f old
+  if f=$(find_file 2>/dev/null); then
+    p=${f##*/}; p=${p%.md}
+    apply_ended "$p" >/dev/null 2>&1
+    [ "$(get_field "$f" status)" = DONE ] || return 0
+    old=$(get_field "$f" session)
+    case "$old" in ''|'-') return 0 ;; esac
+    sid=$(printf '%s' "${1:-}" | jget session_id 2>/dev/null) || sid=""
+    { [ -n "$sid" ] && [ "$sid" != "$old" ]; } || return 0
+  else
+    p=$(agent_pid); is_agent_comm "$p" || return 0
+    sid=$(printf '%s' "${1:-}" | jget session_id 2>/dev/null) || sid=""
+  fi
   cwd=$(printf '%s' "${1:-}" | jget cwd 2>/dev/null) || cwd=""
   cmd_claim --pid "$p" --session "${sid:--}" --cwd "${cwd:-$PWD}" >/dev/null 2>&1 || true
 }
@@ -4574,10 +4795,9 @@ reclaim_if_lost() {   # reclaim_if_lost <hook payload>
 #
 # A sign-off is a shell tool whose command runs one of those four. The words in
 # any other place are data: a file to read whose name has them, a search for them,
-# a commit message, a quoted argument. Such a call is work and brings the session
-# back. So the command is read as the gates read it (tool_command, scan_text), and
-# the sign-off is matched where a command starts.
-AB_SIGNOFF_RE='(^|[;&|({])[[:space:]]*((then|do|else|if|elif|while|until|time|command|exec|!)[[:space:]]+)*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*([^[:space:];&|(){}]*/)?agentboard[[:space:]]+(done|release|(env|vault)[[:space:]]+free)([[:space:];&|)}]|$)'
+# a commit message, a quoted argument, a comment. Such a call is work and brings
+# the session back. So the command is read as the shell reads it (signoff_reader):
+# split into its simple commands, and each one's first word looked at.
 is_signoff_call() {   # is_signoff_call <hook payload>
   local tool cmd
   case "$1" in *agentboard*) ;; *) return 1 ;; esac   # the usual call: nothing to parse
@@ -4585,15 +4805,228 @@ is_signoff_call() {   # is_signoff_call <hook payload>
   case "|$SHELL_TOOLS|" in *"|$tool|"*) ;; *) return 1 ;; esac
   cmd=$(printf '%s' "$1" | tool_command 2>/dev/null) || return 1
   [ -n "$cmd" ] || return 1
-  cmd=$(printf '%s' "$cmd" | scan_text) || return 1
-  printf '%s' "$cmd" | command grep -Eq -- "$AB_SIGNOFF_RE"
+  [ "$(printf '%s' "$cmd" | signoff_reader)" = yes ]
+}
+# stdin: a shell command. stdout: "yes" when one of its commands is `agentboard`
+# with done, release, env free or vault free; else "no".
+# What the reader knows of the shell:
+# - quotes and backslashes go from a word before it is compared, so
+#   "/path/to/agentboard" release is a sign-off and echo "agentboard done" is not;
+# - a # where a word starts is a comment to the end of the line;
+# - the body of a here-document is data;
+# - ; & | && || ( ) and a new line end a command; $( ) and backquotes hold commands;
+# - a redirection and its target are not words of the command;
+# - assignments, shell keywords, and command, exec, env, nohup, time, nice,
+#   timeout, sudo come before the command word;
+# - bash -c, sh -c and eval run their text, which is read the same way.
+# A word that the shell fills in when it runs ($AB done) is not known here, and is
+# not a sign-off. Quotes that do not close: "no", the call counts as work.
+signoff_reader() {
+  python3 -c '
+import re, sys
+
+class Open(Exception):
+    pass
+
+def close_paren(s, i):
+    """s[i] is "(": -> the index of the ")" that closes it."""
+    depth, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2; continue
+        if c == "\x27":
+            j = s.find("\x27", i + 1)
+            if j < 0: raise Open()
+            i = j + 1; continue
+        if c == "\"":
+            i += 1
+            while i < n and s[i] != "\"":
+                i += 2 if s[i] == "\\" else 1
+            if i >= n: raise Open()
+            i += 1; continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0: return i
+        i += 1
+    raise Open()
+
+def commands(s):
+    """-> the simple commands in s, each a list of words with the quotes removed."""
+    out, words, cur = [], [], None
+    skip_next = [False]     # the next word is the target of a redirection
+    heredocs = []           # (delimiter, strip tabs) to read after this line
+    want_delim = [None]     # set while the word being read is a heredoc delimiter
+    i, n = 0, len(s)
+
+    def end_word():
+        nonlocal cur
+        if cur is None: return
+        w = "".join(cur); cur = None
+        if want_delim[0] is not None:
+            heredocs.append((w, want_delim[0])); want_delim[0] = None
+        elif skip_next[0]:
+            skip_next[0] = False
+        else:
+            words.append(w)
+    def end_cmd():
+        nonlocal words
+        end_word()
+        if words: out.append(words)
+        words = []
+    def add(text):
+        nonlocal cur
+        if cur is None: cur = []
+        cur.append(text)
+
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            if i + 1 < n and s[i + 1] == "\n":
+                i += 2; continue                      # a line that goes on
+            add(s[i + 1] if i + 1 < n else ""); i += 2; continue
+        if c == "\x27":
+            j = s.find("\x27", i + 1)
+            if j < 0: raise Open()
+            add(s[i + 1:j]); i = j + 1; continue
+        if c == "$" and s.startswith("$\x27", i):
+            add(""); i += 2
+            while i < n and s[i] != "\x27":
+                if s[i] == "\\" and i + 1 < n:
+                    add(s[i + 1]); i += 2
+                else:
+                    add(s[i]); i += 1
+            if i >= n: raise Open()
+            i += 1; continue
+        if c == "$" and s.startswith("$(", i):
+            j = close_paren(s, i + 1)
+            out.extend(commands(s[i + 2:j]))
+            add("\0"); i = j + 1; continue           # what it prints is not known
+        if c == "`":
+            j = i + 1
+            while j < n and s[j] != "`":
+                j += 2 if s[j] == "\\" else 1
+            if j >= n: raise Open()
+            out.extend(commands(s[i + 1:j].replace("\\`", "`")))
+            add("\0"); i = j + 1; continue
+        if c == "\"":
+            add(""); i += 1
+            while True:
+                if i >= n: raise Open()
+                d = s[i]
+                if d == "\"":
+                    i += 1; break
+                if d == "\\" and i + 1 < n:
+                    e = s[i + 1]
+                    if e == "\n": pass
+                    elif e in "\"\\$`": add(e)
+                    else: add(d + e)
+                    i += 2; continue
+                if d == "$" and s.startswith("$(", i):
+                    j = close_paren(s, i + 1)
+                    out.extend(commands(s[i + 2:j]))
+                    add("\0"); i = j + 1; continue
+                if d == "`":
+                    j = i + 1
+                    while j < n and s[j] != "`":
+                        j += 2 if s[j] == "\\" else 1
+                    if j >= n: raise Open()
+                    out.extend(commands(s[i + 1:j].replace("\\`", "`")))
+                    add("\0"); i = j + 1; continue
+                add(d); i += 1
+            continue
+        if c in " \t\r":
+            end_word(); i += 1; continue
+        if c == "#" and cur is None:
+            while i < n and s[i] != "\n": i += 1     # a comment; the new line stays
+            continue
+        if c == "\n":
+            end_cmd(); i += 1
+            while heredocs:                           # the bodies are data
+                delim, strip = heredocs.pop(0)
+                while i < n:
+                    k = s.find("\n", i)
+                    line = s[i:] if k < 0 else s[i:k]
+                    i = n if k < 0 else k + 1
+                    if (line.lstrip("\t") if strip else line) == delim: break
+            continue
+        if c in "<>" or (c == "&" and i + 1 < n and s[i + 1] == ">"):
+            if cur is not None and "".join(cur).isdigit():
+                cur = None                            # 2> : the number is not a word
+            end_word()
+            if s.startswith("<<<", i):
+                skip_next[0] = True; i += 3; continue
+            if s.startswith("<<", i):
+                i += 2
+                strip = i < n and s[i] == "-"
+                if strip: i += 1
+                want_delim[0] = strip; continue
+            if c in "<>" and i + 1 < n and s[i + 1] == "(":
+                i += 1; continue                      # <( ) and >( ): commands, read next
+            while i < n and s[i] in "<>&|":
+                i += 1
+            skip_next[0] = True; continue
+        if c in ";&|()":
+            end_cmd(); i += 1; continue
+        add(c); i += 1
+    end_cmd()
+    return out
+
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
+KEYWORD = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"}
+BEFORE = {"command", "exec", "env", "nohup", "time", "nice", "timeout", "sudo", "builtin"}
+TAKES_VALUE = {("sudo", "-u"), ("nice", "-n"), ("env", "-u"), ("exec", "-a"),
+               ("timeout", "-k"), ("timeout", "-s")}
+
+def signoff(words, depth=0):
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if ASSIGN.match(w) or w in KEYWORD:
+            i += 1; continue
+        b = w.rsplit("/", 1)[-1]
+        if b in BEFORE:
+            i += 1
+            while i < len(words) and (words[i].startswith("-") or (b == "env" and ASSIGN.match(words[i]))):
+                if (b, words[i]) in TAKES_VALUE: i += 1
+                i += 1
+            if b == "timeout" and i < len(words): i += 1     # the time
+            continue
+        break
+    if i >= len(words):
+        return False
+    prog, args = words[i].rsplit("/", 1)[-1], words[i + 1:]
+    if depth < 4:
+        if prog in ("bash", "sh", "zsh", "dash"):
+            for k, a in enumerate(args):
+                if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", a):
+                    return k + 1 < len(args) and any_signoff(args[k + 1], depth + 1)
+                if not a.startswith("-"): break
+            return False
+        if prog == "eval":
+            return any_signoff(" ".join(args), depth + 1)
+    if prog != "agentboard":
+        return False
+    return args[:1] in (["done"], ["release"]) or args[:2] in (["env", "free"], ["vault", "free"])
+
+def any_signoff(text, depth=0):
+    try:
+        cmds = commands(text)
+    except (Open, RecursionError):
+        return False
+    return any(signoff(w, depth) for w in cmds)
+
+print("yes" if any_signoff(sys.stdin.read()) else "no")
+' 2>/dev/null
 }
 revive_on_tool() {   # revive_on_tool <hook payload>
   local f
   f=$(find_file 2>/dev/null) || return 0
   [ "$(get_field "$f" status)" = DONE ] || return 0
   is_signoff_call "$1" && return 0
-  revive "$f" >/dev/null 2>&1
+  revive "$f" >/dev/null 2>&1   # without the board lock it stays DONE: the next call tries again
   return 0
 }
 
@@ -4938,38 +5371,41 @@ else:
 # A session ending holds nothing: drop its hold and its vault lease, or the next
 # agent inherits an exclusion owned by a process that no longer exists.
 hook_end() {
-  local payload sid="" f mine locked=1
+  local payload sid="" f p mine
   payload=$(cat)
   [ "$AB_HOST" = codex ] && sid=$(printf '%s' "$payload" | jget session_id 2>/dev/null)
-  # One Codex app-server daemon hosts several sessions under one pid, so they
-  # share one session file. The end of one of them is not the end of the session
-  # the file describes: leave its leases, its hold and its status alone.
-  #
+  f=$(find_file 2>/dev/null) || f=""
+  if [ -n "$f" ]; then p=${f##*/}; p=${p%.md}; else p=$(agent_pid); fi
   # Whose file it is and the signing off are one step under the board lock. A
   # claim writes the session id under the same lock, so a thread that starts
   # while this hook runs either has the file before the id is read here, and
   # this end leaves it alone, or finds it signed off and starts its own.
   # Without the lock the new thread could take the file between the two, and
   # this end then freed its leases and marked it DONE.
-  # Codex gives SessionEnd one second, so the wait is short. An end that cannot
-  # have the lock in that time does not sign off: a thread that still shows on a
-  # daemon that runs costs less than a live one that loses its leases.
-  if [ "$AB_HOST" = codex ]; then board_lock 0.4 || locked=0; else board_lock || locked=0; fi
+  # So without the lock nothing is signed off here, whatever the file says and
+  # on every host. Codex gives SessionEnd one second, so its wait is short. The
+  # end is written down, and the next step that has the lock applies it
+  # (defer_end): the leases do not stay with a daemon that goes on running.
+  if [ "$AB_HOST" = codex ]; then board_lock 0.4; else board_lock; fi || {
+    board_unlock
+    defer_end "$p" "$sid"
+    exit 0
+  }
+  apply_ended "$p"   # an earlier end that waited comes first
+  # One Codex app-server daemon hosts several sessions under one pid, so they
+  # share one session file. The end of one of them is not the end of the session
+  # the file describes: leave its leases, its hold and its status alone.
   if [ "$AB_HOST" = codex ] && f=$(find_file 2>/dev/null); then
     mine=$(get_field "$f" session)
     case "$mine" in ''|'-') ;; *)
-      if [ "$locked" = 0 ] || { [ -n "$sid" ] && [ "$sid" != "$mine" ]; }; then
-        board_unlock; exit 0
-      fi ;;
+      if [ -n "$sid" ] && [ "$sid" != "$mine" ]; then board_unlock; exit 0; fi ;;
     esac
   fi
   vault_i_hold && cmd_vault free >/dev/null 2>&1
   env_free_mine >/dev/null 2>&1
   cmd_done
   board_unlock
-  rm -f "$(allow_edit_file)"   # the .lock goes in a sweep, once this pid is dead
-  # Codex gives SessionEnd one second. The sweep is not urgent: the next
-  # session start runs one anyway.
+  rm -f "$(allow_edit_file)"
   [ "$AB_HOST" = codex ] || cmd_sweep
   exit 0
 }

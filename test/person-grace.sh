@@ -16,6 +16,14 @@
 #   - a Codex SessionEnd and a claim take the same lock; only a shell call that runs
 #     a sign-off leaves a DONE session DONE; a hook that finds no file makes one
 #     with the thread's session id
+#   - without the board lock nothing is written: a claim exits 75, a DONE session
+#     stays DONE, no person is drawn again, and a heartbeat that waits in its
+#     rename holds a claim back
+#   - a session end that cannot have the lock is written down and applied later,
+#     to the session it was the end of
+#   - a claim that cannot save the person of the process before it changes nothing
+#   - a tool hook does not take over the file of another process or another
+#     session; a sign-off is found as the shell reads the command
 #
 # Self-contained: throwaway boards, a local theme pack, stand-in agents.
 #
@@ -649,6 +657,352 @@ for ev in PreToolUse PostToolUse Stop; do
   check "$ev with no file: the thread has its person"      "$(o "lost-person-$ev")" "$P0"
   check "$ev with no file: and its session id"             "$(o "lost-session-$ev")" 'thread-2'
 done
+
+echo
+echo 'the board lock, held for longer than a claim waits'
+board b16 4
+for i in 1 2 3 4; do standin; claim --pid "$SP" --session "old-$i"; eval "O$i=$SP"; done
+for i in 1 2 3 4; do eval "gone \$O$i"; done
+"$AB" sweep >/dev/null 2>&1
+check 'all four names are in grace'                        "$(ledger_n)" '4'
+hold_lock() {   # another process has the board lock, until free_lock
+  mkdir -p "$AGENT_BOARD_DIR/locks"
+  python3 "$T/hold-lock.py" "$AGENT_BOARD_DIR/locks/board.flock" "$T/held" &
+  holder=$!; printf '%s\n' "$holder" >> "$T/fakes"
+  local i=0; while [ ! -e "$T/held" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+}
+free_lock() { rm -f "$T/held"; wait "$holder" 2>/dev/null; }
+standin; N1=$SP; standin; N2=$SP
+hold_lock
+C=""
+for p in $N1 $N2; do
+  ( AGENT_BOARD_LOCK_WAIT_SECS=1 "$AB" claim --agent codex --cwd "$T" --pid "$p" --session "new-$p" \
+      >/dev/null 2>"$T/busy.$p"; echo "$?" > "$T/rc.$p" ) &
+  C="$C $!"
+done
+wait $C
+check 'a claim that cannot have the lock exits 75'         "$(cat "$T/rc.$N1")" '75'
+check 'and so does the one that started with it'           "$(cat "$T/rc.$N2")" '75'
+has   'it says that the board is busy'                     "$(cat "$T/busy.$N1")" 'the board is busy'
+check 'neither wrote a session file' \
+  "$([ -e "$(sfile "$N1")" ] || [ -e "$(sfile "$N2")" ] && echo there || echo none)" 'none'
+check 'and no claim in the ledger was used'                "$(ledger_n)" '4'
+free_lock
+C=""
+for p in $N1 $N2; do claim --pid "$p" --session "new-$p" & C="$C $!"; done
+wait $C
+has    'with the lock free, the first has a person'        "$(person "$N1")" '^Crew-[1-4]$'
+has    'and the second'                                    "$(person "$N2")" '^Crew-[1-4]$'
+differ 'and they are two persons'                          "$(person "$N1")" "$(person "$N2")"
+
+echo
+echo 'a claim that would replace the file of the process before it, with no ledger'
+board b17 6
+no_ledger()   { mv "$AGENT_BOARD_DIR/retired" "$AGENT_BOARD_DIR/retired.keep"; : > "$AGENT_BOARD_DIR/retired"; }
+with_ledger() { rm -f "$AGENT_BOARD_DIR/retired"; mv "$AGENT_BOARD_DIR/retired.keep" "$AGENT_BOARD_DIR/retired"; }
+standin; A=$SP
+claim --pid "$A" --session s-a --name alpha --scope 'the old work'
+PA=$(person "$A")
+standin; B=$SP
+claim --pid "$B" --session s-c --name gamma --scope 'older work'
+PB=$(person "$B")
+standin; Z=$SP
+claim --pid "$Z" --session s-z; gone "$Z"; "$AB" sweep >/dev/null 2>&1   # the ledger directory is there
+refile "$A" 's/^pstart: .*/pstart: another-start/'
+refile "$B" 's/^status: .*/status: DONE/; /^pstart: /d'
+no_ledger
+"$AB" claim --agent codex --cwd "$T" --pid "$A" --session s-b --name beta >/dev/null 2>"$T/claim.err"; rc=$?
+check 'a file of another process: the claim fails'         "$rc" '1'
+has   'and says why'                                       "$(cat "$T/claim.err")" 'could not save the person'
+check 'the old file stays: its session id'                 "$(field "$(sfile "$A")" session)" 's-a'
+check 'its person'                                         "$(person "$A")" "$PA"
+check 'and its scope'                                      "$(field "$(sfile "$A")" scope)" 'the old work'
+"$AB" claim --agent codex --cwd "$T" --pid "$B" --session s-d --name delta >/dev/null 2>"$T/claim.err"; rc=$?
+check 'a DONE file that names no process: the claim fails too' "$rc" '1'
+check 'and that file stays: its session id'                "$(field "$(sfile "$B")" session)" 's-c'
+check 'and its person'                                     "$(person "$B")" "$PB"
+with_ledger
+claim --pid "$A" --session s-b --name beta
+check 'with the ledger back, the claim is made'            "$(field "$(sfile "$A")" session)" 's-b'
+check 'and the person of the process before is in the ledger' "$(ledger_has "$PA")" '1'
+differ 'not with the new session'                          "$(person "$A")" "$PA"
+claim --pid "$B" --session s-d --name delta
+check 'the same for the file that named no process'        "$(field "$(sfile "$B")" session)" 's-d'
+check 'its person is in the ledger'                        "$(ledger_has "$PB")" '1'
+
+echo
+echo 'hooks of a Codex session when the board lock is not to be had'
+board b18 8
+rm -rf "$T/out" "$T/held" "$T/pause" "$T/mv-paused"; mkdir -p "$T/out" "$T/slowbin"
+# A rename that waits, for the one process that has this directory first in PATH:
+# the write of a field has then read the file, and has not put the new one in place.
+cat > "$T/slowbin/mv" <<'EOS'
+#!/bin/bash
+if [ -e "$T/pause" ]; then
+  : > "$T/mv-paused"
+  while [ -e "$T/pause" ]; do sleep 0.05; done
+fi
+exec /bin/mv "$@"
+EOS
+chmod +x "$T/slowbin/mv"
+cat > "$T/agent-lib.sh" <<'EOS'
+pl() {   # pl <event> <session id> [<command>]
+  EV=$1 SID=$2 A=${3:-} CWD=$T python3 -c '
+import json, os
+e = os.environ
+d = {"session_id": e["SID"], "transcript_path": None, "cwd": e["CWD"],
+     "hook_event_name": e["EV"], "model": "gpt-test", "permission_mode": "default",
+     "turn_id": "t1", "reason": "other"}
+if e["A"]:
+    d.update(tool_name="Bash", tool_use_id="u1", tool_input={"command": e["A"]})
+print(json.dumps(d))'
+}
+f="$AGENT_BOARD_DIR/sessions/$$.md"
+fld() { sed -n "s/^$1: //p" "$f" 2>/dev/null | head -1; }
+put() { printf '%s' "$2" > "$T/out/$1"; }
+edit() { sed "$1" "$f" > "$f.t" && mv "$f.t" "$f"; }
+# Always the last part of a pipeline. The exec puts the hook in the place of the
+# subshell that the pipeline made: the hook's parent is then the stand-in agent.
+hook() { exec "$AB" "hook-$1" --codex >/dev/null 2>&1; }
+hold_lock() {
+  mkdir -p "$AGENT_BOARD_DIR/locks"
+  python3 "$T/hold-lock.py" "$AGENT_BOARD_DIR/locks/board.flock" "$T/held" &
+  holder=$!
+  i=0; while [ ! -e "$T/held" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+}
+free_lock() { rm -f "$T/held"; wait "$holder" 2>/dev/null; }
+lease() { [ -d "$AGENT_BOARD_DIR/locks/env/dev1.lease" ] && echo held || echo free; }
+ends() { ls "$AGENT_BOARD_DIR/locks" 2>/dev/null | grep -c '^end\.' || true; }
+cd "$T"
+EOS
+cat > "$T/agent4.sh" <<'EOS'
+. "$T/agent-lib.sh"
+export AGENT_BOARD_LOCK_WAIT_SECS=1
+
+# The start of the session cannot claim. The next tool call does.
+hold_lock
+pl SessionStart thread-1 | hook start
+put start-busy "$([ -e "$f" ] && echo there || echo none)"
+free_lock
+pl PreToolUse thread-1 'true' | hook pretool
+put start-after "$(fld session)"
+put p0 "$(fld person)"
+"$AB" scope 'first task' >/dev/null 2>&1
+
+# No lock: a DONE session is not made live, a field is not written, a person is
+# not drawn again.
+"$AB" done
+hold_lock
+"$AB" scope 'second task' >/dev/null 2>"$T/out/scope-err"; put scope-rc "$?"
+put busy-scope-status "$(fld status)"; put busy-scope "$(fld scope)"
+pl PreToolUse thread-1 'true' | hook pretool
+put busy-pretool "$(fld status)"
+free_lock
+pl PreToolUse thread-1 'true' | hook pretool
+put free-pretool "$(fld status)"
+edit 's/^person: .*/person: Ghost/'     # not a name of the theme: a heartbeat draws again
+hold_lock
+"$AB" heartbeat 2>/dev/null
+put busy-person "$(fld person)"
+"$AB" done 2>/dev/null; put busy-done-rc "$?"; put busy-done "$(fld status)"
+free_lock
+"$AB" heartbeat
+put free-person "$(fld person)"
+
+# A heartbeat that has read the file, and waits before its rename. The claim of
+# the next thread comes in between.
+export AGENT_BOARD_LOCK_WAIT_SECS=5
+: > "$T/pause"
+PATH="$T/slowbin:$PATH" "$AB" heartbeat &
+hb=$!
+i=0; while [ ! -e "$T/mv-paused" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+put hb-paused "$([ -e "$T/mv-paused" ] && echo paused || echo no)"
+"$AB" claim --session thread-2 >/dev/null 2>&1 &
+cl=$!
+sleep 0.7
+put paused-sid "$(fld session)"
+rm -f "$T/pause"; wait "$hb" "$cl"
+put after-sid "$(fld session)"
+pl SessionEnd thread-1 | hook end
+put after-old-end "$(fld status)"
+export AGENT_BOARD_LOCK_WAIT_SECS=1
+
+# A file that names no session (made by a command, not by a hook): its end takes
+# the lock like any other.
+edit 's/^session: .*/session: -/'
+"$AB" env take dev1 --for 'a test' >/dev/null 2>&1
+put lease-taken "$(lease)"
+hold_lock
+s=$(date +%s%N)
+pl SessionEnd thread-9 | hook end
+put dash-ms "$(( ($(date +%s%N) - s) / 1000000 ))"
+put dash-locked "$(fld status)"; put dash-lease-locked "$(lease)"; put dash-ends "$(ends)"
+free_lock
+"$AB" sweep >/dev/null 2>&1
+put dash-swept "$(fld status)"; put dash-lease-swept "$(lease)"; put dash-ends-swept "$(ends)"
+
+# The end of the thread that has the file, with the lock held: the next hook of
+# the session applies it.
+pl SessionStart thread-3 | hook start
+put t3-sid "$(fld session)"; put t3-status "$(fld status)"
+"$AB" env take dev1 --for 'a test' >/dev/null 2>&1
+hold_lock
+pl SessionEnd thread-3 | hook end
+put own-locked "$(fld status)"; put own-lease-locked "$(lease)"
+free_lock
+pl PostToolUse thread-3 'true' | hook posttool
+put own-applied "$(fld status)"; put own-lease-applied "$(lease)"; put own-ends "$(ends)"
+
+# The end of another thread of the daemon, written down the same way: it is not
+# the end of the thread that has the file.
+pl SessionStart thread-4 | hook start
+"$AB" scope 'thread four' >/dev/null 2>&1
+"$AB" env take dev1 --for 'a test' >/dev/null 2>&1
+hold_lock
+pl SessionEnd thread-3 | hook end
+free_lock
+"$AB" sweep >/dev/null 2>&1
+put other-status "$(fld status)"; put other-sid "$(fld session)"
+put other-lease "$(lease)"; put other-ends "$(ends)"
+
+# An end that waits, and the start of the next thread: the end comes first.
+hold_lock
+pl SessionEnd thread-4 | hook end
+free_lock
+"$AB" claim --session thread-5 >/dev/null 2>&1
+put next-sid "$(fld session)"; put next-status "$(fld status)"
+put next-scope "$(fld scope)"; put next-lease "$(lease)"; put next-person "$(fld person)"
+put next-ends "$(ends)"
+EOS
+AB="$AB" T="$T" "$T/fakebin/codex" "$T/agent4.sh" 2>"$T/out/stderr"
+check 'SessionStart without the lock makes no file'        "$(o start-busy)" 'none'
+check 'the next tool call makes it, with the thread id'    "$(o start-after)" 'thread-1'
+if [ "$(o scope-rc)" != 0 ]; then ok '`scope` on a DONE session without the lock fails'
+else bad '`scope` exited 0 without the lock'; fi
+has   'and says that the board is busy'                    "$(cat "$T/out/scope-err")" 'the board is busy'
+check 'the session stays DONE'                             "$(o busy-scope-status)" 'DONE'
+check 'and the scope is not written'                       "$(o busy-scope)" 'first task'
+check 'a tool call without the lock leaves it DONE'        "$(o busy-pretool)" 'DONE'
+check 'the next one, with the lock, makes it ACTIVE'       "$(o free-pretool)" 'ACTIVE'
+check 'no person is drawn again without the lock'          "$(o busy-person)" 'Ghost'
+if [ "$(o busy-done-rc)" != 0 ]; then ok '`done` without the lock fails'
+else bad '`done` exited 0 without the lock'; fi
+check 'and writes nothing'                                 "$(o busy-done)" 'ACTIVE'
+has   'with the lock, the heartbeat draws one'             "$(o free-person)" '^Crew-[1-8]$'
+check 'the heartbeat waits in its rename'                  "$(o hb-paused)" 'paused'
+check 'a claim does not write while it does'               "$(o paused-sid)" 'thread-1'
+check 'the claim is the later write: its session id stays' "$(o after-sid)" 'thread-2'
+check 'so the end of the earlier thread leaves the file ACTIVE' "$(o after-old-end)" 'ACTIVE'
+check 'the session has a dev environment lease'            "$(o lease-taken)" 'held'
+check 'no session id in the file, lock held: SessionEnd does not sign off' "$(o dash-locked)" 'ACTIVE'
+check 'the lease stays for now'                            "$(o dash-lease-locked)" 'held'
+check 'the end is written down'                            "$(o dash-ends)" '1'
+ms=$(o dash-ms)
+if [ "${ms:-9999}" -lt 1000 ]; then ok "inside the second Codex gives SessionEnd (${ms}ms)"
+else bad "hook-end --codex took ${ms}ms with the lock held"; fi
+check 'with the lock free, a sweep applies it: DONE'       "$(o dash-swept)" 'DONE'
+check 'and the lease is free'                              "$(o dash-lease-swept)" 'free'
+check 'the record is gone'                                 "$(o dash-ends-swept)" '0'
+check 'the next thread has the file'                       "$(o t3-sid)/$(o t3-status)" 'thread-3/ACTIVE'
+check 'its end with the lock held does not sign off'       "$(o own-locked)/$(o own-lease-locked)" 'ACTIVE/held'
+check 'its next hook applies the end: DONE'                "$(o own-applied)" 'DONE'
+check 'and the lease is free'                              "$(o own-lease-applied)" 'free'
+check 'the record is gone'                                 "$(o own-ends)" '0'
+check 'a written-down end of another thread leaves the file' "$(o other-status)/$(o other-sid)" 'ACTIVE/thread-4'
+check 'and the lease'                                      "$(o other-lease)" 'held'
+check 'and the record is gone'                             "$(o other-ends)" '0'
+check 'an end that waits is applied before the claim of the next thread' "$(o next-lease)" 'free'
+check 'which then starts its own file'                     "$(o next-sid)/$(o next-status)" 'thread-5/ACTIVE'
+check 'without the scope of the thread that ended'         "$(o next-scope)" '-'
+has   'and with a person'                                  "$(o next-person)" '^Crew-[1-8]$'
+check 'no record is left'                                  "$(o next-ends)" '0'
+
+echo
+echo 'a tool hook that finds the file of another process, or of another session'
+board b19 8
+rm -rf "$T/out"; mkdir -p "$T/out"
+cat > "$T/agent5.sh" <<'EOS'
+. "$T/agent-lib.sh"
+inledger() { grep -lx "person: $1" "$AGENT_BOARD_DIR"/retired/*.md 2>/dev/null | grep -c . || true; }
+pl SessionStart thread-1 | hook start
+p0=$(fld person); put p0 "$p0"
+"$AB" scope 'the old work' >/dev/null 2>&1
+
+# A DONE file under this pid, written by a process that started at another time.
+"$AB" done
+edit 's/^pstart: .*/pstart: another-start/'
+pl PreToolUse thread-2 'true' | hook pretool
+put stale-status "$(fld status)"; put stale-sid "$(fld session)"; put stale-scope "$(fld scope)"
+put stale-person "$(fld person)"; put stale-ledger "$(inledger "$p0")"
+
+# The same with an ACTIVE file, and a hook that is not PreToolUse.
+"$AB" scope 'more old work' >/dev/null 2>&1
+p1=$(fld person); put p1 "$p1"
+edit 's/^pstart: .*/pstart: another-start/'
+pl PostToolUse thread-3 'true' | hook posttool
+put stale2-sid "$(fld session)"; put stale2-scope "$(fld scope)"
+put stale2-person "$(fld person)"; put stale2-ledger "$(inledger "$p1")"
+
+# This process's own file, DONE, and a tool call of a thread that has no file: it
+# does not become that thread's past.
+"$AB" scope 'work of thread three' >/dev/null 2>&1
+p2=$(fld person); put p2 "$p2"
+"$AB" done
+pl PreToolUse thread-4 'true' | hook pretool
+put own-status "$(fld status)"; put own-sid "$(fld session)"
+put own-scope "$(fld scope)"; put own-person "$(fld person)"
+
+# What is a sign-off, and what only has the words. The session is DONE each time.
+pre() { "$AB" done; pl PreToolUse thread-4 "$1" | hook pretool; fld status; }
+put so-comment   "$(pre 'pwd # earlier step; agentboard done')"
+put so-dq-path   "$(pre '"/opt/agent board/bin/agentboard" release')"
+put so-sq-path   "$(pre "'/opt/board/bin/agentboard' done")"
+put so-var-path  "$(pre '"$HOME/agent-board/bin/agentboard" release')"
+put so-after-comment "$(pre 'agentboard done # finished')"
+put so-word-hash "$(pre 'echo a#b; agentboard done')"
+put so-heredoc   "$(pre "$(printf 'cat <<EOF\nagentboard done\nEOF')")"
+put so-after-heredoc "$(pre "$(printf 'cat <<EOF\nnotes\nEOF\nagentboard done')")"
+put so-newline   "$(pre "$(printf 'git status\nagentboard vault free')")"
+put so-subst     "$(pre 'echo "$(agentboard done)"')"
+put so-bash-c    "$(pre "bash -c 'agentboard release'")"
+put so-if        "$(pre 'if true; then agentboard done; fi')"
+put so-redirect  "$(pre 'agentboard done >/dev/null 2>&1')"
+put so-echo      "$(pre 'echo agentboard done')"
+put so-arg       "$(pre 'agentboard scope "done"')"
+put so-unclosed  "$(pre 'echo "agentboard done')"
+put so-remote    "$(pre 'ssh somehost agentboard done')"
+EOS
+AB="$AB" T="$T" "$T/fakebin/codex" "$T/agent5.sh" 2>"$T/out/stderr"
+P0=$(o p0)
+check 'a DONE file of another process: the tool call starts a file' "$(o stale-status)" 'ACTIVE'
+check 'with the id of the thread that made the call'       "$(o stale-sid)" 'thread-2'
+check 'without the scope of the process before'            "$(o stale-scope)" '-'
+differ 'and without its person'                            "$(o stale-person)" "$P0"
+check 'which stays claimed in the ledger'                  "$(o stale-ledger)" '1'
+check 'an ACTIVE file of another process, PostToolUse: the thread id' "$(o stale2-sid)" 'thread-3'
+check 'not its scope'                                      "$(o stale2-scope)" '-'
+differ 'not its person'                                    "$(o stale2-person)" "$(o p1)"
+check 'which is in the ledger'                             "$(o stale2-ledger)" '1'
+check 'own DONE file, another thread: the call starts a file' "$(o own-status)/$(o own-sid)" 'ACTIVE/thread-4'
+check 'without the scope of the thread before'             "$(o own-scope)" '-'
+check 'and with the person the process has'                "$(o own-person)" "$(o p2)"
+check 'a sign-off after a # is a comment: the call is work' "$(o so-comment)" 'ACTIVE'
+check 'a release by a path in double quotes is a sign-off' "$(o so-dq-path)" 'DONE'
+check 'and by a path in single quotes'                     "$(o so-sq-path)" 'DONE'
+check 'and by a path with a variable in it'                "$(o so-var-path)" 'DONE'
+check 'a comment after a sign-off does not hide it'        "$(o so-after-comment)" 'DONE'
+check 'a # inside a word is no comment'                    "$(o so-word-hash)" 'DONE'
+check 'the body of a here-document is data'                "$(o so-heredoc)" 'ACTIVE'
+check 'a sign-off after a here-document is one'            "$(o so-after-heredoc)" 'DONE'
+check 'and one on the next line'                           "$(o so-newline)" 'DONE'
+check 'and one in $( )'                                    "$(o so-subst)" 'DONE'
+check 'and one that bash -c runs'                          "$(o so-bash-c)" 'DONE'
+check 'and one in an if'                                   "$(o so-if)" 'DONE'
+check 'and one with its output sent away'                  "$(o so-redirect)" 'DONE'
+check 'the words as arguments of echo are data'            "$(o so-echo)" 'ACTIVE'
+check 'so is a scope that says done'                       "$(o so-arg)" 'ACTIVE'
+check 'quotes that do not close: the call is work'         "$(o so-unclosed)" 'ACTIVE'
+check 'a sign-off on another machine is not this session'"'"'s' "$(o so-remote)" 'ACTIVE'
 
 echo
 printf 'pass=%s fail=%s\n' "$pass" "$fail"
