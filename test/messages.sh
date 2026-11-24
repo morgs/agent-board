@@ -315,6 +315,13 @@ codex_screen "$(printf '\033[2m%sAsk Codex to do anything' "$cbg")"
 PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
 check 'a working Codex: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
 rm -f "$AGENT_BOARD_DIR/agentinfo"
+# a Codex app-server daemon carries the pane that started it, not each session's:
+# no poke, exit 1 (no pane), even with a clear box
+codex_screen "$(printf '\033[2m%sAsk Codex to do anything' "$cbg")"
+env HERDR_PANE_ID=w9:p8 sh -c 'sleep 3000; true' app-server </dev/null >/dev/null 2>&1 & DAEMON=$!; disown $DAEMON 2>/dev/null; FAKES+=("$DAEMON")
+sleep 0.2
+PATH="$FAKEBIN:$PATH" "$HP" "$DAEMON"
+check 'a Codex daemon pid: not poked, exit 1' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "1/"
 rm -f "$STUBJSON"
 
 echo

@@ -8,6 +8,11 @@
 pid=$1
 [ -n "$pid" ] || exit 1
 
+# A Codex app-server daemon hosts several sessions under one pid, and its environment
+# names the pane that started it, not the session's own pane. A poke there would
+# wake the wrong agent, so a daemon pid has no pane (as pane_id in agentboard).
+case "$(ps -o args= -p "$pid" 2>/dev/null)" in *app-server*) exit 1 ;; esac
+
 if [ -r /proc/"$pid"/environ ]; then
   pane=$(tr "\0" "\n" < /proc/"$pid"/environ 2>/dev/null | sed -n "s/^HERDR_PANE_ID=//p")
 else

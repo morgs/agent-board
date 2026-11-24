@@ -882,6 +882,9 @@ no status for the board to read, so it stays queued until the poke lands or it r
 its mail; it is queued only when the poke command exits 75, since any other failure
 means there is no pane to poke. `ab-poke-herdr` uses this on purpose:
 
+- A Codex app-server daemon pid hosts several sessions, and its environment names the
+  pane that started it, not each session's own: it has no pane (exit 1), as in the
+  board's `pane_id`, so a poke never wakes the wrong agent.
 - It asks herdr for the pane's state (`herdr agent get`). A `working` agent collects
   its mail at its own Stop (Codex too, through its Stop hook), and a `blocked` one has
   a dialog open: exit 75.
