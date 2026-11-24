@@ -2969,7 +2969,9 @@ cmd__poke() {   # wake an idle local target of a message a peer sent — quiet, 
   local pid=${1:-} name st
   [ -n "$pid" ] && [ -f "$SESS/$pid.md" ] || return 0
   st=$(cc_meta "$pid" status) || st=""
-  [ "$st" = idle ] || return 0
+  # No status is a session that is not Claude (Codex): the poke command reads its
+  # state from the terminal and declines while it works.
+  case "$st" in idle|'') ;; *) return 0 ;; esac
   [ -n "$(poke_cmd)" ] || return 0
   name=$(name_of "$SESS/$pid.md")
   poke_target "$pid" "$name" >/dev/null 2>&1
@@ -3000,7 +3002,7 @@ poke_later() {   # poke_later <pid> — keeps the first time, so the TTL runs fr
 
 cmd__repoke() {
   [ -d "$POKES" ] || return 0
-  local pcmd f pid since try st name sock now
+  local pcmd f pid since try st name sock now rc
   pcmd=$(poke_cmd); now=$(now_e)
   for f in "$POKES"/*; do
     [ -e "$f" ] || continue
@@ -3011,13 +3013,18 @@ cmd__repoke() {
     mv "$f" "$try" 2>/dev/null || continue
     since=$(cat "$try" 2>/dev/null); since=${since:-0}
     st=$(cc_meta "$pid" status) || st=""
-    if [ -z "$pcmd" ] || [ ! -f "$SESS/$pid.md" ] || [ "$st" != idle ] \
+    # A busy Claude session collects at its Stop. One with no status (Codex) stays
+    # queued: the poke command declines while it works, and its Stop drops the
+    # entry here by marking the mail read.
+    if [ -z "$pcmd" ] || [ ! -f "$SESS/$pid.md" ] || { [ -n "$st" ] && [ "$st" != idle ]; } \
        || [ $((now - since)) -ge "$POKE_TTL" ] || ! has_unread "$pid"; then
       rm -f "$try"; continue
     fi
     name=$(name_of "$SESS/$pid.md")
     sock=$(cc_meta "$pid" messagingSocketPath) || sock=""
-    if "$pcmd" "$pid" "$name" "$sock" >/dev/null 2>&1; then
+    rc=0; "$pcmd" "$pid" "$name" "$sock" >/dev/null 2>&1 || rc=$?
+    # A non-Claude target is retried only on 75; any other failure is no pane.
+    if [ "$rc" = 0 ] || { [ -z "$st" ] && [ "$rc" != 75 ]; }; then
       rm -f "$try"
     else
       mv "$try" "$f" 2>/dev/null
@@ -3208,13 +3215,28 @@ poke_target() {   # poke_target <pid> <name>
     busy)
       printf '%s is working — it picks this up at the end of its current turn.\n' "${name:-pid $pid}"
       return 0 ;;
-    '')
-      printf '%s is not a Claude session — it collects with `agentboard inbox`.\n' "${name:-pid $pid}"
-      return 0 ;;
   esac
 
-  # idle: it will not run a hook until something drives it
+  # idle, or not Claude (Codex): neither runs a hook until something drives it.
+  # The poke command reads a non-Claude target's state from its terminal and
+  # declines (exit 75) while it works or has a draft or a dialog open.
   local pcmd; pcmd=$(poke_cmd)
+  if [ -z "$state" ]; then
+    if [ -z "$pcmd" ]; then
+      printf '%s is not a Claude session — it collects with `agentboard inbox`.\n' "${name:-pid $pid}"
+      return 0
+    fi
+    local rc=0; "$pcmd" "$pid" "$name" "$sock" >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+      0) printf '%s is not a Claude session — poked it via %s.\n' "${name:-pid $pid}" "$(basename "$pcmd")"
+         cmd_note "poked ${name:-pid $pid} (not Claude) after messaging it" ;;
+      75) poke_later "$pid"
+         printf '%s could not be poked now (working, text in its input box, or a dialog open) — the board pokes it again on a later tick.\n' "${name:-pid $pid}" ;;
+      # No pane to poke (not in herdr): a retry would find none either.
+      *) printf '%s is not a Claude session and could not be poked — it collects with `agentboard inbox`.\n' "${name:-pid $pid}" ;;
+    esac
+    return 0
+  fi
   if [ -n "$pcmd" ]; then
     if "$pcmd" "$pid" "$name" "$sock" >/dev/null 2>&1; then
       printf '%s was idle — poked it via %s.\n' "$name" "$(basename "$pcmd")"

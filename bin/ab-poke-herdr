@@ -8,6 +8,11 @@
 pid=$1
 [ -n "$pid" ] || exit 1
 
+# A Codex app-server daemon hosts several sessions under one pid, and its environment
+# names the pane that started it, not the session's own pane. A poke there would
+# wake the wrong agent, so a daemon pid has no pane (as pane_id in agentboard).
+case "$(ps -o args= -p "$pid" 2>/dev/null)" in *app-server*) exit 1 ;; esac
+
 if [ -r /proc/"$pid"/environ ]; then
   pane=$(tr "\0" "\n" < /proc/"$pid"/environ 2>/dev/null | sed -n "s/^HERDR_PANE_ID=//p")
 else
@@ -23,17 +28,30 @@ for c in "$HOME/.local/bin/herdr" /opt/homebrew/bin/herdr /usr/local/bin/herdr "
 done
 [ -n "$herdr" ] || exit 1
 
+# herdr knows what the pane is doing, for Claude and for Codex alike. A working agent
+# collects its mail at its own Stop, and `agent prompt` would type into its turn; a
+# blocked one has a dialog open. Exit 75 (EX_TEMPFAIL) and the board tries again on
+# a later tick, until the target is idle or has read its mail.
+info=$("$herdr" agent get "$pane" 2>/dev/null)
+status=$(printf '%s' "$info" | sed -n 's/.*"agent_status":"\([a-z_]*\)".*/\1/p')
+case "$status" in working|blocked) exit 75 ;; esac
+
 # `agent prompt` types its line and presses Enter, so anything already in the input
-# box would be sent with it, cut off mid-sentence. Claude draws its own prompt
-# suggestion dim (SGR 2); other text after the last ❯ is a draft the human is
-# writing. Exit 75 (EX_TEMPFAIL) and the board tries again on a later tick. A ❯ in
-# a dialog's option list reads as a draft too, which is right: the target cannot
-# take a prompt until the dialog closes.
+# box would be sent with it, cut off mid-sentence. The input box starts at the
+# agent's prompt glyph: ❯ for Claude, › for Codex. Each draws its placeholder dim
+# (SGR 2), Codex with a background colour code after the dim one; other text after
+# the last glyph is a draft the human is writing. Exit 75 for a draft too. A glyph in
+# a dialog's option list reads as a draft, which is right: the target cannot take a
+# prompt until the dialog closes.
+case "$(printf '%s' "$info" | grep -o '"agent":"[a-z]*"' | head -n 1)" in
+  *'"codex"') glyph='›' ;;
+  *) glyph='❯' ;;
+esac
 esc=$(printf '\033')
 draft=$("$herdr" agent read "$pane" --source visible --format ansi 2>/dev/null \
-  | LC_ALL=C grep -a '❯' | tail -n 1 \
-  | LC_ALL=C sed -e "s/.*❯//" \
-      -e "s/${esc}\[2m[^${esc}]*${esc}\[[0-9;]*m//g" \
+  | LC_ALL=C grep -a "$glyph" | tail -n 1 \
+  | LC_ALL=C sed -e "s/.*$glyph//" \
+      -e "s/${esc}\[2m\(${esc}\[[0-9;]*m\)*[^${esc}]*//g" \
       -e "s/${esc}\[[0-9;?]*[A-Za-z]//g" \
   | LC_ALL=C tr -d ' \t\r\302\240')
 [ -z "$draft" ] || exit 75

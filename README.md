@@ -852,7 +852,7 @@ Consequences worth knowing:
 |---|---|
 | `busy` Claude session | nothing — the message lands at the end of its current turn |
 | `idle` Claude session | pokes it (below), so it does not sit unread until someone types at it |
-| not a Claude session (Grok) | says so — that agent collects with `agentboard inbox` |
+| not a Claude session (Codex, Grok) | pokes it when a poke command is set, and the poke command declines while it works; with no poke command, or no pane to poke, says so — that agent collects with `agentboard inbox` |
 
 The poke is transport-agnostic, deliberately. Claude Code has a first-party channel
 between local sessions — the `ListAgents` / `SendMessage` tools, over the socket named
@@ -877,11 +877,21 @@ bookkeeping stays in one place.
 target goes into `pokes/` and the next tick tries again. A tick is a relay pass, a
 peer import, or the Stop hook of any local agent. The target leaves the queue when the
 poke lands, when it has read its mail, when it goes busy (its own Stop delivers the
-mail), when it ends, or after `AGENT_BOARD_POKE_TTL` seconds. `ab-poke-herdr` uses
-this on purpose. `herdr agent prompt` types a line and presses Enter, so it would send
-the text the human has half typed in the input box. If text that is not Claude's dim
-prompt suggestion follows the last `❯`, or a dialog is open, `ab-poke-herdr` exits 75
-and the board waits.
+mail), when it ends, or after `AGENT_BOARD_POKE_TTL` seconds. A non-Claude target has
+no status for the board to read, so it stays queued until the poke lands or it reads
+its mail; it is queued only when the poke command exits 75, since any other failure
+means there is no pane to poke. `ab-poke-herdr` uses this on purpose:
+
+- A Codex app-server daemon pid hosts several sessions, and its environment names the
+  pane that started it, not each session's own: it has no pane (exit 1), as in the
+  board's `pane_id`, so a poke never wakes the wrong agent.
+- It asks herdr for the pane's state (`herdr agent get`). A `working` agent collects
+  its mail at its own Stop (Codex too, through its Stop hook), and a `blocked` one has
+  a dialog open: exit 75.
+- `herdr agent prompt` types a line and presses Enter, so it would send the text the
+  human has half typed in the input box. The box starts at the agent's prompt glyph:
+  `❯` for Claude, `›` for Codex. If text that is not the agent's dim placeholder
+  follows the last glyph, or a dialog is open, it exits 75 and the board waits.
 
 ## Claude Code integration (automatic, via global hooks)
 
