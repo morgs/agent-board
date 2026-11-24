@@ -62,7 +62,9 @@ MIT — see [`LICENSE`](./LICENSE).
       paths/<pid>         files that session has been seen to edit, owned by it
       messages/<id>.md    one file per message, owned by the sender
       read/<pid>          message ids this session has already been shown
-      locks/              the deploy lock, and the vault lease
+      locks/              the deploy lock, the vault lease, the board lock (board.flock),
+                          and session ends that wait for it (end.<pid>.<writer pid>)
+      retired/            the person of each session that went, kept for the grace period
       theme               one line: which pack of names this machine uses
       themes.local/       packs written here — gitignored, override the shipped ones
       persons.local       session names pinned to a person — gitignored
@@ -160,7 +162,7 @@ classification cannot save you there.
     agentboard scope "app — widgets module"
     agentboard note "rewrote roles/db/tasks/backup.yml"
     agentboard log [name|pid]          # read a session's log
-    agentboard done                    # mark finished
+    agentboard done                    # mark finished; its next tool call brings it back
     agentboard sweep                   # drop dead / stale entries
 
     agentboard win "nightly export live on prod"   # something landed; add it to today
@@ -428,6 +430,26 @@ drops off: its pid is gone, so it is neither live nor kept. Other machines see i
 the same way, because the export carries this machine's own `is_live` judgement.
 It is machine-local and gitignored, like `persons.local`.
 
+**`done` is final only when the agent process ends.** A session marked DONE is off
+the roster: it has no hold, `tell` cannot find it, and it is not live. But the pane
+can stay open, and the agent can get a new task. Its next tool call (the
+`PreToolUse` hook), or its next `claim`, `scope`, `hold`, `say`, `tell`, `win` or
+lease, makes the same session file ACTIVE again, with the same name, person and
+scope. A shell call that runs a sign-off (`agentboard done`, `release`, `env free`,
+`vault free`) and the `PostToolUse` and `Stop` hooks after it do not. Only a shell
+tool counts, and only when the command runs the sign-off: a `Read` of a file with
+"agentboard done" in its name, or a command that has the words in quotes, is a tool
+call like any other and makes the session ACTIVE. The command is read as the shell
+reads it. Text after a `#` is a comment, so `pwd # then agentboard done` is not a
+sign-off. Quotes around the program do not hide it: `"$HOME/agent-board/bin/agentboard" release`
+is one. So is a sign-off after `;`, `&&` or `|`, in `$( )`, after `env`, `command`,
+`timeout` and the like, or in `bash -c '...'`. The text of a heredoc is data. A
+command with a quote that does not close is not read as a sign-off. `sweep` keeps a
+DONE file while its pid is still an agent process, however old the file is, and
+drops it when the process ends. Without this, a Codex session that ran
+`agentboard done` at the end of a task disappeared from the board for the rest of
+its life, and another session drew its person.
+
 ## Names
 
 A Claude Code session's name — what `/rename` sets — is read straight out of
@@ -466,7 +488,82 @@ descriptive is the one kind that is actually memorable across a long afternoon.
 case-insensitively, because it is a name typed from memory rather than copied off the
 board. A person is issued once and never reissued while the session lives — being
 renamed mid-conversation is the one thing an address must not do — and it is unique
-among *live* sessions only, so a retired one comes back into circulation.
+among live sessions and among sessions that went a short time ago.
+
+**A person stays claimed for a day after its session goes.** When a session is
+marked DONE, or its process ends, or `sweep` drops its file, its person is in
+*grace* for `AGENT_BOARD_PERSON_GRACE_SECS` (default 86400, 24 hours; `0` turns the
+grace period off). In that time no new session draws it, here or on a peer. `sweep`
+moves the claim to `retired/<epoch>.<pid>.md` when it drops the session file, and
+removes that entry when the time is up. A session that comes back gets its person
+again. The board knows it by one of these, in this order:
+
+1. the same session id (`claude --resume`, a Codex thread on a restarted daemon);
+2. the same pane (`HERDR_PANE_ID`, else `TMUX_PANE`): a new agent started in the pane
+   where the old one ran;
+3. the same session name, if the user chose it: a name that the session has when it
+   starts, or one that it takes later with `claim --name`. A name that the board
+   issued is not a claim.
+
+A new session id on the same agent process (`/clear`, a new Codex thread) keeps the
+person that the process had. A pin in `persons.local` comes before all of these. If
+another live session has the person by then, the returning session draws a new one:
+two live sessions never share a person.
+
+The session file records how its person came to it, as `person_source`: `pin`,
+`back` (one of the three matches above) or `drawn`. A name that a session takes
+after it starts (`claim --name`) brings the person of that name back only while the
+session's person is `drawn`. A person that came back by session id or by pane stays,
+and the name's claim stays in the ledger for the session that owns it.
+
+**The same pid is not the same process.** The system gives the pid of a process that
+ended to a new one. A session file records when its process started (`pstart`: the
+start time from `/proc/<pid>/stat`, or `ps -o lstart` where there is no `/proc`).
+A claim that finds a file under its pid compares the two. So does every hook and
+command that looks for the session's file: a file with a different start is not
+this session's, so a tool hook does not make it ACTIVE again, and it claims a new
+one (with the thread's session id on Codex).
+
+- the same start: the same process. A new session id keeps the person (above).
+- a different start: the file is another process's. Its person goes to the ledger
+  for its own session, the file is dropped, and the new session starts a file of
+  its own, without the old name, scope or hold. If the person cannot be written to
+  the ledger, `claim` exits 1, makes no claim and leaves the old file as it is.
+- no start recorded (a file from before the field): no proof. A DONE file with
+  another session id is treated as another process's, with the same rule for a
+  ledger that cannot be written. An ACTIVE file gets the field on its next claim.
+
+**Claims are one step at a time.** A claim reads which persons are held, then writes
+its file. Two claims that did this together drew the same person. Each now takes the
+board lock (`locks/board.flock`, an `flock`, so the kernel drops it when the holder
+dies) for the read and the write together. So do a revive, a redraw and the end of a
+session. Where there is no `flock(1)` (macOS), python's `fcntl` takes the same lock.
+
+**Nothing is written without the board lock.** Every write of a session file takes
+it: a field (`scope`, the heartbeat of a hook, the state), a log line, `done`. A
+write reads the whole file and moves a new one into its place, so a write that read
+the file before another write landed put the old text back. A process waits
+`AGENT_BOARD_LOCK_WAIT_SECS` (default 5) for the lock. When the wait runs out it
+writes nothing, and its later writes try once and do not wait:
+
+- `claim` exits 75 and makes no file. Run it again. A hook claims again on the
+  session's next tool call.
+- `scope`, `done`, `hold` and the other commands that write say "the board is busy"
+  on stderr and exit 1. Run them again.
+- A hook leaves out its heartbeat. The next hook writes it. The gates still run.
+- The end of a session is written down as `locks/end.<pid>.<writer pid>`: when the
+  process started and which session ended. The next step that has the lock for that
+  pid applies it before its own work: a hook or a claim under the pid, or `sweep`.
+  It frees the leases that the pid owns and marks the file DONE, unless the file
+  names another session by then. A record of a process that is gone, or of the
+  process that had the pid before, is dropped.
+
+**A claim is not used until its replacement is written.** A returning session's
+ledger entry is removed only after the new session file is in place. If the file
+cannot be written, `claim` exits 1 and the entry stays for the next try. In the same
+way `sweep` drops a session file only after its person is in the ledger. If
+`retired/` cannot be written, the file stays, `sweep` says how many it kept and
+exits 1, and a later sweep tries again.
 
 Sessions that predate the field pick one up on their next heartbeat, written by their
 own process. Nothing here ever writes into another agent's session file.
@@ -509,8 +606,10 @@ The pinned person need not be in the theme, nobody else is drawn it, and if anot
 live session already has it the pin waits rather than making two. It is
 machine-local and gitignored, like the theme.
 
-**A full pool gives `Anon`.** When every name in the pack is held by a live session,
-here or on a peer, the next session is `Anon`. It looks for a free name again at most
+**A full pool gives `Anon`.** When every free name in the pack is in grace, the next
+session takes the one whose session went first, so the grace period never makes the
+pool smaller. When every name in the pack is held by a live session, here or on a
+peer, the next session is `Anon`. It looks for a free name again at most
 once every `AGENT_BOARD_ANON_RETRY_SECS` (default 60), on its own hook events, and
 takes the first one it finds. Two `Anon` sessions share one `tell` address, so a pool
 that is often full needs more names: add them to the pack's `[names]`.
@@ -794,6 +893,9 @@ and the board waits.
 | `PostToolUse` | `Edit\|Write\|MultiEdit\|NotebookEdit` | records the path, so the claim is observed rather than declared |
 | `Stop` | — | heartbeat, and delivers any messages waiting for this agent |
 | `SessionEnd` | — | releases the hold and the vault lease, marks the session DONE |
+
+The first `PreToolUse` after a session was marked DONE makes it ACTIVE again (see
+Liveness).
 
 Registration is by **path**, so the script is exec'd fresh on every event: editing
 `bin/agentboard` changes the gates for every running session immediately, with no
@@ -1104,7 +1206,7 @@ Codex takes different answers:
 | PreToolUse deny | `permissionDecision: "deny"` or exit 2 | always exit 2 with the reason on stderr (Codex accepts both forms; the watchdog passes on only this one) |
 | PreToolUse ask | `permissionDecision: "ask"` | **no ask in Codex**: an exit-2 refusal that tells the agent to stop and ask the user |
 | Stop, messages waiting | `additionalContext` | `{"decision": "block", "reason": ...}` |
-| SessionEnd | sweeps, then marks DONE | marks DONE only: Codex allows one second |
+| SessionEnd | marks DONE, then sweeps | marks DONE only: Codex allows one second. The end of a different session id on the same process does nothing. An end that cannot have the board lock in 0.4 seconds (Claude Code: `AGENT_BOARD_LOCK_WAIT_SECS`) is written down and applied by the next step that has the lock (see Names) |
 
 Where Claude would ask, the Codex agent asks the user in the chat. If the user says
 yes, it runs `agentboard allow-edit <path>` (the next edit of that path passes the
@@ -1124,6 +1226,22 @@ trust again. The TUI asks for it ("Hooks need review") at the next start.
 To see what a host sends, start it with `AGENT_BOARD_HOOK_LOG=<file>`. Each hook
 then appends its stdin to that file, one line per call. `test/codex-hooks.sh`
 tests the Codex answers under a process named `codex`.
+
+**A Codex session on the app-server daemon.** Codex can run its sessions in a
+managed daemon (`codex app-server`). The hooks then run under the daemon, so the
+session file has the daemon's pid, and all threads on that daemon share one file.
+Three rules follow from that. A `SessionEnd` whose session id is not the one in the
+file is ignored: another thread ended, not this one. The comparison and the sign-off
+are one step under the board lock, and a claim writes the session id under the same
+lock, so a thread that starts while another one ends is not signed off by it. An
+end that cannot have the lock signs nothing off, whatever the file says: it is
+written down with its session id, and the same comparison is made when it is
+applied. No
+pane is recorded for such a session, because the daemon's environment has the pane
+of whoever started the daemon. And when the daemon restarts (it updates itself) the
+pid changes: the session gets a new file, and its session id gives it the person it
+had (see Names). The file is made by `SessionStart`, or by the thread's first
+`PreToolUse`, `PostToolUse` or `Stop` under the new pid; each passes the session id.
 
 ### Fail closed, and where it cannot
 
@@ -1299,7 +1417,9 @@ exactly the failure this board exists to prevent.
 | `AGENT_BOARD_DIR` | `~/agent-board` | relocate the whole board |
 | `AGENT_BOARD_WORKSPACE` | `$AGENT_BOARD_DIR/workspace.local` | the repo-policy profile — point it at a shared file to give a team one copy |
 | `AGENT_BOARD_STALE_SECS` | `7200` | how long without a heartbeat before an entry is ignored, unless its pid is still an agent |
-| `AGENT_BOARD_DONE_KEEP_SECS` | `3600` | how long finished entries linger before `sweep` drops them |
+| `AGENT_BOARD_DONE_KEEP_SECS` | `3600` | how long finished entries linger before `sweep` drops them; one whose pid is still an agent process is kept |
+| `AGENT_BOARD_PERSON_GRACE_SECS` | `86400` | how long a person stays claimed after its session goes; `0` turns the grace period off |
+| `AGENT_BOARD_LOCK_WAIT_SECS` | `5` | how long a process waits for the board lock before it writes nothing (`claim` exits 75) |
 | `AGENT_BOARD_MSG_KEEP_SECS` | `86400` | how long messages live before `sweep` drops them |
 | `AGENT_BOARD_ANON_RETRY_SECS` | `60` | how often a session that drew `Anon` from a full pool looks for a free name |
 | `AGENT_BOARD_DELIVER_ON_STOP` | `1` | `0` stops messages being pushed at end of turn |
