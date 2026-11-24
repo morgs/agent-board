@@ -211,12 +211,47 @@ AGENT_BOARD_POKE_CMD=$POKE "$AB" _repoke
 check 'past the TTL: dropped, not poked' "$(cat "$AGENT_BOARD_DIR/poked")$(ls "$AGENT_BOARD_DIR/pokes")" ""
 
 echo
+echo 'a Codex target is poked too'
+# metrics is a codex claim with no Claude metadata: no status for the board to read
+: > "$AGENT_BOARD_DIR/poked"
+out=$(AGENT_BOARD_POKE_CMD=$POKE "$AB" tell metrics 'codex, wake up' 2>&1)
+has  'tell pokes a non-Claude target' "$out" 'poked it via poke.sh'
+has  'with its pid and name' "$(cat "$AGENT_BOARD_DIR/poked")" "$PEER metrics"
+: > "$AGENT_BOARD_DIR/poked"
+out=$(AGENT_BOARD_POKE_CMD=$LATER "$AB" tell metrics 'codex, busy or typing' 2>&1)
+has  'a declined poke says it will try again' "$out" 'pokes it again on a later tick'
+check 'and queues the target' "$(ls "$AGENT_BOARD_DIR/pokes" 2>/dev/null)" "$PEER"
+AGENT_BOARD_POKE_CMD=$POKE "$AB" _repoke
+has  'the retry pokes it: no status is not busy' "$(cat "$AGENT_BOARD_DIR/poked")" "$PEER metrics"
+check 'and leaves the queue' "$(ls "$AGENT_BOARD_DIR/pokes" 2>/dev/null)" ""
+# no pane to poke (exit 1, not 75): said plainly, and not queued
+NOPANE=$AGENT_BOARD_DIR/nopane.sh
+printf '#!/bin/sh\nexit 1\n' > "$NOPANE"; chmod +x "$NOPANE"
+out=$(AGENT_BOARD_POKE_CMD=$NOPANE "$AB" tell metrics 'codex outside herdr' 2>&1)
+has  'no pane: it collects with inbox' "$out" 'could not be poked — it collects'
+check 'and is not queued' "$(ls "$AGENT_BOARD_DIR/pokes" 2>/dev/null)" ""
+AGENT_BOARD_POKE_CMD=$LATER "$AB" tell metrics 'queued, then its pane went' >/dev/null 2>&1
+AGENT_BOARD_POKE_CMD=$NOPANE "$AB" _repoke
+check 'a queued one whose pane went is dropped' "$(ls "$AGENT_BOARD_DIR/pokes" 2>/dev/null)" ""
+# a message the relay imports is poked through _poke
+: > "$AGENT_BOARD_DIR/poked"
+AGENT_BOARD_POKE_CMD=$POKE "$AB" _poke "$PEER"
+has  'the relay import pokes a Codex target' "$(cat "$AGENT_BOARD_DIR/poked")" "$PEER metrics"
+: > "$AGENT_BOARD_DIR/poked"
+AGENT_BOARD_POKE_CMD=$LATER "$AB" _poke "$PEER"
+check 'a declined relay poke is queued' "$(ls "$AGENT_BOARD_DIR/pokes" 2>/dev/null)" "$PEER"
+ls "$AGENT_BOARD_DIR/messages" >> "$AGENT_BOARD_DIR/read/$PEER"
+AGENT_BOARD_POKE_CMD=$POKE "$AB" _repoke
+check 'read its mail at its Stop: dropped, not poked' "$(cat "$AGENT_BOARD_DIR/poked")$(ls "$AGENT_BOARD_DIR/pokes")" ""
+
+echo
 echo 'ab-poke-herdr leaves a draft alone'
 # a stand-in herdr: `agent read` prints a screen, `agent prompt` records the call
 FAKEBIN=$AGENT_BOARD_DIR/fakebin; mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/herdr" <<EOF
 #!/bin/sh
 case "\$2" in
+  get)    cat "$AGENT_BOARD_DIR/agentinfo" 2>/dev/null ;;
   read)   cat "$AGENT_BOARD_DIR/screen" ;;
   prompt) echo "\$3 \$4" >> "$AGENT_BOARD_DIR/prompted" ;;
 esac
@@ -245,6 +280,41 @@ check 'a typed draft: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 
 screen "$(printf '❯ 1. Yes\r')"
 PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
 check 'a dialog open: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
+# herdr's own view of the pane: a working or blocked agent is not prompted
+agentinfo() { printf '{"result":{"agent":{"agent":"%s","agent_status":"%s","pane_id":"w9:p9"}}}\n' "$1" "$2" > "$AGENT_BOARD_DIR/agentinfo"; }
+screen "$(printf '❯\302\240\033[0m\033[2m/upcoming\033[0m\r')"
+agentinfo claude working
+PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
+check 'herdr says working: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
+agentinfo claude blocked
+PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
+check 'herdr says blocked: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
+# Codex: › is its prompt, history lines above the box start with it too, and its
+# dim placeholder carries a background code after the dim one (read from a live pane)
+cbg=$(printf '\033[48;2;52;52;52m')
+codex_screen() {
+  printf '%s\n' \
+    "$(printf '\033[0m\033[1m\033[2m%s›\033[0m%s s\033[0m\r' "$cbg" "$cbg")" \
+    "$(printf '\033[0m\033[2m• \033[0mDone. \r')" \
+    "$(printf '\033[0m\033[1m%s›\033[0m%s \033[0m%s\033[0m%s          \033[0m\r' "$cbg" "$cbg" "$1" "$cbg")" \
+    "$(printf '  \033[0m\033[1m←\033[0m for agents · ? for shortcuts\r')" > "$AGENT_BOARD_DIR/screen"
+}
+agentinfo codex idle
+codex_screen "$(printf '\033[2m%sAsk Codex to do anything' "$cbg")"
+PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
+check "Codex's dim placeholder is not a draft: poked" "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "0/w9:p9 you have mail, run agentboard inbox"
+rm -f "$AGENT_BOARD_DIR/prompted"
+codex_screen "$(printf '%sdeploy brace after the che' "$cbg")"
+PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
+check 'a Codex draft: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
+printf '%s\n' "$(printf '\033[0m\033[1m›\033[0m 1. Yes, proceed\r')" "  2. No" > "$AGENT_BOARD_DIR/screen"
+PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
+check 'a Codex dialog open: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
+agentinfo codex working
+codex_screen "$(printf '\033[2m%sAsk Codex to do anything' "$cbg")"
+PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
+check 'a working Codex: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
+rm -f "$AGENT_BOARD_DIR/agentinfo"
 rm -f "$STUBJSON"
 
 echo
