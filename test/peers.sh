@@ -181,6 +181,16 @@ done
 ok 'no person live on beta was issued on alpha'
 
 echo
+echo 'a person in grace on one machine is held on the other'
+PG=$(fake "$B" leaver Quasar)
+kill "$PG" 2>/dev/null
+for _ in $(seq 1 100); do kill -0 "$PG" 2>/dev/null || break; sleep 0.05; done
+ab "$B" sweep >/dev/null 2>&1
+has   'the machine it left exports the claim' "$(ab "$B" _export 2>/dev/null)" "^G	Quasar	[0-9]"
+relay >/dev/null 2>&1
+has   'and the relay carries it to the mirror' "$(cat "$A/remote/beta/held.tsv" 2>/dev/null)" "^Quasar	[0-9]"
+
+echo
 echo 'a stale mirror is not shown as live'
 echo $(( $(date +%s) - 3600 )) > "$A/remote/beta/synced"
 out=$(ab "$A" list 2>&1)

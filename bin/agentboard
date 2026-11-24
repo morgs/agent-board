@@ -48,7 +48,8 @@
 #   agentboard scope "..."          set what I am working on
 #   agentboard note "..."           append a timestamped line to my log
 #   agentboard log [name|pid]       read a session's log (not injected anywhere)
-#   agentboard done                 mark this session finished
+#   agentboard done                 mark this session finished (its next tool call
+#                                 brings it back, with the same person)
 #   agentboard board                full board, including me and stale entries
 #   agentboard watch [secs]         the same, redrawn in place until ctrl-c
 #   agentboard sweep                drop dead/stale entries
@@ -74,7 +75,7 @@
 # Env: AGENT_BOARD_DIR (default ~/agent-board), AGENT_BOARD_STALE_SECS (7200),
 #      AGENT_BOARD_DONE_KEEP_SECS (3600), AGENT_BOARD_MSG_KEEP_SECS (86400),
 #      AGENT_BOARD_DELIVER_ON_STOP (1), AGENT_BOARD_POKE_CMD (unset),
-#      AGENT_BOARD_ANON_RETRY_SECS (60),
+#      AGENT_BOARD_ANON_RETRY_SECS (60), AGENT_BOARD_PERSON_GRACE_SECS (86400),
 #      AGENT_BOARD_CC_SESSIONS (~/.claude/sessions — where Claude keeps its own
 #      per-session metadata; overridable so the tests stay self-contained).
 
@@ -87,6 +88,7 @@ READ="$BOARD/read"
 PATHSD="$BOARD/paths"
 LOCKS="$BOARD/locks"
 WINS="$BOARD/wins"
+RETIRED="$BOARD/retired"           # persons still claimed for sessions that are gone
 DEPLOYLOCK="$BOARD/bin/deploylock"
 PEERCMD="$BOARD/bin/agentboard-peer"
 MACHINES="$BOARD/machines.local"   # optional: the peers this board is mirrored with
@@ -97,13 +99,18 @@ MSG_KEEP_SECS="${AGENT_BOARD_MSG_KEEP_SECS:-86400}"
 WIN_KEEP_DAYS="${AGENT_BOARD_WIN_KEEP_DAYS:-14}"  # today plus the fourteen days before it, so a weekly review that slips a week still sees both weeks
 DELIVER_ON_STOP="${AGENT_BOARD_DELIVER_ON_STOP:-1}"
 ANON_RETRY_SECS="${AGENT_BOARD_ANON_RETRY_SECS:-60}"   # how often a session with no person looks for a free one
+# How long a person stays claimed after its session stops looking live. A day, so a
+# pane closed in the evening has its person when it is opened again in the morning.
+# 0 turns the grace period off: a person is free the moment its session is gone.
+PERSON_GRACE_SECS="${AGENT_BOARD_PERSON_GRACE_SECS:-86400}"
+case "$PERSON_GRACE_SECS" in ''|*[!0-9]*) PERSON_GRACE_SECS=86400 ;; esac
 # Set only by the commands a human runs at a prompt. Everything the hooks print
 # lands in some agent's context window, where a banner, a colour escape and a
 # joke are all just tokens it has to pay for and cannot act on.
 AB_RICH=0
 # Which agent's hook protocol we are speaking. Set by --codex on a hook-* call.
 AB_HOST=claude
-mkdir -p "$SESS" "$MSGS" "$READ" "$PATHSD" "$LOCKS" "$WINS" 2>/dev/null
+mkdir -p "$SESS" "$MSGS" "$READ" "$PATHSD" "$LOCKS" "$WINS" "$RETIRED" 2>/dev/null
 
 now_h() { date +%Y-%m-%dT%H:%M:%S%z; }
 ago() {   # ago <iso8601> -> "4m" / "3h" / "2d", or "" if it will not parse
@@ -465,8 +472,127 @@ in_lines() {   # in_lines <word> <newline-separated list>
   return 1
 }
 
-person_taken() {   # among live sessions only — a retired person is free to reuse
+# Held by a live session, here or on a peer. A person whose session is gone is not
+# taken in this sense: it is in its grace period (grace_rows), which keeps it out
+# of the draw but gives it to its own session when that comes back, and to a pin.
+person_taken() {
   in_lines "$1" "$(live_persons)"
+}
+
+# The pane this agent sits in, as the terminal multiplexer names it. A session that
+# comes back in the same pane is the same seat, so it gets the person it had.
+# Hooks that a shared daemon runs (Codex app-server) see the environment of
+# whichever pane started the daemon, not of the session's own pane: no pane then.
+pane_id() {   # pane_id <agent pid>
+  local p=${HERDR_PANE_ID:-${TMUX_PANE:-}}
+  p=${p//[$' \t\r\n']/}
+  [ -n "$p" ] || return 0
+  case "$(ps -o args= -p "${1:-0}" 2>/dev/null)" in *app-server*) return 0 ;; esac
+  printf '%s' "$p"
+}
+
+# Every claim on a person that outlives its session, inside the grace period:
+#   - the ledger in retired/, one file for each session file that sweep removed;
+#   - a session file still here that is not live: marked DONE, or its process gone
+#     and not swept yet.
+# One row each: epoch it stopped, person, name, name_source, session id, pane, file.
+# One awk reads all of them, as live_local does.
+grace_rows() {
+  local f st pid ep person name src sid pane now
+  [ "$PERSON_GRACE_SECS" -gt 0 ] || return 0
+  now=$(now_e)
+  set -- "$RETIRED"/*.md "$SESS"/*.md
+  printf '%s\n' "$@" | awk '
+    { f = $0; st = pid = ep = per = nm = src = sid = pane = ""
+      while ((getline line < f) > 0) {
+        if (line == "") break
+        i = index(line, ": "); if (!i) continue
+        k = substr(line, 1, i - 1); v = substr(line, i + 2)
+        if      (k == "status"      && st   == "") st   = v
+        else if (k == "pid"         && pid  == "") pid  = v
+        else if (k == "epoch"       && ep   == "") ep   = v
+        else if (k == "person"      && per  == "") per  = v
+        else if (k == "name"        && nm   == "") nm   = v
+        else if (k == "name_source" && src  == "") src  = v
+        else if (k == "session"     && sid  == "") sid  = v
+        else if (k == "pane"        && pane == "") pane = v
+      }
+      close(f)
+      if (pid == "") next
+      printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n", f, st, pid, ep, per, nm, src, sid, pane }' 2>/dev/null \
+  | while IFS=$'\037' read -r f st pid ep person name src sid pane; do
+      case "$person" in ''|'-'|"$AB_PERSON_NONE") continue ;; esac
+      case "$ep" in ''|*[!0-9]*) continue ;; esac
+      case "$f" in
+        "$SESS"/*)
+          live_by "$f" "$st" "$pid" "$ep" && continue
+          # DONE says when it stopped. A file whose process has gone stopped some
+          # time after its last heartbeat: count from now, as sweep will.
+          [ "$st" = DONE ] || ep=$now ;;
+      esac
+      [ $(( now - ep )) -lt "$PERSON_GRACE_SECS" ] || continue
+      case "$name" in '-') name="" ;; esac
+      case "$sid" in '-') sid="" ;; esac
+      case "$pane" in '-') pane="" ;; esac
+      printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\n' "$ep" "$person" "$name" "$src" "$sid" "$pane" "$f"
+    done
+}
+
+# What a fresh peer holds in grace: "epoch<TAB>person". Its relay carries the list.
+peer_held() {
+  local l now
+  peers_on || return 0
+  [ "$PERSON_GRACE_SECS" -gt 0 ] || return 0
+  now=$(now_e)
+  for l in $(peer_labels); do
+    peer_fresh "$l" || continue
+    [ -f "$REMOTED/$l/held.tsv" ] || continue
+    awk -F'\t' -v now="$now" -v g="$PERSON_GRACE_SECS" \
+      'NF >= 2 && $2 ~ /^[0-9]+$/ && now - $2 < g { print $2 "\t" $1 }' "$REMOTED/$l/held.tsv"
+  done
+}
+
+# The persons in grace, here and on every fresh peer, one per line. The one whose
+# session has been gone longest comes first.
+grace_persons() {
+  { grace_rows | awk -F'\037' '{ print $1 "\t" $2 }'; peer_held; } \
+    | awk -F'\t' '$2 != "" { if (!($2 in t) || $1 + 0 > t[$2] + 0) t[$2] = $1 }
+        END { for (p in t) print t[p] "\t" p }' | sort -n | cut -f2
+}
+
+# The claim a returning session has on a person: the newest grace row with the same
+# session id, else the same pane, else the same name where the user chose that name
+# (an issued name comes from the pid and says nothing about who this is).
+# Sets RC_PERSON and RC_FILE.
+returning_claim() {   # returning_claim <session id> <pane> <chosen name>
+  local sid=$1 pane=$2 name=$3 best
+  RC_PERSON=""; RC_FILE=""
+  case "$sid" in '-') sid="" ;; esac
+  [ -n "$sid$pane$name" ] || return 1
+  best=$(grace_rows | awk -F'\037' -v sid="$sid" -v pane="$pane" -v name="$name" '
+    { r = 0
+      if      (sid  != "" && $5 == sid)  r = 3
+      else if (pane != "" && $6 == pane) r = 2
+      else if (name != "" && $4 == "user" && $3 == name) r = 1
+      if (!r) next
+      if (r > br || (r == br && $1 + 0 > be + 0)) { br = r; be = $1; out = $2 "\037" $7 } }
+    END { if (br) print out }')
+  [ -n "$best" ] || return 1
+  RC_PERSON=${best%%$'\037'*}; RC_FILE=${best#*$'\037'}
+}
+# The ledger entry has done its work once its session is back. A session file is
+# its own session's to remove, or sweep's: left alone here.
+claim_used() { case "${RC_FILE:-}" in "$RETIRED"/*) rm -f "$RC_FILE" ;; esac; return 0; }
+
+# A person a returning session can have back: nobody live holds it, it is not
+# pinned to some other name, and this theme (or this name's pin) still issues it.
+person_free_for() {   # person_free_for <person> <session name>
+  local p=$1
+  [ -n "$p" ] && [ "$p" != "$AB_PERSON_NONE" ] || return 1
+  person_taken "$p" && return 1
+  [ "$p" = "$(pinned_person "$2")" ] && return 0
+  is_pinned_person "$p" && return 1
+  person_in_theme "$p"
 }
 
 # A pin keeps a long-running role's person across restarts: a session named
@@ -512,27 +638,66 @@ is_persistent() {   # is_persistent <session name>
 # 28 seconds is killed long before it answers. The whole pool is walked, whatever
 # its size, so a free name is always found if there is one.
 AB_PERSON_NONE=Anon   # what a session is called while every name in the pool is out
-auto_person() {   # auto_person <pid> -> a person no live session is using
-  local pid=$1 i=0 cand taken n
+auto_person() {   # auto_person <pid> -> a person no session holds, live or in grace
+  local pid=$1 i=0 cand taken held n
   local -a P=($(person_pool))
   n=${#P[@]}
   [ "$n" -gt 0 ] || { printf '%s' "$AB_PERSON_NONE"; return 0; }
   taken=$(live_persons; pinned_persons)
+  held=$(grace_persons)
   while [ "$i" -lt "$n" ]; do
     cand="${P[$(( ( ${pid:-0} / 7 + i ) % n ))]}"
-    in_lines "$cand" "$taken" || { printf '%s' "$cand"; return 0; }
+    in_lines "$cand" "$taken" || in_lines "$cand" "$held" || { printf '%s' "$cand"; return 0; }
     i=$((i+1))
   done
+  # Every name nobody live holds is in its grace period. A session that is here
+  # needs a name more than one that may not come back: it takes the name whose
+  # session has been gone longest.
+  if [ -n "$held" ]; then
+    while IFS= read -r cand; do
+      case " ${P[*]} " in *" $cand "*) ;; *) continue ;; esac
+      in_lines "$cand" "$taken" || { printf '%s' "$cand"; return 0; }
+    done <<EOF
+$held
+EOF
+  fi
   printf '%s' "$AB_PERSON_NONE"
 }
 
 # A new session file takes its pin at once when the name is already known (a
 # resumed or named session), so its first greeting carries the right person.
 # Pass the name the user chose, never the one issued: an issued name has no pin.
-claim_person() {   # claim_person <pid> <chosen session name>
+# A session that comes back gets the person it had: the same session id, the same
+# pane or the same chosen name inside the grace period (returning_claim), or a
+# session file under the same pid that a new session is about to replace. A pin
+# comes before all of that.
+claim_person() {   # claim_person <pid> <chosen session name> [<session id> <pane> <person of the file being replaced>]
   local pin; pin=$(pinned_person "$2")
-  if [ -n "$pin" ] && ! person_taken "$pin"; then printf '%s' "$pin"
-  else auto_person "$1"; fi
+  if [ -n "$pin" ] && ! person_taken "$pin"; then printf '%s' "$pin"; return 0; fi
+  if returning_claim "${3:-}" "${4:-}" "$2" && person_free_for "$RC_PERSON" "$2"; then
+    printf '%s' "$RC_PERSON"; claim_used; return 0
+  fi
+  if [ -n "${5:-}" ] && person_free_for "$5" "$2"; then printf '%s' "$5"; return 0; fi
+  auto_person "$1"
+}
+
+# A session marked DONE whose agent works again is live again: the same file, the
+# same person, the same scope and log. `done` is what an agent says at the end of
+# a task, and the pane then often gets the next one. Without this the session
+# stayed hidden for the rest of its life: off the list, deaf to `tell`, its hold
+# and its person gone.
+# Past the grace period somebody else may hold the person; then this one draws again.
+revive() {   # revive <session file> — only ever this process's own
+  [ "$(get_field "$1" status)" = DONE ] || return 0
+  local person others
+  set_field "$1" status ACTIVE
+  person=$(person_of "$1")
+  if [ -n "$person" ] && [ "$person" != "$AB_PERSON_NONE" ]; then
+    others=$(live_local | awk -F'\037' -v me="$1" '$1 != me && $3 != "" { print $3 }'
+             peers_on && peer_rows | awk -F'\t' '$3 != "" && $3 != "-" { print $3 }')
+    in_lines "$person" "$others" && set_field "$1" person "$(auto_person "$(get_field "$1" pid)")"
+  fi
+  touch_updated "$1"
 }
 
 name_taken() {   # name_taken <name> — among live sessions, the only ones addressable
@@ -1276,7 +1441,7 @@ cmd_vault() {
     --help|-h) vault_help; return 0 ;;
     take)
       file=${1:-}
-      me=$(ensure_file) || return 1
+      me=$(working_file) || return 1
       mypid=$(get_field "$me" pid); name=$(name_of "$me")
       vault_owner >/dev/null 2>&1      # clears a lease whose owner has died
       if mkdir "$VLEASE" 2>/dev/null; then
@@ -1457,7 +1622,7 @@ cmd_env() {
       while [ $# -gt 0 ]; do
         case "$1" in --for) what=${2:-}; shift 2;; *) shift;; esac
       done
-      me=$(ensure_file) || return 1
+      me=$(working_file) || return 1
       mypid=$(get_field "$me" pid); who=$(name_of "$me")
       env_owner "$name" >/dev/null 2>&1      # clears a lease whose owner has died
       mkdir -p "$ENVLEASES" 2>/dev/null
@@ -1557,12 +1722,12 @@ fmt_list() {   # fmt_list "<newline-separated>" [text when empty]
 
 # --- commands --------------------------------------------------------------
 cmd_claim() {
-  local pid="" agent="" session="" cwd="" scope="" name=""
+  local pid="" agent="" session="" cwd="" scope="" name="" named=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --pid) pid=$2; shift 2;;
       --agent) agent=$2; shift 2;;
-      --name) name=$2; shift 2;;
+      --name) name=$2; named=1; shift 2;;
       --session) session=$2; shift 2;;
       --cwd) cwd=$2; shift 2;;
       --scope) scope=$2; shift 2;;
@@ -1580,14 +1745,45 @@ cmd_claim() {
   [ -n "$name" ] || name=$(cc_meta "$pid" name) || name=""
   local name_src=""; [ -n "$name" ] && name_src=user
 
-  local f="$SESS/$pid.md"
+  local f="$SESS/$pid.md" pane had="" sid_new sid_old
+  pane=$(pane_id "$pid")
+  sid_new=$session; case "$sid_new" in '-') sid_new="" ;; esac
+  if session_ok "$f"; then
+    sid_old=$(get_field "$f" session); case "$sid_old" in '-') sid_old="" ;; esac
+    if [ "$(get_field "$f" status)" != "ACTIVE" ]; then
+      # A file marked DONE under a pid that is claiming again. The same session,
+      # or one that does not say: it carries on (revive). Another session on the
+      # same process (/clear, a new thread): a new file, with the same person.
+      if [ -z "$sid_new" ] || [ -z "$sid_old" ] || [ "$sid_new" = "$sid_old" ]; then
+        revive "$f"
+      else
+        had=$(person_of "$f")
+      fi
+    fi
+  fi
   if session_ok "$f" && [ "$(get_field "$f" status)" = "ACTIVE" ]; then
     set_field "$f" cwd "$cwd"; set_field "$f" repo "$repo"; set_field "$f" branch "$branch"
+    # The session id follows the session that last started here, so that its end
+    # (hook_end) and its return after a restart are matched to the right one.
+    [ -n "$sid_new" ] && [ "$sid_new" != "$sid_old" ] && set_field "$f" session "$sid_new"
+    [ -n "$pane" ] && [ "$(get_field "$f" pane)" != "$pane" ] && set_field "$f" pane "$pane"
     # A chosen name is written on every refresh so /rename takes effect at once;
     # an issued one is written once and then left alone, or the session would be
     # renamed out from under anyone mid-conversation with it.
     if [ -n "$name" ]; then
+      local was; was=$(get_field "$f" name)
       set_field "$f" name "$name"; set_field "$f" name_source user
+      # An agent that names itself after it starts (Codex: `claim --name`) is only
+      # now known to be the one that had this name before. Its person comes back
+      # with the name. A pin is left to touch_updated, which already applies it.
+      if [ "$named" = 1 ] && [ "$was" != "$name" ] && [ -z "$(pinned_person "$name")" ] \
+         && returning_claim "" "" "$name"; then
+        if [ "$RC_PERSON" = "$(person_of "$f")" ]; then claim_used
+        elif person_free_for "$RC_PERSON" "$name"; then
+          set_field "$f" person "$RC_PERSON"; claim_used
+          printf 'agentboard: %s had the person %s before, and has it again.\n' "$name" "$RC_PERSON" >&2
+        fi
+      fi
     elif [ -z "$(name_of "$f")" ]; then
       set_field "$f" name "$(auto_name "$pid")"; set_field "$f" name_source auto
     fi
@@ -1601,7 +1797,7 @@ cmd_claim() {
     # pid, which then could not be healed by anything that read its pid.
     local chosen=$name person nowh nowe tmp="$f.tmp.$$"
     [ -n "$name" ] || { name=$(auto_name "$pid"); name_src=auto; }
-    person=$(claim_person "$pid" "$chosen")
+    person=$(claim_person "$pid" "$chosen" "$sid_new" "$pane" "$had")
     nowh=$(now_h); nowe=$(now_e)
     cat > "$tmp" <<EOF && mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
 agent: ${agent:-unknown}
@@ -1610,6 +1806,7 @@ name_source: ${name_src:--}
 person: ${person:--}
 pid: $pid
 session: ${session:--}
+pane: ${pane:--}
 started: $nowh
 updated: $nowh
 epoch: $nowe
@@ -1629,6 +1826,14 @@ EOF
 }
 
 ensure_file() { find_file || { cmd_claim >/dev/null; find_file; }; }
+# The same, for a command that only a working session runs (a hold, a scope, a
+# lease, a message): a session marked DONE is live again. A note is not one of
+# them: releasing a lease writes a note, and that is part of signing off.
+working_file() {
+  local f; f=$(ensure_file) || return 1
+  revive "$f" >/dev/null 2>&1
+  printf '%s' "$f"
+}
 
 cmd_note() {
   local f; f=$(ensure_file) || return 0
@@ -1637,7 +1842,7 @@ cmd_note() {
 
 cmd_set() { # cmd_set <field> <value...>
   local k=$1; shift
-  local f; f=$(ensure_file) || return 0
+  local f; f=$(working_file) || return 0
   set_field "$f" "$k" "$*"; touch_updated "$f"
 }
 
@@ -1661,6 +1866,9 @@ cmd_log() {
   grep '^- ' "$f" 2>/dev/null || { printf 'nothing logged\n'; return 1; }
 }
 
+# DONE hides the session and drops its hold. It is not the end of the process: the
+# session's next tool call, or its next hold, scope, lease or message, makes it
+# ACTIVE again (revive). Its person stays its own for the grace period.
 cmd_done() {
   local f; f=$(find_file) || return 0
   set_field "$f" status DONE; set_field "$f" hold '-'; touch_updated "$f"
@@ -1673,7 +1881,7 @@ cmd_heartbeat() { local f; f=$(find_file) || return 0; touch_updated "$f"; }
 # next agent needs to know to decide whether it needs a worktree.
 cmd_hold() {
   local f repo branch
-  f=$(ensure_file) || return 1
+  f=$(working_file) || return 1
   repo=$(repo_of "$PWD")
   [ -n "$repo" ] || { printf 'not in a git repo — nothing to hold.\n' >&2; return 1; }
   branch=$(branch_of "$PWD")
@@ -2344,8 +2552,10 @@ print_peer_entry() {   # print_peer_entry <peer_rows line>
 #   E env pid holder for since                        a dev env lease held here
 #   V pid holder file since                           the vault lease, if held
 #   W day time who what                               wins inside the keep window
+#   G person epoch                                    a person in its grace period here
 cmd__export() {
   local f pid repo rb st sc p e w day
+  grace_rows | awk -F'\037' '{ printf "G\t%s\t%s\n", $2, $1 }'
   for f in "$SESS"/*.md; do
     [ -e "$f" ] || continue
     is_live "$f" || continue
@@ -2566,7 +2776,7 @@ resolve_local() {   # <name|pid> -> pid on stdout, or 1 with a reason on stderr
 post_msg() {   # post_msg <to-pid-or-*> <text...>
   local to=$1; shift
   local f me pid name agent repo
-  me=$(ensure_file) || return 1
+  me=$(working_file) || return 1
   pid=$(get_field "$me" pid); name=$(name_of "$me"); agent=$(get_field "$me" agent)
   repo=$(get_field "$me" repo)
   f="$MSGS/$(now_e).$pid.$RANDOM.md"
@@ -2869,7 +3079,7 @@ cmd_win() {
     printf 'usage: agentboard win "the nightly export runs in batches now"\n' >&2
     printf 'What counts as a win, and how to write it:  agentboard win --help\n' >&2
     return 1; }
-  me=$(ensure_file) || return 1
+  me=$(working_file) || return 1
   who=$(person_of "$me"); [ -n "$who" ] || who=$(name_of "$me")
   [ -n "$who" ] || who=$(get_field "$me" agent)
   # Tabs are the field separator and a newline would forge a second win, so both
@@ -3494,6 +3704,30 @@ cmd_board() {
   printf '%s' "$tail"
 }
 
+# Sweep removes a session file; the person in it stays claimed for the grace
+# period, so the claim moves to the ledger. One small file per session that went,
+# with what a returning session is matched on. Written whole, then moved.
+retire_person() {   # retire_person <session file> <epoch it stopped looking live>
+  local f=$1 ep=$2 person pid out
+  [ "$PERSON_GRACE_SECS" -gt 0 ] || return 0
+  person=$(person_of "$f")
+  case "$person" in ''|"$AB_PERSON_NONE") return 0 ;; esac
+  case "$ep" in ''|*[!0-9]*) return 0 ;; esac
+  [ $(( $(now_e) - ep )) -lt "$PERSON_GRACE_SECS" ] || return 0
+  pid=$(get_field "$f" pid)
+  out="$RETIRED/$ep.${pid:-0}.md"
+  { printf 'person: %s\n' "$person"
+    printf 'name: %s\n' "$(get_field "$f" name)"
+    printf 'name_source: %s\n' "$(get_field "$f" name_source)"
+    printf 'session: %s\n' "$(get_field "$f" session)"
+    printf 'pane: %s\n' "$(get_field "$f" pane)"
+    printf 'pid: %s\n' "${pid:-0}"
+    printf 'agent: %s\n' "$(get_field "$f" agent)"
+    printf 'epoch: %s\n\n' "$ep"
+  } > "$out.tmp.$$" 2>/dev/null && mv -f "$out.tmp.$$" "$out" 2>/dev/null || rm -f "$out.tmp.$$"
+  return 0
+}
+
 cmd_sweep() {
   local nowe; nowe=$(now_e)
   SW_S=0; SW_M=0; SW_R=0; SW_W=0; SW_L=0
@@ -3502,14 +3736,35 @@ cmd_sweep() {
     local st pid ep age
     st=$(get_field "$f" status); pid=$(get_field "$f" pid); ep=$(get_field "$f" epoch)
     age=$(( nowe - ${ep:-0} ))
-    if [ "$st" = "DONE" ] && [ "$age" -gt "$DONE_KEEP_SECS" ]; then rm -f "$f"; SW_S=$((SW_S+1)); continue; fi
-    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -f "$f"; SW_S=$((SW_S+1)); continue; fi
+    if [ "$st" = "DONE" ] && [ "$age" -gt "$DONE_KEEP_SECS" ]; then
+      # Marked DONE, and its agent process is still there: the pane is open and
+      # may take another task. The file stays, hidden, so the session comes back
+      # whole on its next tool call (revive).
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && is_agent_comm "$pid"; then continue; fi
+      retire_person "$f" "${ep:-0}"; rm -f "$f"; SW_S=$((SW_S+1)); continue
+    fi
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      if [ "$st" = "DONE" ]; then retire_person "$f" "${ep:-0}"; else retire_person "$f" "$nowe"; fi
+      rm -f "$f"; SW_S=$((SW_S+1)); continue
+    fi
     # A live agent that sat idle (a long build, overnight) is stale, not gone:
     # dropping its file would orphan its leases and file claims. The age rule
     # stays for a pid that some other program has since been given.
     [ -n "$pid" ] && is_agent_comm "$pid" && continue
     [ -n "$pid" ] && is_persistent "$(name_of "$f")" && continue
-    if [ "$age" -gt $(( STALE_SECS * 4 )) ]; then rm -f "$f"; SW_S=$((SW_S+1)); fi
+    if [ "$age" -gt $(( STALE_SECS * 4 )) ]; then retire_person "$f" "$nowe"; rm -f "$f"; SW_S=$((SW_S+1)); fi
+  done
+  # The ledger: a claim goes when its grace period is over, and a half-written
+  # entry goes once its writer has.
+  for f in "$RETIRED"/*.md; do
+    [ -e "$f" ] || continue
+    local rep; rep=$(get_field "$f" epoch)
+    case "$rep" in ''|*[!0-9]*) rm -f "$f"; continue ;; esac
+    [ $(( nowe - rep )) -lt "$PERSON_GRACE_SECS" ] || rm -f "$f"
+  done
+  for f in "$RETIRED"/*.md.tmp.*; do
+    [ -e "$f" ] || continue
+    kill -0 "${f##*.}" 2>/dev/null || rm -f "$f"
   done
   # A session file is written as <file>.tmp.<writer pid> and moved into place. A
   # writer killed in between leaves the temp behind; nothing reads it, so it only
@@ -4139,6 +4394,21 @@ reclaim_if_lost() {
   cmd_claim --pid "$p" >/dev/null 2>&1 || true
 }
 
+# A tool call is work. A session that said `done` and now makes one is live again,
+# from here, before the gates read the board. The calls that are the signing off
+# itself do not count: `done` after `release` must not undo it. Only PreToolUse
+# does this. The PostToolUse and the Stop that follow the agent's own
+# `agentboard done` would bring it straight back.
+revive_on_tool() {   # revive_on_tool <hook payload>
+  local f
+  case "$1" in
+    *'agentboard done'*|*'agentboard release'*|*'agentboard env free'*|*'agentboard vault free'*) return 0 ;;
+  esac
+  f=$(find_file 2>/dev/null) || return 0
+  revive "$f" >/dev/null 2>&1
+  return 0
+}
+
 hook_posttool() {
   local payload tool path
   payload=$(cat)
@@ -4187,6 +4457,7 @@ d = json.load(sys.stdin)
 assert isinstance(d, dict) and isinstance(d.get("tool_name"), str) and d["tool_name"]' 2>/dev/null \
     || hook_refuse "the hook payload is not a JSON object with a tool_name"
   reclaim_if_lost
+  revive_on_tool "$payload"
   tool=$(printf '%s' "$payload" | jget tool_name)
   cwd=$(printf '%s' "$payload" | jget cwd)
 
@@ -4479,7 +4750,18 @@ else:
 # A session ending holds nothing: drop its hold and its vault lease, or the next
 # agent inherits an exclusion owned by a process that no longer exists.
 hook_end() {
-  cat >/dev/null
+  local payload sid f mine
+  payload=$(cat)
+  # One Codex app-server daemon hosts several sessions under one pid, so they
+  # share one session file. The end of one of them is not the end of the session
+  # the file describes: leave its leases, its hold and its status alone.
+  if [ "$AB_HOST" = codex ] && f=$(find_file 2>/dev/null); then
+    mine=$(get_field "$f" session)
+    case "$mine" in ''|'-') ;; *)
+      sid=$(printf '%s' "$payload" | jget session_id 2>/dev/null)
+      [ -n "$sid" ] && [ "$sid" != "$mine" ] && exit 0 ;;
+    esac
+  fi
   vault_i_hold && cmd_vault free >/dev/null 2>&1
   env_free_mine >/dev/null 2>&1
   cmd_done

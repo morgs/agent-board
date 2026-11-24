@@ -142,7 +142,7 @@ def cmd_export(_args):
     me = c["local"]["label"]
     peers = {p["label"] for p in c["peers"]}
     out = {"label": me, "epoch": int(time.time()), "sessions": [], "claims": [],
-           "envs": [], "vault": [], "wins": [], "messages": []}
+           "envs": [], "vault": [], "wins": [], "held": [], "messages": []}
     for f in board_lines():
         kind, rest = f[0], f[1:]
         if kind == "S" and len(rest) >= 8:
@@ -156,6 +156,8 @@ def cmd_export(_args):
             out["vault"].append(dict(zip(("pid", "holder", "file", "since"), rest)))
         elif kind == "W" and len(rest) >= 4:
             out["wins"].append(dict(zip(("day", "time", "who", "what"), rest)))
+        elif kind == "G" and len(rest) >= 2:
+            out["held"].append(dict(zip(("person", "epoch"), rest)))
     # Only messages written here travel: one that arrived from a peer already has
     # an origin, and sending it on again is how a two-way relay loops.
     cutoff = time.time() - MSG_KEEP
@@ -252,6 +254,10 @@ def cmd_import(args):
     atomic_write(os.path.join(d, "vault.tsv"), "".join(
         "\t".join(clean(v.get(k)) for k in ("pid", "holder", "file", "since")) + "\n"
         for v in data.get("vault", [])))
+    # Persons in their grace period over there: not drawn here either.
+    atomic_write(os.path.join(d, "held.tsv"), "".join(
+        "\t".join(clean(h.get(k)) for k in ("person", "epoch")) + "\n"
+        for h in data.get("held", [])))
     wd = os.path.join(d, "wins")
     days = {}
     for w in data.get("wins", []):

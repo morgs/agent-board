@@ -8,6 +8,8 @@ paths/
 locks/
 wins/
 pokes/
+# The persons of sessions that went, kept for the grace period.
+retired/
 
 # Written by every install as the pre-edit undo. Once history is tracked, git is
 # the durable one; this stays local for the edit that is not committed yet.

@@ -482,8 +482,12 @@ OUT=$(cd "$D" && payload Stop '' '' | "$AB" hook-stop --codex)
 [ -z "$OUT" ] && ok 'the next Stop is silent (no loop)' || bad "second stop: $OUT"
 
 echo 'SessionEnd is fast and leaves the session DONE'
-s=$(date +%s%N)
+# The app-server daemon hosts many sessions under one pid. The end of some other
+# one must not sign this one off.
 (cd "$D" && printf '{"session_id":"x","cwd":"%s","hook_event_name":"SessionEnd","reason":"other","transcript_path":null}' "$D" | "$AB" hook-end --codex)
+[ "$(sed -n 's/^status: //p' "$ME")" = ACTIVE ] && ok 'the end of another session leaves this one ACTIVE' || bad 'another session ended, and this one is not ACTIVE'
+s=$(date +%s%N)
+(cd "$D" && payload SessionEnd '' '' | "$AB" hook-end --codex)
 ms=$(( ($(date +%s%N) - s) / 1000000 ))
 [ "$ms" -lt 1000 ] && ok "hook-end --codex took ${ms}ms (< 1000ms)" || bad "hook-end took ${ms}ms"
 [ "$(sed -n 's/^status: //p' "$ME")" = DONE ] && ok 'status DONE' || bad 'status not DONE'
