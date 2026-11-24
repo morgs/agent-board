@@ -884,18 +884,23 @@ means it cannot be poked at all (no pane, or an agent the poke does not know). `
 
 - A Codex app-server daemon pid hosts several sessions, and its environment names the
   pane that started it, not each session's own: it has no pane (exit 1), so a poke
-  never wakes the wrong agent. The daemon is the `app-server` subcommand in the first
-  argument; the same text elsewhere, such as a `--cd` path, is a normal Codex.
+  never wakes the wrong agent. The daemon is any argument that is exactly `app-server`,
+  so global options before it (`codex -c key=value app-server`) do not hide it; the
+  word inside a path, such as `--cd /work/app-server-ui`, is a normal Codex.
 - It sends nothing unless herdr says what the pane is and what it is doing
   (`herdr agent get`), and only to an `idle` or `done` agent. A `working` agent
   collects its mail at its own Stop (Codex too, through its Stop hook); a `blocked`
   one has a dialog open. A failed `get` or `read`, or a state herdr does not know,
   exits 75. An agent whose input box it does not know (not Claude or Codex) exits 1.
 - `herdr agent prompt` types a line and presses Enter, so it would send the text the
-  human has half typed. So it reads the whole input box: for Claude from the last `❯`
-  to the `───` rule under it, for Codex from the last `›` down the rows drawn on the
-  box's background colour. Any text there but the agent's dim placeholder, a dialog,
-  or a box it cannot find on screen exits 75 and the board waits.
+  human has half typed. So it pokes only a box it can prove is empty. It frames the
+  box first: for Claude, between the last two `───` rules that start in the first
+  column (the top one may carry the session name), with `❯` at the start of the first
+  row; for Codex, the last block of rows on the box's background colour, with a blank
+  row at its top and bottom and `›` at the start of the row under the top one. Empty
+  is the glyph and the agent's dim placeholder on that row, and nothing on any other
+  row. A draft (with `❯`, `›` or `───` in it or not), a dialog, or a box it cannot
+  frame exits 75 and the board waits.
 
 ## Claude Code integration (automatic, via global hooks)
 

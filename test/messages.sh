@@ -275,17 +275,34 @@ HP=${AB%/agentboard}/ab-poke-herdr
 poke() { rm -f "$AGENT_BOARD_DIR/prompted"; PATH="$FAKEBIN:$PATH" "$HP" "${1:-$INPANE}"; echo "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)"; }
 POKED="0/w9:p9 you have mail, run agentboard inbox"
 agentinfo() { printf '{"result":{"agent":{"agent":"%s","agent_status":"%s","pane_id":"w9:p9"}}}\n' "$1" "$2" > "$AGENT_BOARD_DIR/agentinfo"; }
-screen() { printf '%s\n' '────' "$1" '────' > "$AGENT_BOARD_DIR/screen"; }
+# Claude's box, as read from a live pane: a ─── rule above (the session name may sit
+# in it) and below, ❯ on the first row, continuation rows indented by two.
+RULE=$(printf '─%.0s' $(seq 1 40))
+LABELRULE="$(printf '─%.0s' $(seq 1 30)) GRC ─"
+# claude_screen <first row> [<continuation rows>...]
+claude_screen() {
+  local first=$1; shift
+  { printf '%s\n' "$LABELRULE" "$first"
+    for r in "$@"; do printf '  %s\r\n' "$r"; done
+    printf '%s\n' "$RULE" '  ⏵⏵ auto mode on'; } > "$AGENT_BOARD_DIR/screen"
+}
+screen() { claude_screen "$1"; }
 agentinfo claude idle
 screen "$(printf '❯\302\240\033[0m\033[2m/upcoming\033[0m\r')"
 check "Claude's dim suggestion is not a draft: poked" "$(poke)" "$POKED"
 screen "$(printf '❯\302\240\033[0mI want the inv\033[7m \033[0m\r')"
 check 'a typed draft: not poked, exit 75' "$(poke)" "75/"
-printf '%s\n' '────' "$(printf '❯\302\240\033[0m\r')" 'and the second line' '────' > "$AGENT_BOARD_DIR/screen"
+claude_screen "$(printf '❯\302\240\033[0m\r')" 'and the second line'
 check 'a Claude draft below an empty first row: exit 75' "$(poke)" "75/"
+claude_screen "$(printf '❯\302\240\033[0mUse the glyph ❯\r')"
+check 'a Claude draft that ends in the prompt glyph: exit 75' "$(poke)" "75/"
+claude_screen "$(printf '❯\302\240\033[0m\r')" 'compare ─── here'
+check 'a Claude draft row with ─── in it is not the rule: exit 75' "$(poke)" "75/"
+claude_screen "$(printf '❯\302\240\033[0m\r')" "$RULE"
+check 'a Claude draft row of only ─── is not the rule: exit 75' "$(poke)" "75/"
 screen "$(printf '❯ 1. Yes\r')"
 check 'a dialog open: not poked, exit 75' "$(poke)" "75/"
-printf '%s\n' '────' "$(printf '❯\302\240\033[0m\r')" > "$AGENT_BOARD_DIR/screen"
+printf '%s\n' "$LABELRULE" "$(printf '❯\302\240\033[0m\r')" > "$AGENT_BOARD_DIR/screen"
 check 'no edge to the box on screen: exit 75' "$(poke)" "75/"
 printf '%s\n' 'nothing that looks like an input box' > "$AGENT_BOARD_DIR/screen"
 check 'no input box on screen: exit 75' "$(poke)" "75/"
@@ -329,6 +346,14 @@ codex_screen "$(printf '%sdeploy brace after the che' "$cbg")"
 check 'a Codex draft: not poked, exit 75' "$(poke)" "75/"
 codex_screen "" "$(printf '%sthe draft starts on its second row' "$cbg")"
 check 'a Codex draft that starts with a newline: exit 75' "$(poke)" "75/"
+codex_screen "$(printf '%sthe tail is the glyph ›' "$cbg")"
+check 'a Codex draft that ends in the prompt glyph: exit 75' "$(poke)" "75/"
+# no background on the draft row: the box has no lower edge this can prove
+{ printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+  printf '\033[0m\033[1m%s›\033[0m%s          \033[0m\r\n' "$cbg" "$cbg"
+  printf 'draft text with no background\r\n'
+  printf '  \033[0m\033[1m←\033[0m for agents · ? for shortcuts\r\n'; } > "$AGENT_BOARD_DIR/screen"
+check 'a blank Codex row over a draft with no background: exit 75' "$(poke)" "75/"
 printf '%s\n' "$(printf '\033[0m\033[1m›\033[0m 1. Yes, proceed\r')" "  2. No" > "$AGENT_BOARD_DIR/screen"
 check 'a Codex dialog open: not poked, exit 75' "$(poke)" "75/"
 agentinfo codex working
@@ -336,13 +361,17 @@ codex_screen "$PLACEHOLDER"
 check 'a working Codex: not poked, exit 75' "$(poke)" "75/"
 agentinfo codex idle
 # A Codex app-server daemon carries the pane that started it, not each session's:
-# no poke, exit 1 (no pane), even with a clear box. It is the subcommand in the
-# first argument; the same text elsewhere, as a --cd path, is a normal Codex.
+# no poke, exit 1 (no pane), even with a clear box. It is any argument that is
+# exactly app-server; the word inside a --cd path is a normal Codex.
 # argv is then [codex, app-server], as the real daemon's is
 printf 'sleep 3000; true\n' > "$AGENT_BOARD_DIR/app-server"
 (cd "$AGENT_BOARD_DIR" && HERDR_PANE_ID=w9:p9 exec -a codex sh app-server) </dev/null >/dev/null 2>&1 & DAEMON=$!; disown $DAEMON 2>/dev/null; FAKES+=("$DAEMON")
 sleep 0.2
 check 'a Codex daemon pid: not poked, exit 1' "$(poke "$DAEMON")" "1/"
+# global options before the subcommand: argv is [codex, -c, <value>, app-server]
+(HERDR_PANE_ID=w9:p9 exec -a codex sh -c 'sleep 3000; true' app-server) </dev/null >/dev/null 2>&1 & DAEMON2=$!; disown $DAEMON2 2>/dev/null; FAKES+=("$DAEMON2")
+sleep 0.2
+check 'a Codex daemon with options before app-server: exit 1' "$(poke "$DAEMON2")" "1/"
 if [ -n "$inpane_sh" ]; then
   env HERDR_PANE_ID=w9:p9 "$inpane_sh" -c 'sleep 3000; true' codex --cd /work/app-server-ui </dev/null >/dev/null 2>&1 & CDARG=$!; disown $CDARG 2>/dev/null; FAKES+=("$CDARG")
   sleep 0.2

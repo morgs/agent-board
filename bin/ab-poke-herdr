@@ -11,13 +11,15 @@ pid=$1
 # A Codex app-server daemon hosts several sessions under one pid, and its environment
 # names the pane that started it, not the session's own pane. A poke there would
 # wake the wrong agent, so a daemon pid has no pane. The daemon is the app-server
-# subcommand, its first argument; the text elsewhere (a --cd path) is not.
+# subcommand, which global options (-c key=value, --cd dir) may come before, so any
+# argument that is exactly app-server counts. A path that only contains the word
+# (--cd /work/app-server-ui) is a normal Codex.
 if [ -r /proc/"$pid"/cmdline ]; then
-  arg1=$(tr "\0" "\n" < /proc/"$pid"/cmdline 2>/dev/null | sed -n 2p)
+  args=$(tr "\0" "\n" < /proc/"$pid"/cmdline 2>/dev/null)
 else
-  arg1=$(ps -o args= -p "$pid" 2>/dev/null | awk '{print $2}')
+  args=$(ps -o args= -p "$pid" 2>/dev/null | tr ' ' '\n')
 fi
-[ "$arg1" = app-server ] && exit 1
+printf '%s\n' "$args" | grep -qx app-server && exit 1
 
 if [ -r /proc/"$pid"/environ ]; then
   pane=$(tr "\0" "\n" < /proc/"$pid"/environ 2>/dev/null | sed -n "s/^HERDR_PANE_ID=//p")
@@ -49,11 +51,14 @@ case "$status" in
   *) exit 75 ;;
 esac
 
-# The input box starts at the agent's prompt glyph and runs to the box's edge:
-#   Claude  ❯, closed by a ─── rule.
-#   Codex   ›, every row of the box drawn on a background colour (SGR 48), so the
-#           first row without one is past it.
-# An agent whose box this does not know is not poked.
+# A poke presses Enter on whatever is in the input box, so it goes only to a box
+# this can prove is empty. Each agent frames its box in a way the screen shows:
+#   Claude  a ─── rule above and below, from the first column; the first row
+#           inside starts with ❯, and continuation rows are indented.
+#   Codex   a block of rows on a background colour (SGR 48), a blank row at its
+#           top and bottom, the › row below the top one, and the footer below.
+# Empty is the glyph and the agent's dim placeholder (SGR 2) on the first row, and
+# nothing on any other row. Anything else, or a box this cannot frame, is 75.
 case "$agent" in
   claude) glyph='❯' ;;
   codex)  glyph='›' ;;
@@ -61,31 +66,40 @@ case "$agent" in
 esac
 esc=$(printf '\033')
 screen=$("$herdr" agent read "$pane" --source visible --format ansi 2>/dev/null) || exit 75
-# The text of the whole box: after the last glyph on its first row, then every row
-# down to the edge. No glyph, or no edge on screen, is a box not identified: 75.
-box=$(printf '%s\n' "$screen" | LC_ALL=C awk -v g="$glyph" -v agent="$agent" -v e="$esc" '
-  { l[NR] = $0; if (index($0, g)) last = NR }
+printf '%s\n' "$screen" | LC_ALL=C awk -v g="$glyph" -v agent="$agent" -v e="$esc" \
+    -v rule='─' -v nbsp="$(printf '\302\240')" '
+  function plain(s) { gsub(e "\\[[0-9;?]*[A-Za-z]", "", s); return s }
+  function undim(s) { gsub(e "\\[2m(" e "\\[[0-9;]*m)*[^" e "]*", "", s); return s }
+  function blank(s) { gsub(/[ \t\r]/, "", s); gsub(nbsp, "", s); return s == "" }
+  # A rule starts in the first column with at least 20 of ─ and ends with one; it
+  # may carry the session name in it. Draft rows are indented, so text with ─ in
+  # it is never one.
+  function isrule(s,   c) {
+    sub(/[ \t\r]+$/, "", s)
+    if (substr(s, length(s) - length(rule) + 1) != rule) return 0
+    for (c = 0; c < 20 && substr(s, 1, length(rule)) == rule; c++) s = substr(s, length(rule) + 1)
+    return c == 20
+  }
+  function bg(s) { return index(s, e "[48;") > 0 }
+  { raw[NR] = $0; p[NR] = plain($0) }
   END {
-    if (!last) exit 3
-    s = l[last]
-    while ((i = index(s, g)) > 0) s = substr(s, i + length(g))
-    print s
-    for (n = last + 1; n <= NR; n++) {
-      if (agent == "claude" && index(l[n], "───")) exit 0
-      if (agent == "codex" && !index(l[n], e "[48;")) exit 0
-      print l[n]
+    if (agent == "claude") {
+      for (n = NR; n >= 1; n--) if (isrule(p[n])) { if (!r2) r2 = n; else { r1 = n; break } }
+      if (!r1 || r2 - r1 < 2) exit 3
+      top = r1 + 1; bot = r2 - 1
+    } else {
+      for (n = NR; n >= 1 && !bg(raw[n]); n--) ;
+      if (n < 1 || n == NR) exit 3
+      bot = n
+      for (top = n; top > 1 && bg(raw[top - 1]); top--) ;
+      if (bot - top < 2 || !blank(p[top]) || !blank(p[bot])) exit 3
+      top++; bot--
     }
-    exit 4
-  }') || exit 75
-
-# Each agent draws its placeholder dim (SGR 2), Codex with a background code after
-# the dim one; any other text in the box is a draft the human is writing, so 75. A
-# glyph in a dialog's option list reads as a draft too, which is right: the target
-# cannot take a prompt until the dialog closes.
-draft=$(printf '%s\n' "$box" \
-  | LC_ALL=C sed -e "s/${esc}\[2m\(${esc}\[[0-9;]*m\)*[^${esc}]*//g" \
-      -e "s/${esc}\[[0-9;?]*[A-Za-z]//g" \
-  | LC_ALL=C tr -d ' \t\r\n\302\240')
-[ -z "$draft" ] || exit 75
+    if (index(p[top], g) != 1) exit 3
+    first = plain(undim(raw[top]))
+    if (index(first, g) == 1) first = substr(first, length(g) + 1)
+    if (!blank(first)) exit 4
+    for (n = top + 1; n <= bot; n++) if (!blank(p[n])) exit 4
+  }' || exit 75
 
 exec "$herdr" agent prompt "$pane" "you have mail, run agentboard inbox" >/dev/null
