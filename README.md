@@ -880,18 +880,22 @@ poke lands, when it has read its mail, when it goes busy (its own Stop delivers 
 mail), when it ends, or after `AGENT_BOARD_POKE_TTL` seconds. A non-Claude target has
 no status for the board to read, so it stays queued until the poke lands or it reads
 its mail; it is queued only when the poke command exits 75, since any other failure
-means there is no pane to poke. `ab-poke-herdr` uses this on purpose:
+means it cannot be poked at all (no pane, or an agent the poke does not know). `ab-poke-herdr` uses this on purpose:
 
 - A Codex app-server daemon pid hosts several sessions, and its environment names the
-  pane that started it, not each session's own: it has no pane (exit 1), as in the
-  board's `pane_id`, so a poke never wakes the wrong agent.
-- It asks herdr for the pane's state (`herdr agent get`). A `working` agent collects
-  its mail at its own Stop (Codex too, through its Stop hook), and a `blocked` one has
-  a dialog open: exit 75.
+  pane that started it, not each session's own: it has no pane (exit 1), so a poke
+  never wakes the wrong agent. The daemon is the `app-server` subcommand in the first
+  argument; the same text elsewhere, such as a `--cd` path, is a normal Codex.
+- It sends nothing unless herdr says what the pane is and what it is doing
+  (`herdr agent get`), and only to an `idle` or `done` agent. A `working` agent
+  collects its mail at its own Stop (Codex too, through its Stop hook); a `blocked`
+  one has a dialog open. A failed `get` or `read`, or a state herdr does not know,
+  exits 75. An agent whose input box it does not know (not Claude or Codex) exits 1.
 - `herdr agent prompt` types a line and presses Enter, so it would send the text the
-  human has half typed in the input box. The box starts at the agent's prompt glyph:
-  `❯` for Claude, `›` for Codex. If text that is not the agent's dim placeholder
-  follows the last glyph, or a dialog is open, it exits 75 and the board waits.
+  human has half typed. So it reads the whole input box: for Claude from the last `❯`
+  to the `───` rule under it, for Codex from the last `›` down the rows drawn on the
+  box's background colour. Any text there but the agent's dim placeholder, a dialog,
+  or a box it cannot find on screen exits 75 and the board waits.
 
 ## Claude Code integration (automatic, via global hooks)
 

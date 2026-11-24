@@ -10,8 +10,14 @@ pid=$1
 
 # A Codex app-server daemon hosts several sessions under one pid, and its environment
 # names the pane that started it, not the session's own pane. A poke there would
-# wake the wrong agent, so a daemon pid has no pane (as pane_id in agentboard).
-case "$(ps -o args= -p "$pid" 2>/dev/null)" in *app-server*) exit 1 ;; esac
+# wake the wrong agent, so a daemon pid has no pane. The daemon is the app-server
+# subcommand, its first argument; the text elsewhere (a --cd path) is not.
+if [ -r /proc/"$pid"/cmdline ]; then
+  arg1=$(tr "\0" "\n" < /proc/"$pid"/cmdline 2>/dev/null | sed -n 2p)
+else
+  arg1=$(ps -o args= -p "$pid" 2>/dev/null | awk '{print $2}')
+fi
+[ "$arg1" = app-server ] && exit 1
 
 if [ -r /proc/"$pid"/environ ]; then
   pane=$(tr "\0" "\n" < /proc/"$pid"/environ 2>/dev/null | sed -n "s/^HERDR_PANE_ID=//p")
@@ -28,32 +34,58 @@ for c in "$HOME/.local/bin/herdr" /opt/homebrew/bin/herdr /usr/local/bin/herdr "
 done
 [ -n "$herdr" ] || exit 1
 
-# herdr knows what the pane is doing, for Claude and for Codex alike. A working agent
-# collects its mail at its own Stop, and `agent prompt` would type into its turn; a
-# blocked one has a dialog open. Exit 75 (EX_TEMPFAIL) and the board tries again on
-# a later tick, until the target is idle or has read its mail.
-info=$("$herdr" agent get "$pane" 2>/dev/null)
+# Nothing is sent unless herdr says what the pane is and what it is doing, and the
+# screen shows its input box: a poke presses Enter on whatever is in that box. When
+# herdr cannot be read now, exit 75 (EX_TEMPFAIL) and the board tries again on a
+# later tick, until the target is idle or has read its mail.
+info=$("$herdr" agent get "$pane" 2>/dev/null) || exit 75
 status=$(printf '%s' "$info" | sed -n 's/.*"agent_status":"\([a-z_]*\)".*/\1/p')
-case "$status" in working|blocked) exit 75 ;; esac
+agent=$(printf '%s' "$info" | grep -o '"agent":"[a-z]*"' | head -n 1 | sed 's/.*:"\(.*\)"/\1/')
 
-# `agent prompt` types its line and presses Enter, so anything already in the input
-# box would be sent with it, cut off mid-sentence. The input box starts at the
-# agent's prompt glyph: ❯ for Claude, › for Codex. Each draws its placeholder dim
-# (SGR 2), Codex with a background colour code after the dim one; other text after
-# the last glyph is a draft the human is writing. Exit 75 for a draft too. A glyph in
-# a dialog's option list reads as a draft, which is right: the target cannot take a
-# prompt until the dialog closes.
-case "$(printf '%s' "$info" | grep -o '"agent":"[a-z]*"' | head -n 1)" in
-  *'"codex"') glyph='›' ;;
-  *) glyph='❯' ;;
+# A working agent collects its mail at its own Stop, and a prompt would type into its
+# turn; a blocked one has a dialog open. Only idle or done takes a prompt.
+case "$status" in
+  idle|done) ;;
+  *) exit 75 ;;
+esac
+
+# The input box starts at the agent's prompt glyph and runs to the box's edge:
+#   Claude  ❯, closed by a ─── rule.
+#   Codex   ›, every row of the box drawn on a background colour (SGR 48), so the
+#           first row without one is past it.
+# An agent whose box this does not know is not poked.
+case "$agent" in
+  claude) glyph='❯' ;;
+  codex)  glyph='›' ;;
+  *) exit 1 ;;
 esac
 esc=$(printf '\033')
-draft=$("$herdr" agent read "$pane" --source visible --format ansi 2>/dev/null \
-  | LC_ALL=C grep -a "$glyph" | tail -n 1 \
-  | LC_ALL=C sed -e "s/.*$glyph//" \
-      -e "s/${esc}\[2m\(${esc}\[[0-9;]*m\)*[^${esc}]*//g" \
+screen=$("$herdr" agent read "$pane" --source visible --format ansi 2>/dev/null) || exit 75
+# The text of the whole box: after the last glyph on its first row, then every row
+# down to the edge. No glyph, or no edge on screen, is a box not identified: 75.
+box=$(printf '%s\n' "$screen" | LC_ALL=C awk -v g="$glyph" -v agent="$agent" -v e="$esc" '
+  { l[NR] = $0; if (index($0, g)) last = NR }
+  END {
+    if (!last) exit 3
+    s = l[last]
+    while ((i = index(s, g)) > 0) s = substr(s, i + length(g))
+    print s
+    for (n = last + 1; n <= NR; n++) {
+      if (agent == "claude" && index(l[n], "───")) exit 0
+      if (agent == "codex" && !index(l[n], e "[48;")) exit 0
+      print l[n]
+    }
+    exit 4
+  }') || exit 75
+
+# Each agent draws its placeholder dim (SGR 2), Codex with a background code after
+# the dim one; any other text in the box is a draft the human is writing, so 75. A
+# glyph in a dialog's option list reads as a draft too, which is right: the target
+# cannot take a prompt until the dialog closes.
+draft=$(printf '%s\n' "$box" \
+  | LC_ALL=C sed -e "s/${esc}\[2m\(${esc}\[[0-9;]*m\)*[^${esc}]*//g" \
       -e "s/${esc}\[[0-9;?]*[A-Za-z]//g" \
-  | LC_ALL=C tr -d ' \t\r\302\240')
+  | LC_ALL=C tr -d ' \t\r\n\302\240')
 [ -z "$draft" ] || exit 75
 
 exec "$herdr" agent prompt "$pane" "you have mail, run agentboard inbox" >/dev/null
