@@ -8,6 +8,14 @@
 #   - a Codex session hosted by the app-server daemon keeps its person when the
 #     daemon restarts under a new pid, and records no pane
 #   - a session marked DONE whose agent works again is ACTIVE again, as it was
+#   - claims that start together get different persons (the board lock)
+#   - a file under a pid that another process had gives its person to nobody new
+#   - a person that came back by session id is not replaced by a later name match
+#   - two peers are two peers: the persons both hold stay out of the draw
+#   - a claim or a sweep that cannot write loses no claim, and says that it failed
+#   - a Codex SessionEnd and a claim take the same lock; only a shell call that runs
+#     a sign-off leaves a DONE session DONE; a hook that finds no file makes one
+#     with the thread's session id
 #
 # Self-contained: throwaway boards, a local theme pack, stand-in agents.
 #
@@ -379,6 +387,268 @@ check 'its own end marks it DONE'                          "$(o end-own)" 'DONE'
 ms=$(o end-ms)
 if [ "${ms:-9999}" -lt 1000 ]; then ok "inside the second Codex gives SessionEnd (${ms}ms)"
 else bad "hook-end --codex took ${ms}ms"; fi
+
+echo
+echo 'claims that start together'
+board b9 4
+for i in 1 2 3 4; do standin; claim --pid "$SP" --session "old-$i"; eval "O$i=$SP"; done
+for i in 1 2 3 4; do eval "gone \$O$i"; done
+"$AB" sweep >/dev/null 2>&1
+check 'all four names are in grace'                        "$(ledger_n)" '4'
+N=""
+for i in 1 2 3 4; do standin; N="$N $SP"; done
+for p in $N; do claim --pid "$p" --session "new-$p" & done
+wait
+got=$(for p in $N; do person "$p"; done | sort)
+check 'four claims at once: four different persons'        "$(printf '%s\n' "$got" | sort -u | grep -c .)" '4'
+if printf '%s\n' "$got" | grep -q 'Anon'; then bad 'one of them got the placeholder'
+else ok 'and none is the placeholder'; fi
+
+echo
+echo 'a pid that the system gave to another process'
+board b10 6
+ledger_has() { grep -lx "person: $1" "$AGENT_BOARD_DIR"/retired/*.md 2>/dev/null | grep -c . || true; }
+refile() {   # refile <pid> <sed script>: change the session file as the test needs
+  sed "$2" "$(sfile "$1")" > "$T/refile.tmp" && mv "$T/refile.tmp" "$(sfile "$1")"
+}
+standin; A=$SP
+claim --pid "$A" --session s-a --name alpha --scope 'the old work'
+PA=$(person "$A")
+case "$(field "$(sfile "$A")" pstart)" in ''|'-') bad 'the file records when its process started' ;;
+  *) ok 'the file records when its process started' ;; esac
+refile "$A" 's/^status: .*/status: DONE/; s/^pstart: .*/pstart: another-start/'
+claim --pid "$A" --session s-b --name beta
+differ 'a DONE file of another process: its person is not passed on' "$(person "$A")" "$PA"
+check 'that person stays claimed for its own session'      "$(ledger_has "$PA")" '1'
+check 'the new session has a file of its own'              "$(field "$(sfile "$A")" session)" 's-b'
+check 'without the old scope'                              "$(field "$(sfile "$A")" scope)" '-'
+
+standin; B=$SP
+claim --pid "$B" --session s-c --name gamma
+PB=$(person "$B")
+refile "$B" 's/^status: .*/status: DONE/; /^pstart: /d'
+claim --pid "$B" --session s-d --name delta
+differ 'a DONE file that does not say which process: no proof, not passed on' "$(person "$B")" "$PB"
+check 'and its person stays claimed too'                   "$(ledger_has "$PB")" '1'
+
+standin; C=$SP
+claim --pid "$C" --session s-e --name epsilon --scope 'stale work'
+PC=$(person "$C")
+refile "$C" 's/^pstart: .*/pstart: another-start/'
+claim --pid "$C" --session s-f --name zeta
+differ 'an ACTIVE file of another process is not this session'"'"'s either' "$(person "$C")" "$PC"
+check 'its person goes to the ledger'                      "$(ledger_has "$PC")" '1'
+check 'and its scope is not taken over'                    "$(field "$(sfile "$C")" scope)" '-'
+check 'nor its name'                                       "$(field "$(sfile "$C")" name)" 'zeta'
+
+standin; D=$SP
+claim --pid "$D" --session s-g --name eta
+PD=$(person "$D")
+refile "$D" 's/^status: .*/status: DONE/'
+claim --pid "$D" --session s-h --name theta
+check 'the same process with a new session keeps its person' "$(person "$D")" "$PD"
+
+echo
+echo 'a person restored by session id, then a name'
+board b11 6
+standin; A=$SP
+claim --pid "$A" --session s-a --name alpha
+PA=$(person "$A")
+standin; B=$SP
+claim --pid "$B" --session s-b --name bravo
+PB=$(person "$B")
+gone "$A"; gone "$B"; "$AB" sweep >/dev/null 2>&1
+standin; N=$SP
+claim --pid "$N" --session s-a
+check 'the session is back with its person'                "$(person "$N")" "$PA"
+check 'marked as its own, not drawn'                       "$(field "$(sfile "$N")" person_source)" 'back'
+claim --pid "$N" --name bravo 2>/dev/null
+check 'a name another session used does not change it'     "$(person "$N")" "$PA"
+check 'and that session'"'"'s claim stays in the ledger'   "$(ledger_has "$PB")" '1'
+standin; M=$SP
+claim --pid "$M"
+check 'a new session has a drawn person'                   "$(field "$(sfile "$M")" person_source)" 'drawn'
+claim --pid "$M" --name bravo 2>/dev/null
+check 'a drawn person does give way to the name'           "$(person "$M")" "$PB"
+check 'and the claim is used'                              "$(ledger_has "$PB")" '0'
+
+echo
+echo 'persons in grace on two other machines'
+board b12 4
+printf '[local]\nlabel = here\n\n[peer]\nlabel = first\n\n[peer]\nlabel = second\n' \
+  > "$AGENT_BOARD_DIR/machines.local"
+now=$(date +%s)
+for l in first second; do
+  mkdir -p "$AGENT_BOARD_DIR/remote/$l"; printf '%s\n' "$now" > "$AGENT_BOARD_DIR/remote/$l/synced"
+done
+printf 'Crew-1\t%s\n' "$now" > "$AGENT_BOARD_DIR/remote/first/held.tsv"
+printf 'Crew-2\t%s\n' "$now" > "$AGENT_BOARD_DIR/remote/second/held.tsv"
+seeded Crew-1 4; A=$SP
+claim --pid "$A"
+check 'a draw that starts at the first peer'"'"'s person passes both' "$(person "$A")" 'Crew-3'
+seeded Crew-2 4; B=$SP
+claim --pid "$B"
+check 'and one that starts at the second peer'"'"'s takes the last free name' "$(person "$B")" 'Crew-4'
+
+echo
+echo 'a session file that cannot be written'
+board b13 4
+standin; A=$SP
+claim --pid "$A" --session s-a
+PA=$(person "$A")
+gone "$A"; "$AB" sweep >/dev/null 2>&1
+check 'its claim is in the ledger'                         "$(ledger_n)" '1'
+standin; N=$SP
+chmod 555 "$AGENT_BOARD_DIR/sessions"
+if [ -w "$AGENT_BOARD_DIR/sessions" ]; then
+  chmod 755 "$AGENT_BOARD_DIR/sessions"
+  ok 'skipped: this user writes to a read-only directory'
+else
+  "$AB" claim --agent codex --cwd "$T" --pid "$N" --session s-a >/dev/null 2>&1; rc=$?
+  chmod 755 "$AGENT_BOARD_DIR/sessions"
+  check 'the claim fails'                                  "$rc" '1'
+  check 'no file was written'  "$([ -e "$(sfile "$N")" ] && echo there || echo none)" 'none'
+  check 'the claim is still in the ledger'                 "$(ledger_n)" '1'
+  claim --pid "$N" --session s-a
+  check 'so the next claim has the person'                 "$(person "$N")" "$PA"
+  check 'and only then is the ledger entry used'           "$(ledger_n)" '0'
+fi
+
+echo
+echo 'a ledger that cannot be written'
+board b14 4
+standin; A=$SP
+claim --pid "$A" --session s-a
+PA=$(person "$A")
+gone "$A"
+rmdir "$AGENT_BOARD_DIR/retired" 2>/dev/null; : > "$AGENT_BOARD_DIR/retired"
+"$AB" sweep >"$T/sweep.out" 2>&1; rc=$?
+if [ "$rc" != 0 ]; then ok 'the sweep says it failed'; else bad 'the sweep exited 0'; fi
+has   'and why'                                            "$(cat "$T/sweep.out")" 'could not save the person'
+check 'the session file stays, with the person'            "$(person "$A")" "$PA"
+rm -f "$AGENT_BOARD_DIR/retired"
+"$AB" sweep >/dev/null 2>&1; rc=$?
+check 'with the ledger back, the next sweep works'         "$rc" '0'
+check 'the file is gone'      "$([ -e "$(sfile "$A")" ] && echo there || echo gone)" 'gone'
+check 'and the claim is in the ledger'                     "$(ledger_has "$PA")" '1'
+standin; N=$SP
+claim --pid "$N" --session s-a
+check 'so the session still gets its person back'          "$(person "$N")" "$PA"
+
+echo
+echo 'hooks of a Codex session: the board lock, sign-off calls, a lost file'
+board b15 8
+rm -rf "$T/out"; mkdir -p "$T/out"
+cat > "$T/hold-lock.py" <<'EOS'
+import fcntl, os, sys, time
+f = open(sys.argv[1], "a")
+fcntl.flock(f, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+while os.path.exists(sys.argv[2]):
+    time.sleep(0.05)
+EOS
+cat > "$T/agent2.sh" <<'EOS'
+pl() {   # pl <event> <session id> [<command> | <tool name> <tool input as JSON>]
+  EV=$1 SID=$2 A=${3:-} B=${4:-} CWD=$T python3 -c '
+import json, os
+e = os.environ
+d = {"session_id": e["SID"], "transcript_path": None, "cwd": e["CWD"],
+     "hook_event_name": e["EV"], "model": "gpt-test", "permission_mode": "default",
+     "turn_id": "t1", "reason": "other"}
+if e["B"]:
+    d.update(tool_name=e["A"], tool_use_id="u1", tool_input=json.loads(e["B"]))
+elif e["A"]:
+    d.update(tool_name="Bash", tool_use_id="u1", tool_input={"command": e["A"]})
+print(json.dumps(d))'
+}
+st() { sed -n 's/^status: //p' "$f" | head -1; }
+sid() { sed -n 's/^session: //p' "$f" | head -1; }
+put() { printf '%s' "$2" > "$T/out/$1"; }
+pre() { "$AB" done; pl PreToolUse thread-1 "$@" | "$AB" hook-pretool --codex >/dev/null 2>&1; st; }
+cd "$T"
+pl SessionStart thread-1 | "$AB" hook-start --codex >/dev/null 2>&1
+f=$("$AB" mine); put file "$f"
+put p0 "$(sed -n 's/^person: //p' "$f" | head -1)"
+
+# A tool call on a DONE session: only a shell call that runs a sign-off leaves it DONE.
+put read-named   "$(pre Read '{"file_path": "/x/notes on agentboard done.md"}')"
+put bash-done    "$(pre 'agentboard done')"
+put bash-path    "$(pre 'cd /x && ~/agent-board/bin/agentboard release')"
+put bash-env     "$(pre 'AGENT_BOARD_OVERRIDE=1 agentboard env free aspen')"
+put bash-quoted  "$(pre 'git commit -m "agentboard done" -- README.md')"
+put bash-grep    "$(pre "grep -n 'agentboard release' README.md")"
+put bash-other   "$(pre 'agentboard doneish')"
+pl SessionStart thread-1 | "$AB" hook-start --codex >/dev/null 2>&1
+
+# Someone else has the board lock.
+lock="$AGENT_BOARD_DIR/locks/board.flock"
+python3 "$T/hold-lock.py" "$lock" "$T/held" &
+holder=$!
+i=0; while [ ! -e "$T/held" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+s=$(date +%s%N)
+pl SessionEnd thread-1 | "$AB" hook-end --codex >/dev/null 2>&1
+put locked-end-ms "$(( ($(date +%s%N) - s) / 1000000 ))"
+put locked-end "$(st)"
+"$AB" claim --session thread-2 >/dev/null 2>&1 &
+claimer=$!
+sleep 0.7
+put locked-claim "$(sid)"
+rm -f "$T/held"; wait "$holder" "$claimer"
+put unlocked-claim "$(sid)"
+pl SessionEnd thread-1 | "$AB" hook-end --codex >/dev/null 2>&1
+put end-old "$(st)"
+pl SessionEnd thread-2 | "$AB" hook-end --codex >/dev/null 2>&1
+put end-own "$(st)"
+EOS
+AB="$AB" T="$T" "$T/fakebin/codex" "$T/agent2.sh" 2>"$T/out/stderr"
+P0=$(o p0)
+has   'the stand-in Codex session registered'              "$(o file)" '/sessions/'
+check 'a Read of a file named after a sign-off makes it ACTIVE' "$(o read-named)" 'ACTIVE'
+check '`agentboard done` in a shell leaves it DONE'        "$(o bash-done)" 'DONE'
+check 'so does a `release` by path, after a `cd`'          "$(o bash-path)" 'DONE'
+check 'and an `env free` behind a variable'                "$(o bash-env)" 'DONE'
+check 'a sign-off inside quotes is not a sign-off'         "$(o bash-quoted)" 'ACTIVE'
+check 'nor one that a grep looks for'                      "$(o bash-grep)" 'ACTIVE'
+check 'nor a word that only starts like one'               "$(o bash-other)" 'ACTIVE'
+check 'with the board lock held, SessionEnd does not sign off' "$(o locked-end)" 'ACTIVE'
+ms=$(o locked-end-ms)
+if [ "${ms:-9999}" -lt 1000 ]; then ok "and it is still inside its second (${ms}ms)"
+else bad "hook-end --codex took ${ms}ms with the lock held"; fi
+check 'a claim waits for the lock: the file is not changed' "$(o locked-claim)" 'thread-1'
+check 'and writes when it has it'                          "$(o unlocked-claim)" 'thread-2'
+check 'the end of the thread that had the file before leaves it ACTIVE' "$(o end-old)" 'ACTIVE'
+check 'the end of the thread that has it marks it DONE'    "$(o end-own)" 'DONE'
+
+# The process of the thread that had the file last (thread-2) is gone: a daemon
+# restart. Its first hook under the new pid finds no file, and makes one: with the
+# thread's id, so with its person.
+cat > "$T/agent3.sh" <<'EOS'
+EV=$1
+cd "$T"
+f="$AGENT_BOARD_DIR/sessions/$$.md"
+SID=thread-2 EV=$EV CWD=$T python3 -c '
+import json, os
+e = os.environ
+d = {"session_id": e["SID"], "transcript_path": None, "cwd": e["CWD"],
+     "hook_event_name": e["EV"], "model": "gpt-test", "permission_mode": "default", "turn_id": "t1"}
+if e["EV"] != "Stop":
+    d.update(tool_name="Bash", tool_use_id="u1", tool_input={"command": "true"})
+print(json.dumps(d))' > "$T/out/payload"
+case "$EV" in
+  PreToolUse)  "$AB" hook-pretool  --codex < "$T/out/payload" >/dev/null 2>&1 ;;
+  PostToolUse) "$AB" hook-posttool --codex < "$T/out/payload" >/dev/null 2>&1 ;;
+  Stop)        "$AB" hook-stop     --codex < "$T/out/payload" >/dev/null 2>&1 ;;
+esac
+f=$("$AB" mine 2>/dev/null)
+printf '%s' "$(sed -n 's/^person: //p' "$f" 2>/dev/null | head -1)" > "$T/out/lost-person-$EV"
+printf '%s' "$(sed -n 's/^session: //p' "$f" 2>/dev/null | head -1)" > "$T/out/lost-session-$EV"
+EOS
+for ev in PreToolUse PostToolUse Stop; do
+  "$AB" sweep >/dev/null 2>&1
+  AB="$AB" T="$T" "$T/fakebin/codex" "$T/agent3.sh" "$ev" 2>>"$T/out/stderr"
+  check "$ev with no file: the thread has its person"      "$(o "lost-person-$ev")" "$P0"
+  check "$ev with no file: and its session id"             "$(o "lost-session-$ev")" 'thread-2'
+done
 
 echo
 printf 'pass=%s fail=%s\n' "$pass" "$fail"

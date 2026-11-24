@@ -62,7 +62,7 @@ MIT — see [`LICENSE`](./LICENSE).
       paths/<pid>         files that session has been seen to edit, owned by it
       messages/<id>.md    one file per message, owned by the sender
       read/<pid>          message ids this session has already been shown
-      locks/              the deploy lock, and the vault lease
+      locks/              the deploy lock, the vault lease, and the board lock (board.flock)
       retired/            the person of each session that went, kept for the grace period
       theme               one line: which pack of names this machine uses
       themes.local/       packs written here — gitignored, override the shipped ones
@@ -434,8 +434,11 @@ the roster: it has no hold, `tell` cannot find it, and it is not live. But the p
 can stay open, and the agent can get a new task. Its next tool call (the
 `PreToolUse` hook), or its next `claim`, `scope`, `hold`, `say`, `tell`, `win` or
 lease, makes the same session file ACTIVE again, with the same name, person and
-scope. The call that signs off (`agentboard done`, `release`, `env free`,
-`vault free`) and the `PostToolUse` and `Stop` hooks after it do not. `sweep` keeps a
+scope. A shell call that runs a sign-off (`agentboard done`, `release`, `env free`,
+`vault free`) and the `PostToolUse` and `Stop` hooks after it do not. Only a shell
+tool counts, and only when the command runs the sign-off: a `Read` of a file with
+"agentboard done" in its name, or a command that has the words in quotes, is a tool
+call like any other and makes the session ACTIVE. `sweep` keeps a
 DONE file while its pid is still an agent process, however old the file is, and
 drops it when the process ends. Without this, a Codex session that ran
 `agentboard done` at the end of a task disappeared from the board for the rest of
@@ -500,6 +503,40 @@ A new session id on the same agent process (`/clear`, a new Codex thread) keeps 
 person that the process had. A pin in `persons.local` comes before all of these. If
 another live session has the person by then, the returning session draws a new one:
 two live sessions never share a person.
+
+The session file records how its person came to it, as `person_source`: `pin`,
+`back` (one of the three matches above) or `drawn`. A name that a session takes
+after it starts (`claim --name`) brings the person of that name back only while the
+session's person is `drawn`. A person that came back by session id or by pane stays,
+and the name's claim stays in the ledger for the session that owns it.
+
+**The same pid is not the same process.** The system gives the pid of a process that
+ended to a new one. A session file records when its process started (`pstart`: the
+start time from `/proc/<pid>/stat`, or `ps -o lstart` where there is no `/proc`).
+A claim that finds a file under its pid compares the two:
+
+- the same start: the same process. A new session id keeps the person (above).
+- a different start: the file is another process's. Its person goes to the ledger
+  for its own session, the file is dropped, and the new session starts a file of
+  its own, without the old name, scope or hold.
+- no start recorded (a file from before the field): no proof. A DONE file with
+  another session id is treated as another process's. An ACTIVE file gets the field
+  on its next claim.
+
+**Claims are one step at a time.** A claim reads which persons are held, then writes
+its file. Two claims that did this together drew the same person. Each now takes the
+board lock (`locks/board.flock`, an `flock`, so the kernel drops it when the holder
+dies) for the read and the write together. So do a revive, a redraw and the end of a
+Codex thread. A claim that cannot have the lock in 5 seconds goes on without it: a
+session without a file is worse than a rare shared person. Where there is no
+`flock(1)` (macOS), python's `fcntl` takes the same lock.
+
+**A claim is not used until its replacement is written.** A returning session's
+ledger entry is removed only after the new session file is in place. If the file
+cannot be written, `claim` exits 1 and the entry stays for the next try. In the same
+way `sweep` drops a session file only after its person is in the ledger. If
+`retired/` cannot be written, the file stays, `sweep` says how many it kept and
+exits 1, and a later sweep tries again.
 
 Sessions that predate the field pick one up on their next heartbeat, written by their
 own process. Nothing here ever writes into another agent's session file.
@@ -1142,7 +1179,7 @@ Codex takes different answers:
 | PreToolUse deny | `permissionDecision: "deny"` or exit 2 | always exit 2 with the reason on stderr (Codex accepts both forms; the watchdog passes on only this one) |
 | PreToolUse ask | `permissionDecision: "ask"` | **no ask in Codex**: an exit-2 refusal that tells the agent to stop and ask the user |
 | Stop, messages waiting | `additionalContext` | `{"decision": "block", "reason": ...}` |
-| SessionEnd | sweeps, then marks DONE | marks DONE only: Codex allows one second. The end of a different session id on the same process does nothing |
+| SessionEnd | sweeps, then marks DONE | marks DONE only: Codex allows one second. The end of a different session id on the same process does nothing, and neither does an end that cannot have the board lock in 0.4 seconds |
 
 Where Claude would ask, the Codex agent asks the user in the chat. If the user says
 yes, it runs `agentboard allow-edit <path>` (the next edit of that path passes the
@@ -1167,10 +1204,14 @@ tests the Codex answers under a process named `codex`.
 managed daemon (`codex app-server`). The hooks then run under the daemon, so the
 session file has the daemon's pid, and all threads on that daemon share one file.
 Three rules follow from that. A `SessionEnd` whose session id is not the one in the
-file is ignored: another thread ended, not this one. No pane is recorded for such a
-session, because the daemon's environment has the pane of whoever started the
-daemon. And when the daemon restarts (it updates itself) the pid changes: the
-session gets a new file, and its session id gives it the person it had (see Names).
+file is ignored: another thread ended, not this one. The comparison and the sign-off
+are one step under the board lock, and a claim writes the session id under the same
+lock, so a thread that starts while another one ends is not signed off by it. No
+pane is recorded for such a session, because the daemon's environment has the pane
+of whoever started the daemon. And when the daemon restarts (it updates itself) the
+pid changes: the session gets a new file, and its session id gives it the person it
+had (see Names). The file is made by `SessionStart`, or by the thread's first
+`PreToolUse`, `PostToolUse` or `Stop` under the new pid; each passes the session id.
 
 ### Fail closed, and where it cannot
 
