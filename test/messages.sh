@@ -246,13 +246,14 @@ check 'read its mail at its Stop: dropped, not poked' "$(cat "$AGENT_BOARD_DIR/p
 
 echo
 echo 'ab-poke-herdr leaves a draft alone'
-# a stand-in herdr: `agent read` prints a screen, `agent prompt` records the call
+# a stand-in herdr: `agent get` prints agentinfo (fails with none), `agent read`
+# prints a screen (fails with readfail), `agent prompt` records the call
 FAKEBIN=$AGENT_BOARD_DIR/fakebin; mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/herdr" <<EOF
 #!/bin/sh
 case "\$2" in
-  get)    cat "$AGENT_BOARD_DIR/agentinfo" 2>/dev/null ;;
-  read)   cat "$AGENT_BOARD_DIR/screen" ;;
+  get)    cat "$AGENT_BOARD_DIR/agentinfo" 2>/dev/null || exit 1 ;;
+  read)   [ -e "$AGENT_BOARD_DIR/readfail" ] && exit 1; cat "$AGENT_BOARD_DIR/screen" ;;
   prompt) echo "\$3 \$4" >> "$AGENT_BOARD_DIR/prompted" ;;
 esac
 EOF
@@ -260,68 +261,220 @@ chmod +x "$FAKEBIN/herdr"
 # macOS `ps eww` hides the environment of Apple's own binaries (/bin/sleep,
 # /bin/bash), so the stand-in agent must be a non-Apple binary, as claude is.
 inpane_cmd=(sleep 3000)
+inpane_sh=sh
 if [ ! -r /proc/self/environ ]; then
+  inpane_sh=
   for c in /opt/homebrew/bin/bash /usr/local/bin/bash; do
-    [ -x "$c" ] && { inpane_cmd=("$c" -c 'sleep 3000; true'); break; }
+    [ -x "$c" ] && { inpane_cmd=("$c" -c 'sleep 3000; true'); inpane_sh=$c; break; }
   done
   [ "${inpane_cmd[0]}" = sleep ] && command -v node >/dev/null && inpane_cmd=(node -e 'setTimeout(()=>{},3e6)')
 fi
 env HERDR_PANE_ID=w9:p9 "${inpane_cmd[@]}" </dev/null >/dev/null 2>&1 & INPANE=$!; disown $INPANE 2>/dev/null; FAKES+=("$INPANE")
 sleep 0.2
 HP=${AB%/agentboard}/ab-poke-herdr
-screen() { printf '%s\n' '────' "$1" '────' > "$AGENT_BOARD_DIR/screen"; }
-screen "$(printf '❯\302\240\033[0m\033[2m/upcoming\033[0m\r')"
-PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
-check "Claude's dim suggestion is not a draft: poked" "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "0/w9:p9 you have mail, run agentboard inbox"
-rm -f "$AGENT_BOARD_DIR/prompted"
-screen "$(printf '❯\302\240\033[0mI want the inv\033[7m \033[0m\r')"
-PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
-check 'a typed draft: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
-screen "$(printf '❯ 1. Yes\r')"
-PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
-check 'a dialog open: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
-# herdr's own view of the pane: a working or blocked agent is not prompted
+poke() { rm -f "$AGENT_BOARD_DIR/prompted"; PATH="$FAKEBIN:$PATH" "$HP" "${1:-$INPANE}"; echo "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)"; }
+POKED="0/w9:p9 you have mail, run agentboard inbox"
 agentinfo() { printf '{"result":{"agent":{"agent":"%s","agent_status":"%s","pane_id":"w9:p9"}}}\n' "$1" "$2" > "$AGENT_BOARD_DIR/agentinfo"; }
+# Claude's box, as read from a live pane: a ─── rule above (the session name may sit
+# in it) and below, ❯ on the first row, continuation rows indented by two.
+DASHES=$(printf '─%.0s' $(seq 1 40))
+RULE=$(printf '\033[0m\033[38;2;136;136;136m%s\033[0m\r' "$DASHES")
+LABELRULE=$(printf '\033[0m\033[38;2;136;136;136m%s GRC ─\033[0m\r' "$DASHES")
+CFOOT=$(printf '  \033[0m\033[38;2;255;193;7m⏵⏵ auto mode on\033[0m\033[38;2;153;153;153m (shift+tab to cycle) · PR\033[0m \033[0m\033[4m\033[38;2;255;193;7m#14\033[0m')
+# claude_screen <first row> [<continuation rows>...]
+claude_screen() {
+  local first=$1; shift
+  { printf '%s\n' "$LABELRULE" "$first"
+    for r in "$@"; do printf '  %s\r\n' "$r"; done
+    printf '%s\n' "$RULE" "$CFOOT"; } > "$AGENT_BOARD_DIR/screen"
+}
+screen() { claude_screen "$1"; }
+agentinfo claude idle
+screen "$(printf '❯\302\240\033[0m\033[2m/upcoming\033[0m\r')"
+check "Claude's dim suggestion is not a draft: poked" "$(poke)" "$POKED"
+screen "$(printf '❯\302\240\033[0mI want the inv\033[7m \033[0m\r')"
+check 'a typed draft: not poked, exit 75' "$(poke)" "75/"
+claude_screen "$(printf '❯\302\240\033[0m\r')" 'and the second line'
+check 'a Claude draft below an empty first row: exit 75' "$(poke)" "75/"
+claude_screen "$(printf '❯\302\240\033[0mUse the glyph ❯\r')"
+check 'a Claude draft that ends in the prompt glyph: exit 75' "$(poke)" "75/"
+claude_screen "$(printf '❯\302\240\033[0m\r')" 'compare ─── here'
+check 'a Claude draft row with ─── in it is not the rule: exit 75' "$(poke)" "75/"
+claude_screen "$(printf '❯\302\240\033[0m\r')" "$DASHES"
+check 'a Claude draft row of only ─── is not the rule: exit 75' "$(poke)" "75/"
+screen "$(printf '❯\302\240\r')"
+check 'the empty Claude box: poked' "$(poke)" "$POKED"
+screen "$(printf '❯\302\240\033[0m\033[0m\r')"
+check 'a reset the empty Claude box does not draw: exit 75' "$(poke)" "75/"
+screen "$(printf '❯\302\240\033[0m\033[7m \033[0m\r')"
+check 'a reverse-video cell in the Claude box: exit 75' "$(poke)" "75/"
+screen "$(printf '❯\302\240\033[0m\033[1m/upcoming\033[0m\r')"
+check 'a suggestion in a style other than dim: exit 75' "$(poke)" "75/"
+# another permission mode draws the rules in its own colour, the session name on a label
+red=$(printf '\033[38;2;220;38;38m')
+{ printf '\033[0m%s%s\033[0m\033[38;2;0;0;0m\033[48;2;220;38;38m JARVIS \033[0m%s─\033[0m\r\n' "$red" "$DASHES" "$red"
+  printf '❯\302\240\r\n'
+  printf '\033[0m%s%s\033[0m\r\n' "$red" "$DASHES"; } > "$AGENT_BOARD_DIR/screen"
+check 'the empty Claude box in red rules, with a label: poked' "$(poke)" "$POKED"
+# the box must be the last thing on screen: an older empty box does not count
+screen "$(printf '❯\302\240\r')"
+printf '%s\n' "$(printf '❯\302\240\033[0mhalf a thought\r')" >> "$AGENT_BOARD_DIR/screen"
+check 'a Claude draft below an older empty box: exit 75' "$(poke)" "75/"
+screen "$(printf '❯\302\240\r')"
+printf '  \033[0m\033[38;2;255;193;7m⏵⏵ auto mode on\033[0m\033[7m \033[0m\n' >> "$AGENT_BOARD_DIR/screen"
+check 'a reverse-video cell in the Claude footer: exit 75' "$(poke)" "75/"
+# a row that opens like the mode row but goes on with other text is not the footer
+screen "$(printf '❯\302\240\r')"
+printf '  \033[0m\033[38;2;255;193;7m⏵⏵ \033[0m❯ unsent note\n' >> "$AGENT_BOARD_DIR/screen"
+check 'the mode-row prefix, then a draft: exit 75' "$(poke)" "75/"
+screen "$(printf '❯\302\240\r')"
+printf '  \033[0m❯ unsent note\n' >> "$AGENT_BOARD_DIR/screen"
+check 'a draft row below the Claude box: exit 75' "$(poke)" "75/"
+# the fields the mode row may carry, as live panes draw them
+for f in '\033[0m\033[38;2;153;153;153m (shift+tab to cycle)\033[0m' \
+         '\033[0m\033[38;2;153;153;153m · \033[0m\033[38;2;0;204;204m1 shell\033[0m\033[38;2;153;153;153m · ↓ to manage\033[0m' \
+         '\033[0m\033[38;2;153;153;153m (shift+tab to cycle) · esc to interrupt\033[0m'; do
+  screen "$(printf '❯\302\240\r')"
+  { printf '%s\n' "$RULE"; printf "  \033[0m\033[38;2;255;193;7m⏵⏵ auto mode on$f\n"; } > "$AGENT_BOARD_DIR/tail"
+  head -n 2 "$AGENT_BOARD_DIR/screen" > "$AGENT_BOARD_DIR/head"; cat "$AGENT_BOARD_DIR/head" "$AGENT_BOARD_DIR/tail" > "$AGENT_BOARD_DIR/screen"
+  check "a live Claude mode row is the footer: poked" "$(poke)" "$POKED"
+done
+screen "$(printf '❯ 1. Yes\r')"
+check 'a dialog open: not poked, exit 75' "$(poke)" "75/"
+printf '%s\n' "$LABELRULE" "$(printf '❯\302\240\033[0m\r')" > "$AGENT_BOARD_DIR/screen"
+check 'no edge to the box on screen: exit 75' "$(poke)" "75/"
+printf '%s\n' 'nothing that looks like an input box' > "$AGENT_BOARD_DIR/screen"
+check 'no input box on screen: exit 75' "$(poke)" "75/"
+# herdr's own view of the pane decides first
 screen "$(printf '❯\302\240\033[0m\033[2m/upcoming\033[0m\r')"
 agentinfo claude working
-PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
-check 'herdr says working: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
+check 'herdr says working: not poked, exit 75' "$(poke)" "75/"
 agentinfo claude blocked
-PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
-check 'herdr says blocked: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
-# Codex: › is its prompt, history lines above the box start with it too, and its
-# dim placeholder carries a background code after the dim one (read from a live pane)
-cbg=$(printf '\033[48;2;52;52;52m')
-codex_screen() {
-  printf '%s\n' \
-    "$(printf '\033[0m\033[1m\033[2m%s›\033[0m%s s\033[0m\r' "$cbg" "$cbg")" \
-    "$(printf '\033[0m\033[2m• \033[0mDone. \r')" \
-    "$(printf '\033[0m\033[1m%s›\033[0m%s \033[0m%s\033[0m%s          \033[0m\r' "$cbg" "$cbg" "$1" "$cbg")" \
-    "$(printf '  \033[0m\033[1m←\033[0m for agents · ? for shortcuts\r')" > "$AGENT_BOARD_DIR/screen"
-}
-agentinfo codex idle
-codex_screen "$(printf '\033[2m%sAsk Codex to do anything' "$cbg")"
-PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
-check "Codex's dim placeholder is not a draft: poked" "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "0/w9:p9 you have mail, run agentboard inbox"
-rm -f "$AGENT_BOARD_DIR/prompted"
-codex_screen "$(printf '%sdeploy brace after the che' "$cbg")"
-PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
-check 'a Codex draft: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
-printf '%s\n' "$(printf '\033[0m\033[1m›\033[0m 1. Yes, proceed\r')" "  2. No" > "$AGENT_BOARD_DIR/screen"
-PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
-check 'a Codex dialog open: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
-agentinfo codex working
-codex_screen "$(printf '\033[2m%sAsk Codex to do anything' "$cbg")"
-PATH="$FAKEBIN:$PATH" "$HP" "$INPANE"
-check 'a working Codex: not poked, exit 75' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "75/"
+check 'herdr says blocked: not poked, exit 75' "$(poke)" "75/"
+agentinfo claude unknown
+check 'herdr does not know the state: exit 75' "$(poke)" "75/"
 rm -f "$AGENT_BOARD_DIR/agentinfo"
-# a Codex app-server daemon carries the pane that started it, not each session's:
-# no poke, exit 1 (no pane), even with a clear box
-codex_screen "$(printf '\033[2m%sAsk Codex to do anything' "$cbg")"
-env HERDR_PANE_ID=w9:p8 sh -c 'sleep 3000; true' app-server </dev/null >/dev/null 2>&1 & DAEMON=$!; disown $DAEMON 2>/dev/null; FAKES+=("$DAEMON")
+check 'herdr agent get fails: exit 75' "$(poke)" "75/"
+agentinfo grok idle
+check 'an agent whose box is not known: exit 1' "$(poke)" "1/"
+agentinfo claude idle; : > "$AGENT_BOARD_DIR/readfail"
+check 'herdr agent read fails: exit 75' "$(poke)" "75/"
+rm -f "$AGENT_BOARD_DIR/readfail"
+# Codex, as read from a live pane: › is its prompt, and history rows above the box
+# start with it too. Every row of the box is drawn on a background colour, and the
+# dim placeholder carries that background code after the dim one.
+# codex_screen <first row> [<more rows of the box>...]
+cbg=$(printf '\033[48;2;52;52;52m')
+# the footer as a live pane draws it: a status row whose " · " separators are
+# coloured, then the shortcuts row, with a hint at its right
+codex_footer_shortcuts_only() { codex_footer | tail -n 1; }
+codex_footer() {
+  printf '  \033[0m\033[38;2;246;226;183mGPT high\033[0m\033[38;2;118;131;140m · \033[0m\033[38;2;171;223;167m~/work\033[0m\r\n'
+  printf '  \033[0m\033[1m\033[38;2;179;201;215m←\033[0m\033[38;2;118;131;140m for agents · \033[0m\033[1m\033[38;2;179;201;215m?\033[0m\033[38;2;118;131;140m for shortcuts          ⚠ \033[0m\033[38;2;196;167;103m1 warning\033[0m\033[38;2;118;131;140m · \033[0m\033[1m\033[38;2;179;201;215mf2\033[0m\033[38;2;118;131;140m to view\033[0m%s\r\n' "${CTAIL-}"
+}
+codex_screen() {
+  local first=$1; shift
+  {
+    printf '\033[0m\033[1m\033[2m%s›\033[0m%s s\033[0m\r\n' "$cbg" "$cbg"
+    printf '\033[0m\033[2m• \033[0mDone. \r\n'
+    printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+    printf '\033[0m\033[1m%s›\033[0m%s \033[0m%s\033[0m%s          \033[0m\r\n' "$cbg" "$cbg" "$first" "$cbg"
+    for r in "$@"; do printf '\033[0m%s  %s\033[0m%s     \033[0m\r\n' "$cbg" "$r" "$cbg"; done
+    printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+    codex_footer
+  } > "$AGENT_BOARD_DIR/screen"
+}
+PLACEHOLDER=$(printf '\033[2m%sAsk Codex to do anything' "$cbg")
+agentinfo codex idle
+codex_screen "$PLACEHOLDER"
+check "Codex's dim placeholder is not a draft: poked" "$(poke)" "$POKED"
+CTAIL=$(printf '\033[7m \033[0m') codex_screen "$PLACEHOLDER"
+check 'a reverse-video cell after the Codex hint: exit 75' "$(poke)" "75/"
+codex_screen "$(printf '%sdeploy brace after the che' "$cbg")"
+check 'a Codex draft: not poked, exit 75' "$(poke)" "75/"
+codex_screen "" "$(printf '%sthe draft starts on its second row' "$cbg")"
+check 'a Codex draft that starts with a newline: exit 75' "$(poke)" "75/"
+codex_screen "$(printf '%sthe tail is the glyph ›' "$cbg")"
+check 'a Codex draft that ends in the prompt glyph: exit 75' "$(poke)" "75/"
+# no background on the draft row: the box has no lower edge this can prove
+{ printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+  printf '\033[0m\033[1m%s›\033[0m%s          \033[0m\r\n' "$cbg" "$cbg"
+  printf 'draft text with no background\r\n'
+  codex_footer; } > "$AGENT_BOARD_DIR/screen"
+check 'a blank Codex row over a draft with no background: exit 75' "$(poke)" "75/"
+# two newlines first: a blank continuation on the background looks like the
+# bottom row, and the draft row under it has no background
+{ printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+  printf '\033[0m\033[1m%s›\033[0m%s          \033[0m\r\n' "$cbg" "$cbg"
+  printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+  printf '  %s\r\n' "${CDRAFT:-draft text with no background}"
+  codex_footer; } > "$AGENT_BOARD_DIR/screen"
+check 'a Codex draft after two newlines, no background on it: exit 75' "$(poke)" "75/"
+# the same, with the footer's separator in the draft
+codex_bare_draft() {
+  { printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+    printf '\033[0m\033[1m%s›\033[0m%s          \033[0m\r\n' "$cbg" "$cbg"
+    printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+    printf '  review notes · still drafting\r\n'
+    "$@"; } > "$AGENT_BOARD_DIR/screen"
+}
+codex_bare_draft codex_footer
+check 'a Codex draft with " · " in it, above the footer: exit 75' "$(poke)" "75/"
+codex_bare_draft codex_footer_shortcuts_only
+check 'a Codex draft with " · " in it, in the status row place: exit 75' "$(poke)" "75/"
+# the same draft with a reset just before " · " (one cell in reverse video)
+codex_reset_draft() {
+  { printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+    printf '\033[0m\033[1m%s›\033[0m%s \033[0m\033[2m%sAsk Codex to do anything\033[0m%s     \033[0m\r\n' "$cbg" "$cbg" "$cbg" "$cbg"
+    printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+    printf '  review note\033[7ms\033[0m · still drafting\r\n'
+    codex_footer_shortcuts_only; } > "$AGENT_BOARD_DIR/screen"
+}
+codex_reset_draft
+check 'a Codex draft with a reset before " · ", in the status row place: exit 75' "$(poke)" "75/"
+printf '%s\n' "$(printf '\033[0m\033[1m›\033[0m 1. Yes, proceed\r')" "  2. No" > "$AGENT_BOARD_DIR/screen"
+check 'a Codex dialog open: not poked, exit 75' "$(poke)" "75/"
+agentinfo codex working
+codex_screen "$PLACEHOLDER"
+check 'a working Codex: not poked, exit 75' "$(poke)" "75/"
+agentinfo codex idle
+# A Codex app-server daemon carries the pane that started it, not each session's:
+# no poke, exit 1 (no pane), even with a clear box. It is the subcommand, the first
+# argument that is neither an option nor an option's value.
+# argv is then [codex, app-server], as the real daemon's is
+printf 'sleep 3000; true\n' > "$AGENT_BOARD_DIR/app-server"
+(cd "$AGENT_BOARD_DIR" && HERDR_PANE_ID=w9:p9 exec -a codex sh app-server) </dev/null >/dev/null 2>&1 & DAEMON=$!; disown $DAEMON 2>/dev/null; FAKES+=("$DAEMON")
 sleep 0.2
-PATH="$FAKEBIN:$PATH" "$HP" "$DAEMON"
-check 'a Codex daemon pid: not poked, exit 1' "$?/$(cat "$AGENT_BOARD_DIR/prompted" 2>/dev/null)" "1/"
+check 'a Codex daemon pid: not poked, exit 1' "$(poke "$DAEMON")" "1/"
+# global options before the subcommand: argv is [codex, -c, <value>, app-server]
+(HERDR_PANE_ID=w9:p9 exec -a codex sh -c 'sleep 3000; true' app-server) </dev/null >/dev/null 2>&1 & DAEMON2=$!; disown $DAEMON2 2>/dev/null; FAKES+=("$DAEMON2")
+sleep 0.2
+check 'a Codex daemon with options before app-server: exit 1' "$(poke "$DAEMON2")" "1/"
+# macOS has no /proc, and ps joins arguments with spaces: with a value that has a
+# space in it, [codex, -C, /tmp/Agent Board, app-server] reads as the positional
+# "Board". Any word that is exactly app-server then counts as the daemon.
+if [ -n "$inpane_sh" ]; then
+  (HERDR_PANE_ID=w9:p9 exec -a codex "$inpane_sh" -c 'sleep 3000; true' -C '/tmp/Agent Board' app-server) </dev/null >/dev/null 2>&1 & DAEMON3=$!; disown $DAEMON3 2>/dev/null; FAKES+=("$DAEMON3")
+  sleep 0.2
+  check 'a daemon read through ps, a value with a space before app-server: exit 1' "$(AGENT_BOARD_PROC=$AGENT_BOARD_DIR/noproc poke "$DAEMON3")" "1/"
+fi
+# app-server as the value of an option is a directory, not the subcommand:
+# argv is [codex, -c, <value>, --cd, app-server]. The NUL-delimited argv in /proc
+# tells the two apart; through ps the word app-server alone is taken for the daemon.
+if [ -n "$inpane_sh" ]; then
+  (HERDR_PANE_ID=w9:p9 exec -a codex "$inpane_sh" -c 'sleep 3000; true' --cd app-server) </dev/null >/dev/null 2>&1 & CDDIR=$!; disown $CDDIR 2>/dev/null; FAKES+=("$CDDIR")
+  sleep 0.2
+  if [ -r "${AGENT_BOARD_PROC:-/proc}/$CDDIR/cmdline" ]; then
+    check 'codex --cd app-server is not the daemon: poked' "$(poke "$CDDIR")" "$POKED"
+  fi
+  check 'codex --cd app-server read through ps: exit 1, no prompt' "$(AGENT_BOARD_PROC=$AGENT_BOARD_DIR/noproc poke "$CDDIR")" "1/"
+fi
+if [ -n "$inpane_sh" ]; then
+  env HERDR_PANE_ID=w9:p9 "$inpane_sh" -c 'sleep 3000; true' codex --cd /work/app-server-ui </dev/null >/dev/null 2>&1 & CDARG=$!; disown $CDARG 2>/dev/null; FAKES+=("$CDARG")
+  sleep 0.2
+  check 'app-server in a --cd path is not the daemon: poked' "$(poke "$CDARG")" "$POKED"
+fi
+rm -f "$AGENT_BOARD_DIR/agentinfo"
 rm -f "$STUBJSON"
 
 echo

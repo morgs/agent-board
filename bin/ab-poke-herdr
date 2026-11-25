@@ -10,11 +10,33 @@ pid=$1
 
 # A Codex app-server daemon hosts several sessions under one pid, and its environment
 # names the pane that started it, not the session's own pane. A poke there would
-# wake the wrong agent, so a daemon pid has no pane (as pane_id in agentboard).
-case "$(ps -o args= -p "$pid" 2>/dev/null)" in *app-server*) exit 1 ;; esac
+# wake the wrong agent, so a daemon pid has no pane. The daemon is the app-server
+# subcommand: the first argument that is neither an option nor the value of one, so
+# `codex -c k=v app-server` is the daemon and `codex --cd app-server` is not.
+proc=${AGENT_BOARD_PROC:-/proc}
+if [ -r "$proc/$pid/cmdline" ]; then
+  args=$(tr "\0" "\n" < "$proc/$pid/cmdline" 2>/dev/null)
+else
+  # macOS has no /proc, and `ps` joins the arguments with spaces, so a value with a
+  # space in it (-C '/tmp/Agent Board') cannot be told from the next argument. A
+  # word that is exactly app-server anywhere is then taken for the daemon: a missed
+  # poke is safer than a wake in the wrong pane.
+  args=$(ps -o args= -p "$pid" 2>/dev/null | tr ' ' '\n')
+  printf '%s\n' "$args" | grep -qx app-server && exit 1
+fi
+sub=$(printf '%s\n' "$args" | awk '
+  # the codex options that take a value
+  BEGIN { split("-c --config --enable --disable --remote --remote-auth-token-env -i --image -m --model --local-provider -p --profile -s --sandbox -C --cd --add-dir -a --ask-for-approval", o, " ")
+          for (k in o) val[o[k]] = 1 }
+  NR == 1 { next }
+  skip { skip = 0; next }
+  $0 == "--" { exit }
+  /^-/ { if (($0 in val) && index($0, "=") == 0) skip = 1; next }
+  { print; exit }')
+[ "$sub" = app-server ] && exit 1
 
-if [ -r /proc/"$pid"/environ ]; then
-  pane=$(tr "\0" "\n" < /proc/"$pid"/environ 2>/dev/null | sed -n "s/^HERDR_PANE_ID=//p")
+if [ -r "$proc/$pid/environ" ]; then
+  pane=$(tr "\0" "\n" < "$proc/$pid/environ" 2>/dev/null | sed -n "s/^HERDR_PANE_ID=//p")
 else
   # macOS has no /proc; `ps eww` appends the environment of a process of this user.
   pane=$(ps eww -p "$pid" -o command= 2>/dev/null | tr ' ' '\n' | sed -n "s/^HERDR_PANE_ID=//p" | head -1)
@@ -28,32 +50,80 @@ for c in "$HOME/.local/bin/herdr" /opt/homebrew/bin/herdr /usr/local/bin/herdr "
 done
 [ -n "$herdr" ] || exit 1
 
-# herdr knows what the pane is doing, for Claude and for Codex alike. A working agent
-# collects its mail at its own Stop, and `agent prompt` would type into its turn; a
-# blocked one has a dialog open. Exit 75 (EX_TEMPFAIL) and the board tries again on
-# a later tick, until the target is idle or has read its mail.
-info=$("$herdr" agent get "$pane" 2>/dev/null)
+# Nothing is sent unless herdr says what the pane is and what it is doing, and the
+# screen shows its input box: a poke presses Enter on whatever is in that box. When
+# herdr cannot be read now, exit 75 (EX_TEMPFAIL) and the board tries again on a
+# later tick, until the target is idle or has read its mail.
+info=$("$herdr" agent get "$pane" 2>/dev/null) || exit 75
 status=$(printf '%s' "$info" | sed -n 's/.*"agent_status":"\([a-z_]*\)".*/\1/p')
-case "$status" in working|blocked) exit 75 ;; esac
+agent=$(printf '%s' "$info" | grep -o '"agent":"[a-z]*"' | head -n 1 | sed 's/.*:"\(.*\)"/\1/')
 
-# `agent prompt` types its line and presses Enter, so anything already in the input
-# box would be sent with it, cut off mid-sentence. The input box starts at the
-# agent's prompt glyph: ❯ for Claude, › for Codex. Each draws its placeholder dim
-# (SGR 2), Codex with a background colour code after the dim one; other text after
-# the last glyph is a draft the human is writing. Exit 75 for a draft too. A glyph in
-# a dialog's option list reads as a draft, which is right: the target cannot take a
-# prompt until the dialog closes.
-case "$(printf '%s' "$info" | grep -o '"agent":"[a-z]*"' | head -n 1)" in
-  *'"codex"') glyph='›' ;;
-  *) glyph='❯' ;;
+# A working agent collects its mail at its own Stop, and a prompt would type into its
+# turn; a blocked one has a dialog open. Only idle or done takes a prompt.
+case "$status" in
+  idle|done) ;;
+  *) exit 75 ;;
 esac
-esc=$(printf '\033')
-draft=$("$herdr" agent read "$pane" --source visible --format ansi 2>/dev/null \
-  | LC_ALL=C grep -a "$glyph" | tail -n 1 \
-  | LC_ALL=C sed -e "s/.*$glyph//" \
-      -e "s/${esc}\[2m\(${esc}\[[0-9;]*m\)*[^${esc}]*//g" \
-      -e "s/${esc}\[[0-9;?]*[A-Za-z]//g" \
-  | LC_ALL=C tr -d ' \t\r\302\240')
-[ -z "$draft" ] || exit 75
+
+# A poke presses Enter on whatever is in the input box, so it goes only to a pane
+# whose box is, byte for byte, the empty box this agent draws; only the free text
+# in it may vary (a placeholder, a session name, the footer's model and path).
+# Anything else - a draft, a dialog, a cursor, another style or reset, a version
+# that draws its box another way - is 75, and the board tries again later.
+# The box must be the last thing on screen, so an older box higher up does not count.
+#   Claude  a rule (its colour follows the permission mode, and the session
+#           name may sit in it, plain or on a label colour), the row "❯" and a
+#           no-break space alone or with a dim suggestion, a rule; below it only
+#           the ⏵⏵ mode row, with the fields Claude adds to it.
+#   Codex   a blank row on the box colour, the › row with the dim placeholder,
+#           a blank row, the status row, the shortcuts row (with or without the
+#           warning hint at its right).
+# The screen is read once and the prompt sent after it, so a human who starts to
+# type in that gap gets the poke appended to the draft and sent. Only herdr can
+# close that gap, with a prompt that it types only into an empty box.
+case "$agent" in
+  claude|codex) ;;
+  *) exit 1 ;;
+esac
+screen=$("$herdr" agent read "$pane" --source visible --format ansi 2>/dev/null) || exit 75
+printf '%s\n' "$screen" | LC_ALL=C awk -v agent="$agent" '
+  BEGIN {
+    E = "\033[[]"                               # the start of a style: ESC [
+    T = "[^\033]"                               # one character that is not a style
+    R = "\342\224\200"                          # ─
+    dot = "\302\267"                             # ·
+    rgb = E "38;2;[0-9]+;[0-9]+;[0-9]+m"
+    rule = "^" E "0m" rgb
+    rule_top = rule "(" R ")+(( " T "* " R ")?|" E "0m" rgb E "48;2;[0-9]+;[0-9]+;[0-9]+m " T "* " E "0m" rgb R ")" E "0m$"
+    rule_bot = rule "(" R ")+" E "0m$"
+    prompt_c = "^\342\235\257\302\240(" E "0m(" E "2m" T "*" E "0m)?)?$"
+    bg = E "48;2;52;52;52m"
+    pad = "^" E "0m" bg " +" E "0m$"
+    prompt_x = "^" E "0m" E "1m" bg "\342\200\272" E "0m" bg " " E "0m" E "2m" bg T "*" E "0m" bg " +" E "0m$"
+    sep = E "38;2;118;131;140m " dot " " E "0m"
+    status = "^  " E "0m" E "38;2;246;226;183m" T "+" E "0m(" sep rgb T "+" E "0m)+$"
+    key = E "0m" E "1m" E "38;2;179;201;215m"
+    grey = E "0m" E "38;2;118;131;140m"
+    warn = " +\342\232\240 " E "0m" E "38;2;196;167;103m[0-9]+ warnings?" grey " " dot " " key "f2" grey " to view"
+    keys = "^  " key "\342\206\220" grey " for agents " dot " " key "[?]" grey " for shortcuts(" warn ")?" E "0m$"
+    # the Claude footer: the mode row, then the fields it may add after " · "
+    # (running shells, the PR, esc to interrupt), each in the style it draws
+    G = E "0m" E "38;2;153;153;153m"
+    mode = "(auto mode|don\047t ask|accept edits|bypass permissions) on"
+    field = "(esc to interrupt|\342\206\223 to manage|PR" E "0m " E "0m" E "4m" rgb "#[0-9]+(" G ")?|" E "0m" E "38;2;0;204;204m[0-9]+ shells?" G ")"
+    cfoot = "^  " E "0m" rgb "\342\217\265\342\217\265 " mode G "( [(]shift[+]tab to cycle[)])?( " dot " " field ")*" E "0m$"
+  }
+  { sub(/\r$/, ""); l[NR] = $0 }
+  END {
+    if (agent == "claude") {
+      for (n = NR; n >= 1 && l[n] ~ /^ *$/; n--) ;
+      while (n >= 1 && l[n] ~ cfoot) n--
+      if (n < 3) exit 3
+      exit !(l[n] ~ rule_bot && l[n - 1] ~ prompt_c && l[n - 2] ~ rule_top)
+    }
+    for (n = NR; n >= 1 && l[n] == ""; n--) ;
+    if (n < 5) exit 3
+    exit !(l[n] ~ keys && l[n - 1] ~ status && l[n - 2] ~ pad && l[n - 3] ~ prompt_x && l[n - 4] ~ pad)
+  }' || exit 75
 
 exec "$herdr" agent prompt "$pane" "you have mail, run agentboard inbox" >/dev/null

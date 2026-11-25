@@ -880,18 +880,36 @@ poke lands, when it has read its mail, when it goes busy (its own Stop delivers 
 mail), when it ends, or after `AGENT_BOARD_POKE_TTL` seconds. A non-Claude target has
 no status for the board to read, so it stays queued until the poke lands or it reads
 its mail; it is queued only when the poke command exits 75, since any other failure
-means there is no pane to poke. `ab-poke-herdr` uses this on purpose:
+means it cannot be poked at all (no pane, or an agent the poke does not know). `ab-poke-herdr` uses this on purpose:
 
 - A Codex app-server daemon pid hosts several sessions, and its environment names the
-  pane that started it, not each session's own: it has no pane (exit 1), as in the
-  board's `pane_id`, so a poke never wakes the wrong agent.
-- It asks herdr for the pane's state (`herdr agent get`). A `working` agent collects
-  its mail at its own Stop (Codex too, through its Stop hook), and a `blocked` one has
-  a dialog open: exit 75.
+  pane that started it, not each session's own: it has no pane (exit 1), so a poke
+  never wakes the wrong agent. The daemon is the `app-server` subcommand: the first
+  argument that is neither an option nor the value of one. So `codex -c key=value
+  app-server` is the daemon, and `codex --cd app-server` (a directory) is a normal Codex.
+  On macOS, `ps` joins the arguments with spaces, so a value with a space in it cannot
+  be told from the next argument; there any word that is exactly `app-server` counts
+  as the daemon, and a Codex with that word in its arguments collects with `inbox`.
+- It sends nothing unless herdr says what the pane is and what it is doing
+  (`herdr agent get`), and only to an `idle` or `done` agent. A `working` agent
+  collects its mail at its own Stop (Codex too, through its Stop hook); a `blocked`
+  one has a dialog open. A failed `get` or `read`, or a state herdr does not know,
+  exits 75. An agent whose input box it does not know (not Claude or Codex) exits 1.
 - `herdr agent prompt` types a line and presses Enter, so it would send the text the
-  human has half typed in the input box. The box starts at the agent's prompt glyph:
-  `❯` for Claude, `›` for Codex. If text that is not the agent's dim placeholder
-  follows the last glyph, or a dialog is open, it exits 75 and the board waits.
+  human has half typed. So it pokes only a pane whose screen ends, byte for byte, in
+  the empty box that agent draws; only the free text in it may vary. For Claude: a
+  rule (its colour follows the permission mode; the session name may sit in it), the
+  row `❯` and a no-break space, alone or with a dim suggestion, then a rule, with only
+  the `⏵⏵` mode row below it (its mode, then the fields Claude adds: shells, the PR,
+  `esc to interrupt`). For Codex, the last rows on screen: a blank row on the
+  box colour, the `›` row with the dim placeholder, a blank row, the status row
+  (model, then ` · ` separators in their colour), and the shortcuts row with or
+  without its warning hint. Anything else exits 75 and the board waits: a draft,
+  a dialog, a cursor, any other style or reset, or a version of the agent that draws
+  its box another way. A new version that changes the box stops the pokes until the
+  template is updated; it does not send a draft. One gap stays open: the screen is
+  read once and the prompt sent after it, so text typed in between is sent with the
+  poke. Only a herdr prompt that types into an empty box only can close it.
 
 ## Claude Code integration (automatic, via global hooks)
 
