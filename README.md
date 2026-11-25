@@ -896,17 +896,16 @@ means it cannot be poked at all (no pane, or an agent the poke does not know). `
   one has a dialog open. A failed `get` or `read`, or a state herdr does not know,
   exits 75. An agent whose input box it does not know (not Claude or Codex) exits 1.
 - `herdr agent prompt` types a line and presses Enter, so it would send the text the
-  human has half typed. So it pokes only a box it can prove is empty. It frames the
-  box first: for Claude, between the last two `───` rules that start in the first
-  column (the top one may carry the session name), with `❯` at the start of the first
-  row; for Codex, the last block of rows on the box's background colour, which must be
-  three rows (blank, `›`, blank) with the footer right below it and nothing after: the
-  status row with the ` · ` separators Codex colours, then the `? for shortcuts` row.
-  A draft row with no background could sit anywhere else there, and typed text has no
-  colour code of its own before a ` · `. Empty
-  is the glyph and the agent's dim placeholder on that row, and nothing on any other
-  row. A draft (with `❯`, `›` or `───` in it or not), a dialog, or a box it cannot
-  frame exits 75 and the board waits.
+  human has half typed. So it pokes only a pane whose screen ends, byte for byte, in
+  the empty box that agent draws; only the free text in it may vary. For Claude: a
+  rule (its colour follows the permission mode; the session name may sit in it), the
+  row `❯` and a no-break space, alone or with a dim suggestion, then a rule. For
+  Codex, the last rows on screen: a blank row on the box colour, the `›` row with the
+  dim placeholder, a blank row, the status row (model, then ` · ` separators in their
+  colour), and the shortcuts row. Anything else exits 75 and the board waits: a draft,
+  a dialog, a cursor, any other style or reset, or a version of the agent that draws
+  its box another way. A new version that changes the box stops the pokes until the
+  template is updated; it does not send a draft.
 
 ## Claude Code integration (automatic, via global hooks)
 

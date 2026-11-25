@@ -277,8 +277,9 @@ POKED="0/w9:p9 you have mail, run agentboard inbox"
 agentinfo() { printf '{"result":{"agent":{"agent":"%s","agent_status":"%s","pane_id":"w9:p9"}}}\n' "$1" "$2" > "$AGENT_BOARD_DIR/agentinfo"; }
 # Claude's box, as read from a live pane: a ─── rule above (the session name may sit
 # in it) and below, ❯ on the first row, continuation rows indented by two.
-RULE=$(printf '─%.0s' $(seq 1 40))
-LABELRULE="$(printf '─%.0s' $(seq 1 30)) GRC ─"
+DASHES=$(printf '─%.0s' $(seq 1 40))
+RULE=$(printf '\033[0m\033[38;2;136;136;136m%s\033[0m\r' "$DASHES")
+LABELRULE=$(printf '\033[0m\033[38;2;136;136;136m%s GRC ─\033[0m\r' "$DASHES")
 # claude_screen <first row> [<continuation rows>...]
 claude_screen() {
   local first=$1; shift
@@ -298,8 +299,22 @@ claude_screen "$(printf '❯\302\240\033[0mUse the glyph ❯\r')"
 check 'a Claude draft that ends in the prompt glyph: exit 75' "$(poke)" "75/"
 claude_screen "$(printf '❯\302\240\033[0m\r')" 'compare ─── here'
 check 'a Claude draft row with ─── in it is not the rule: exit 75' "$(poke)" "75/"
-claude_screen "$(printf '❯\302\240\033[0m\r')" "$RULE"
+claude_screen "$(printf '❯\302\240\033[0m\r')" "$DASHES"
 check 'a Claude draft row of only ─── is not the rule: exit 75' "$(poke)" "75/"
+screen "$(printf '❯\302\240\r')"
+check 'the empty Claude box: poked' "$(poke)" "$POKED"
+screen "$(printf '❯\302\240\033[0m\033[0m\r')"
+check 'a reset the empty Claude box does not draw: exit 75' "$(poke)" "75/"
+screen "$(printf '❯\302\240\033[0m\033[7m \033[0m\r')"
+check 'a reverse-video cell in the Claude box: exit 75' "$(poke)" "75/"
+screen "$(printf '❯\302\240\033[0m\033[1m/upcoming\033[0m\r')"
+check 'a suggestion in a style other than dim: exit 75' "$(poke)" "75/"
+# another permission mode draws the rules in its own colour, the session name on a label
+red=$(printf '\033[38;2;220;38;38m')
+{ printf '\033[0m%s%s\033[0m\033[38;2;0;0;0m\033[48;2;220;38;38m JARVIS \033[0m%s─\033[0m\r\n' "$red" "$DASHES" "$red"
+  printf '❯\302\240\r\n'
+  printf '\033[0m%s%s\033[0m\r\n' "$red" "$DASHES"; } > "$AGENT_BOARD_DIR/screen"
+check 'the empty Claude box in red rules, with a label: poked' "$(poke)" "$POKED"
 screen "$(printf '❯ 1. Yes\r')"
 check 'a dialog open: not poked, exit 75' "$(poke)" "75/"
 printf '%s\n' "$LABELRULE" "$(printf '❯\302\240\033[0m\r')" > "$AGENT_BOARD_DIR/screen"
@@ -381,6 +396,16 @@ codex_bare_draft codex_footer
 check 'a Codex draft with " · " in it, above the footer: exit 75' "$(poke)" "75/"
 codex_bare_draft codex_footer_shortcuts_only
 check 'a Codex draft with " · " in it, in the status row place: exit 75' "$(poke)" "75/"
+# the same draft with a reset just before " · " (one cell in reverse video)
+codex_reset_draft() {
+  { printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+    printf '\033[0m\033[1m%s›\033[0m%s \033[0m\033[2m%sAsk Codex to do anything\033[0m%s     \033[0m\r\n' "$cbg" "$cbg" "$cbg" "$cbg"
+    printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+    printf '  review note\033[7ms\033[0m · still drafting\r\n'
+    codex_footer_shortcuts_only; } > "$AGENT_BOARD_DIR/screen"
+}
+codex_reset_draft
+check 'a Codex draft with a reset before " · ", in the status row place: exit 75' "$(poke)" "75/"
 printf '%s\n' "$(printf '\033[0m\033[1m›\033[0m 1. Yes, proceed\r')" "  2. No" > "$AGENT_BOARD_DIR/screen"
 check 'a Codex dialog open: not poked, exit 75' "$(poke)" "75/"
 agentinfo codex working
@@ -408,11 +433,15 @@ if [ -n "$inpane_sh" ]; then
   check 'a daemon read through ps, a value with a space before app-server: exit 1' "$(AGENT_BOARD_PROC=$AGENT_BOARD_DIR/noproc poke "$DAEMON3")" "1/"
 fi
 # app-server as the value of an option is a directory, not the subcommand:
-# argv is [codex, -c, <value>, --cd, app-server]
+# argv is [codex, -c, <value>, --cd, app-server]. The NUL-delimited argv in /proc
+# tells the two apart; through ps the word app-server alone is taken for the daemon.
 if [ -n "$inpane_sh" ]; then
   (HERDR_PANE_ID=w9:p9 exec -a codex "$inpane_sh" -c 'sleep 3000; true' --cd app-server) </dev/null >/dev/null 2>&1 & CDDIR=$!; disown $CDDIR 2>/dev/null; FAKES+=("$CDDIR")
   sleep 0.2
-  check 'codex --cd app-server is not the daemon: poked' "$(poke "$CDDIR")" "$POKED"
+  if [ -r "/proc/$CDDIR/cmdline" ]; then
+    check 'codex --cd app-server is not the daemon: poked' "$(poke "$CDDIR")" "$POKED"
+  fi
+  check 'codex --cd app-server read through ps: exit 1, no prompt' "$(AGENT_BOARD_PROC=$AGENT_BOARD_DIR/noproc poke "$CDDIR")" "1/"
 fi
 if [ -n "$inpane_sh" ]; then
   env HERDR_PANE_ID=w9:p9 "$inpane_sh" -c 'sleep 3000; true' codex --cd /work/app-server-ui </dev/null >/dev/null 2>&1 & CDARG=$!; disown $CDARG 2>/dev/null; FAKES+=("$CDARG")

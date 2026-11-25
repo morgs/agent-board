@@ -65,66 +65,51 @@ case "$status" in
   *) exit 75 ;;
 esac
 
-# A poke presses Enter on whatever is in the input box, so it goes only to a box
-# this can prove is empty. Each agent frames its box in a way the screen shows:
-#   Claude  a ─── rule above and below, from the first column; the first row
-#           inside starts with ❯, and continuation rows are indented.
-#   Codex   a block of three rows on a background colour (SGR 48): a blank row, the
-#           › row, a blank row. Right below it the footer: the status row with its
-#           coloured " · " separators, the "? for shortcuts" row, then nothing.
-#           Any other row could be a draft drawn without a background, so 75.
-# Empty is the glyph and the agent's dim placeholder (SGR 2) on the first row, and
-# nothing on any other row. Anything else, or a box this cannot frame, is 75.
+# A poke presses Enter on whatever is in the input box, so it goes only to a pane
+# whose box is, byte for byte, the empty box this agent draws; only the free text
+# in it may vary (a placeholder, a session name, the footer's model and path).
+# Anything else - a draft, a dialog, a cursor, another style or reset, a version
+# that draws its box another way - is 75, and the board tries again later.
+#   Claude  a rule (its colour follows the permission mode, and the session
+#           name may sit in it, plain or on a label colour), the row "❯" and a no-break space alone or with
+#           a dim suggestion, a rule. A draft cannot reach the rows below the box.
+#   Codex   the last rows on screen: a blank row on the box colour, the › row
+#           with the dim placeholder, a blank row, the status row, the
+#           shortcuts row. Codex has no rule under its box, so the footer is
+#           matched too.
 case "$agent" in
-  claude) glyph='❯' ;;
-  codex)  glyph='›' ;;
+  claude|codex) ;;
   *) exit 1 ;;
 esac
-esc=$(printf '\033')
 screen=$("$herdr" agent read "$pane" --source visible --format ansi 2>/dev/null) || exit 75
-printf '%s\n' "$screen" | LC_ALL=C awk -v g="$glyph" -v agent="$agent" -v e="$esc" \
-    -v rule='─' -v nbsp="$(printf '\302\240')" -v dot="$(printf ' \302\267 ')" '
-  function plain(s) { gsub(e "\\[[0-9;?]*[A-Za-z]", "", s); return s }
-  function undim(s) { gsub(e "\\[2m(" e "\\[[0-9;]*m)*[^" e "]*", "", s); return s }
-  function blank(s) { gsub(/[ \t\r]/, "", s); gsub(nbsp, "", s); return s == "" }
-  # A rule starts in the first column with at least 20 of ─ and ends with one; it
-  # may carry the session name in it. Draft rows are indented, so text with ─ in
-  # it is never one.
-  function isrule(s,   c) {
-    sub(/[ \t\r]+$/, "", s)
-    if (substr(s, length(s) - length(rule) + 1) != rule) return 0
-    for (c = 0; c < 20 && substr(s, 1, length(rule)) == rule; c++) s = substr(s, length(rule) + 1)
-    return c == 20
+printf '%s\n' "$screen" | LC_ALL=C awk -v agent="$agent" '
+  BEGIN {
+    E = "\033[[]"                               # the start of a style: ESC [
+    T = "[^\033]"                               # one character that is not a style
+    R = "\342\224\200"                          # ─
+    dot = "\302\267"                             # ·
+    rgb = E "38;2;[0-9]+;[0-9]+;[0-9]+m"
+    rule = "^" E "0m" rgb
+    rule_top = rule "(" R ")+(( " T "* " R ")?|" E "0m" rgb E "48;2;[0-9]+;[0-9]+;[0-9]+m " T "* " E "0m" rgb R ")" E "0m$"
+    rule_bot = rule "(" R ")+" E "0m$"
+    prompt_c = "^\342\235\257\302\240(" E "0m(" E "2m" T "*" E "0m)?)?$"
+    bg = E "48;2;52;52;52m"
+    pad = "^" E "0m" bg " +" E "0m$"
+    prompt_x = "^" E "0m" E "1m" bg "\342\200\272" E "0m" bg " " E "0m" E "2m" bg T "*" E "0m" bg " +" E "0m$"
+    sep = E "38;2;118;131;140m " dot " " E "0m"
+    status = "^  " E "0m" E "38;2;246;226;183m" T "+" E "0m(" sep rgb T "+" E "0m)+$"
+    keys = "^  " E "0m" E "1m" E "38;2;179;201;215m\342\206\220" E "0m" E "38;2;118;131;140m for agents " dot " " E "0m" E "1m" E "38;2;179;201;215m[?]" E "0m" E "38;2;118;131;140m for shortcuts(" E "0m)?( +.*)?$"
   }
-  function bg(s) { return index(s, e "[48;") > 0 }
-  # the shortcuts row: indented, with the "?" Codex colours; a hint may follow it
-  function footer2(r) {
-    return substr(plain(r), 1, 2) == "  " && r ~ (e "\\[[0-9;]*m[?]") && index(plain(r), "? for shortcuts")
-  }
-  { raw[NR] = $0; p[NR] = plain($0) }
+  { sub(/\r$/, ""); l[NR] = $0 }
   END {
     if (agent == "claude") {
-      for (n = NR; n >= 1; n--) if (isrule(p[n])) { if (!r2) r2 = n; else { r1 = n; break } }
-      if (!r1 || r2 - r1 < 2) exit 3
-      top = r1 + 1; bot = r2 - 1
-    } else {
-      for (n = NR; n >= 1 && !bg(raw[n]); n--) ;
-      if (n < 1 || n == NR) exit 3
-      bot = n
-      for (top = n; top > 1 && bg(raw[top - 1]); top--) ;
-      if (bot - top != 2 || !blank(p[top]) || !blank(p[bot])) exit 3
-      # the footer: the status row, whose " · " separators Codex colours (typed
-      # text has no colour code of its own before one), the shortcuts row, then
-      # nothing. Any other row could be a draft drawn without a background.
-      if (bot + 2 > NR || raw[bot + 1] !~ (e "\\[[0-9;]*m" dot) || !footer2(raw[bot + 2])) exit 3
-      for (n = bot + 3; n <= NR; n++) if (!blank(p[n])) exit 3
-      top++; bot--
+      for (n = NR; n >= 3; n--) if (l[n] ~ rule_bot) break
+      if (n < 3) exit 3
+      exit !(l[n - 1] ~ prompt_c && l[n - 2] ~ rule_top)
     }
-    if (index(p[top], g) != 1) exit 3
-    first = plain(undim(raw[top]))
-    if (index(first, g) == 1) first = substr(first, length(g) + 1)
-    if (!blank(first)) exit 4
-    for (n = top + 1; n <= bot; n++) if (!blank(p[n])) exit 4
+    for (n = NR; n >= 1 && l[n] == ""; n--) ;
+    if (n < 5) exit 3
+    exit !(l[n] ~ keys && l[n - 1] ~ status && l[n - 2] ~ pad && l[n - 3] ~ prompt_x && l[n - 4] ~ pad)
   }' || exit 75
 
 exec "$herdr" agent prompt "$pane" "you have mail, run agentboard inbox" >/dev/null
