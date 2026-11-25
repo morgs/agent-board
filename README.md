@@ -887,6 +887,9 @@ means it cannot be poked at all (no pane, or an agent the poke does not know). `
   never wakes the wrong agent. The daemon is the `app-server` subcommand: the first
   argument that is neither an option nor the value of one. So `codex -c key=value
   app-server` is the daemon, and `codex --cd app-server` (a directory) is a normal Codex.
+  On macOS, `ps` joins the arguments with spaces, so a value with a space in it cannot
+  be told from the next argument; there any word that is exactly `app-server` counts
+  as the daemon, and a Codex with that word in its arguments collects with `inbox`.
 - It sends nothing unless herdr says what the pane is and what it is doing
   (`herdr agent get`), and only to an `idle` or `done` agent. A `working` agent
   collects its mail at its own Stop (Codex too, through its Stop hook); a `blocked`
@@ -897,8 +900,10 @@ means it cannot be poked at all (no pane, or an agent the poke does not know). `
   box first: for Claude, between the last two `───` rules that start in the first
   column (the top one may carry the session name), with `❯` at the start of the first
   row; for Codex, the last block of rows on the box's background colour, which must be
-  three rows (blank, `›`, blank) with only the footer below it (rows that are blank or
-  carry its ` · ` separators), since a draft row with no background could sit there. Empty
+  three rows (blank, `›`, blank) with the footer right below it and nothing after: the
+  status row with the ` · ` separators Codex colours, then the `? for shortcuts` row.
+  A draft row with no background could sit anywhere else there, and typed text has no
+  colour code of its own before a ` · `. Empty
   is the glyph and the agent's dim placeholder on that row, and nothing on any other
   row. A draft (with `❯`, `›` or `───` in it or not), a dialog, or a box it cannot
   frame exits 75 and the board waits.

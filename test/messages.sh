@@ -326,6 +326,13 @@ rm -f "$AGENT_BOARD_DIR/readfail"
 # dim placeholder carries that background code after the dim one.
 # codex_screen <first row> [<more rows of the box>...]
 cbg=$(printf '\033[48;2;52;52;52m')
+# the footer as a live pane draws it: a status row whose " · " separators are
+# coloured, then the shortcuts row, with a hint at its right
+codex_footer_shortcuts_only() { codex_footer | tail -n 1; }
+codex_footer() {
+  printf '  \033[0m\033[38;2;246;226;183mGPT high\033[0m\033[38;2;118;131;140m · \033[0m\033[38;2;171;223;167m~/work\033[0m\r\n'
+  printf '  \033[0m\033[1m\033[38;2;179;201;215m←\033[0m\033[38;2;118;131;140m for agents · \033[0m\033[1m\033[38;2;179;201;215m?\033[0m\033[38;2;118;131;140m for shortcuts\033[0m          \033[0m\033[38;2;118;131;140m⚠ hint\033[0m\r\n'
+}
 codex_screen() {
   local first=$1; shift
   {
@@ -335,7 +342,7 @@ codex_screen() {
     printf '\033[0m\033[1m%s›\033[0m%s \033[0m%s\033[0m%s          \033[0m\r\n' "$cbg" "$cbg" "$first" "$cbg"
     for r in "$@"; do printf '\033[0m%s  %s\033[0m%s     \033[0m\r\n' "$cbg" "$r" "$cbg"; done
     printf '\033[0m%s                    \033[0m\r\n' "$cbg"
-    printf '  \033[0m\033[1m←\033[0m for agents · ? for shortcuts\r\n'
+    codex_footer
   } > "$AGENT_BOARD_DIR/screen"
 }
 PLACEHOLDER=$(printf '\033[2m%sAsk Codex to do anything' "$cbg")
@@ -352,16 +359,28 @@ check 'a Codex draft that ends in the prompt glyph: exit 75' "$(poke)" "75/"
 { printf '\033[0m%s                    \033[0m\r\n' "$cbg"
   printf '\033[0m\033[1m%s›\033[0m%s          \033[0m\r\n' "$cbg" "$cbg"
   printf 'draft text with no background\r\n'
-  printf '  \033[0m\033[1m←\033[0m for agents · ? for shortcuts\r\n'; } > "$AGENT_BOARD_DIR/screen"
+  codex_footer; } > "$AGENT_BOARD_DIR/screen"
 check 'a blank Codex row over a draft with no background: exit 75' "$(poke)" "75/"
 # two newlines first: a blank continuation on the background looks like the
 # bottom row, and the draft row under it has no background
 { printf '\033[0m%s                    \033[0m\r\n' "$cbg"
   printf '\033[0m\033[1m%s›\033[0m%s          \033[0m\r\n' "$cbg" "$cbg"
   printf '\033[0m%s                    \033[0m\r\n' "$cbg"
-  printf '  draft text with no background\r\n'
-  printf '  \033[0m\033[1m←\033[0m for agents · ? for shortcuts\r\n'; } > "$AGENT_BOARD_DIR/screen"
+  printf '  %s\r\n' "${CDRAFT:-draft text with no background}"
+  codex_footer; } > "$AGENT_BOARD_DIR/screen"
 check 'a Codex draft after two newlines, no background on it: exit 75' "$(poke)" "75/"
+# the same, with the footer's separator in the draft
+codex_bare_draft() {
+  { printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+    printf '\033[0m\033[1m%s›\033[0m%s          \033[0m\r\n' "$cbg" "$cbg"
+    printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+    printf '  review notes · still drafting\r\n'
+    "$@"; } > "$AGENT_BOARD_DIR/screen"
+}
+codex_bare_draft codex_footer
+check 'a Codex draft with " · " in it, above the footer: exit 75' "$(poke)" "75/"
+codex_bare_draft codex_footer_shortcuts_only
+check 'a Codex draft with " · " in it, in the status row place: exit 75' "$(poke)" "75/"
 printf '%s\n' "$(printf '\033[0m\033[1m›\033[0m 1. Yes, proceed\r')" "  2. No" > "$AGENT_BOARD_DIR/screen"
 check 'a Codex dialog open: not poked, exit 75' "$(poke)" "75/"
 agentinfo codex working
@@ -380,6 +399,14 @@ check 'a Codex daemon pid: not poked, exit 1' "$(poke "$DAEMON")" "1/"
 (HERDR_PANE_ID=w9:p9 exec -a codex sh -c 'sleep 3000; true' app-server) </dev/null >/dev/null 2>&1 & DAEMON2=$!; disown $DAEMON2 2>/dev/null; FAKES+=("$DAEMON2")
 sleep 0.2
 check 'a Codex daemon with options before app-server: exit 1' "$(poke "$DAEMON2")" "1/"
+# macOS has no /proc, and ps joins arguments with spaces: with a value that has a
+# space in it, [codex, -C, /tmp/Agent Board, app-server] reads as the positional
+# "Board". Any word that is exactly app-server then counts as the daemon.
+if [ -n "$inpane_sh" ]; then
+  (HERDR_PANE_ID=w9:p9 exec -a codex "$inpane_sh" -c 'sleep 3000; true' -C '/tmp/Agent Board' app-server) </dev/null >/dev/null 2>&1 & DAEMON3=$!; disown $DAEMON3 2>/dev/null; FAKES+=("$DAEMON3")
+  sleep 0.2
+  check 'a daemon read through ps, a value with a space before app-server: exit 1' "$(AGENT_BOARD_PROC=$AGENT_BOARD_DIR/noproc poke "$DAEMON3")" "1/"
+fi
 # app-server as the value of an option is a directory, not the subcommand:
 # argv is [codex, -c, <value>, --cd, app-server]
 if [ -n "$inpane_sh" ]; then

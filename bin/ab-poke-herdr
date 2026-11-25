@@ -13,10 +13,16 @@ pid=$1
 # wake the wrong agent, so a daemon pid has no pane. The daemon is the app-server
 # subcommand: the first argument that is neither an option nor the value of one, so
 # `codex -c k=v app-server` is the daemon and `codex --cd app-server` is not.
-if [ -r /proc/"$pid"/cmdline ]; then
-  args=$(tr "\0" "\n" < /proc/"$pid"/cmdline 2>/dev/null)
+proc=${AGENT_BOARD_PROC:-/proc}
+if [ -r "$proc/$pid/cmdline" ]; then
+  args=$(tr "\0" "\n" < "$proc/$pid/cmdline" 2>/dev/null)
 else
+  # macOS has no /proc, and `ps` joins the arguments with spaces, so a value with a
+  # space in it (-C '/tmp/Agent Board') cannot be told from the next argument. A
+  # word that is exactly app-server anywhere is then taken for the daemon: a missed
+  # poke is safer than a wake in the wrong pane.
   args=$(ps -o args= -p "$pid" 2>/dev/null | tr ' ' '\n')
+  printf '%s\n' "$args" | grep -qx app-server && exit 1
 fi
 sub=$(printf '%s\n' "$args" | awk '
   # the codex options that take a value
@@ -29,8 +35,8 @@ sub=$(printf '%s\n' "$args" | awk '
   { print; exit }')
 [ "$sub" = app-server ] && exit 1
 
-if [ -r /proc/"$pid"/environ ]; then
-  pane=$(tr "\0" "\n" < /proc/"$pid"/environ 2>/dev/null | sed -n "s/^HERDR_PANE_ID=//p")
+if [ -r "$proc/$pid/environ" ]; then
+  pane=$(tr "\0" "\n" < "$proc/$pid/environ" 2>/dev/null | sed -n "s/^HERDR_PANE_ID=//p")
 else
   # macOS has no /proc; `ps eww` appends the environment of a process of this user.
   pane=$(ps eww -p "$pid" -o command= 2>/dev/null | tr ' ' '\n' | sed -n "s/^HERDR_PANE_ID=//p" | head -1)
@@ -64,8 +70,9 @@ esac
 #   Claude  a ─── rule above and below, from the first column; the first row
 #           inside starts with ❯, and continuation rows are indented.
 #   Codex   a block of three rows on a background colour (SGR 48): a blank row, the
-#           › row, a blank row. Below it only the footer, whose rows are blank or
-#           carry its " · " separators; any other row could be a draft, so 75.
+#           › row, a blank row. Right below it the footer: the status row with its
+#           coloured " · " separators, the "? for shortcuts" row, then nothing.
+#           Any other row could be a draft drawn without a background, so 75.
 # Empty is the glyph and the agent's dim placeholder (SGR 2) on the first row, and
 # nothing on any other row. Anything else, or a box this cannot frame, is 75.
 case "$agent" in
@@ -90,6 +97,10 @@ printf '%s\n' "$screen" | LC_ALL=C awk -v g="$glyph" -v agent="$agent" -v e="$es
     return c == 20
   }
   function bg(s) { return index(s, e "[48;") > 0 }
+  # the shortcuts row: indented, with the "?" Codex colours; a hint may follow it
+  function footer2(r) {
+    return substr(plain(r), 1, 2) == "  " && r ~ (e "\\[[0-9;]*m[?]") && index(plain(r), "? for shortcuts")
+  }
   { raw[NR] = $0; p[NR] = plain($0) }
   END {
     if (agent == "claude") {
@@ -102,7 +113,11 @@ printf '%s\n' "$screen" | LC_ALL=C awk -v g="$glyph" -v agent="$agent" -v e="$es
       bot = n
       for (top = n; top > 1 && bg(raw[top - 1]); top--) ;
       if (bot - top != 2 || !blank(p[top]) || !blank(p[bot])) exit 3
-      for (n = bot + 1; n <= NR; n++) if (!blank(p[n]) && !index(p[n], dot)) exit 3
+      # the footer: the status row, whose " · " separators Codex colours (typed
+      # text has no colour code of its own before one), the shortcuts row, then
+      # nothing. Any other row could be a draft drawn without a background.
+      if (bot + 2 > NR || raw[bot + 1] !~ (e "\\[[0-9;]*m" dot) || !footer2(raw[bot + 2])) exit 3
+      for (n = bot + 3; n <= NR; n++) if (!blank(p[n])) exit 3
       top++; bot--
     }
     if (index(p[top], g) != 1) exit 3
