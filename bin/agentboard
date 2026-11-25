@@ -753,9 +753,15 @@ is_pinned_person() {   # is_pinned_person <person>
 PERSISTENT_FILE="$BOARD/persistent.local"
 is_persistent() {   # is_persistent <session name>
   [ -n "$1" ] && [ -f "$PERSISTENT_FILE" ] || return 1
-  awk -v n="$1" '/^[[:space:]]*(#|$)/ { next }
+  # Answer on stdout and exit 0 either way. The pretool gate wraps awk and
+  # refuses the call on any exit but 0 or 141, so "not listed" cannot be awk's
+  # exit 1. That used to fail every gate check that looked at a stale session
+  # whose process is not an agent ("awk exited 1").
+  local hit
+  hit=$(awk -v n="$1" '/^[[:space:]]*(#|$)/ { next }
     { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if ($0 == n) f = 1 }
-    END { exit !f }' "$PERSISTENT_FILE"
+    END { if (f) print "yes" }' "$PERSISTENT_FILE") || return 1
+  [ "$hit" = yes ]
 }
 
 # The names in use are read once, then every candidate is tested against that

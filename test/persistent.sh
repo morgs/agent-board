@@ -59,6 +59,20 @@ out=$("$AB" list 2>&1)
 want    'a persistent session with an old heartbeat is live'        'chief-of-staff' "$out"
 want    'a name is matched with its whitespace trimmed'             'jarvis-remote'  "$out"
 wantnot 'an ordinary session with an old heartbeat is not live'     'ordinary'       "$out"
+
+# The pretool gate wraps awk and treats exit 1 as a broken check. "Not in
+# persistent.local" used to be awk's exit 1, so one stale non-agent session
+# (ordinary, above) refused every command with "awk exited 1".
+git init -q "$T/repo"
+gate_err=$(printf '%s' "$T/repo" | python3 -c 'import json,sys
+cwd=sys.stdin.read().strip()
+print(json.dumps({"tool_name":"Bash","cwd":cwd,"tool_input":{"command":"true"}}))' \
+  | (cd "$T/repo" && "$AB" hook-pretool) 2>&1 >/dev/null)
+gate_rc=$?
+want    'the gate still allows a command while that session is on the board' '0' "$gate_rc"
+wantnot 'and does not report awk as a failed check' 'awk exited' "$gate_err"
+out=$("$AB" list 2>&1)
+want    'the persistent session is still live after the gate ran'   'chief-of-staff' "$out"
 wantnot 'tell reaches a persistent session that sat idle'           'no live' \
   "$("$AB" tell chief-of-staff 'ping' 2>&1)"
 want    'and its export carries it to other machines'               'chief-of-staff' \
