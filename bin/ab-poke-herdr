@@ -74,7 +74,7 @@ esac
 #   Claude  a rule (its colour follows the permission mode, and the session
 #           name may sit in it, plain or on a label colour), the row "❯" and a
 #           no-break space alone or with a dim suggestion, a rule; below it only
-#           the mode row(s) that start with ⏵⏵, in Claude's footer styles.
+#           the ⏵⏵ mode row, with the fields Claude adds to it.
 #   Codex   a blank row on the box colour, the › row with the dim placeholder,
 #           a blank row, the status row, the shortcuts row (with or without the
 #           warning hint at its right).
@@ -106,8 +106,12 @@ printf '%s\n' "$screen" | LC_ALL=C awk -v agent="$agent" '
     grey = E "0m" E "38;2;118;131;140m"
     warn = " +\342\232\240 " E "0m" E "38;2;196;167;103m[0-9]+ warnings?" grey " " dot " " key "f2" grey " to view"
     keys = "^  " key "\342\206\220" grey " for agents " dot " " key "[?]" grey " for shortcuts(" warn ")?" E "0m$"
-    # the Claude footer: the mode row, in the colours and the underline it draws
-    cfoot = "^  " E "0m" rgb "\342\217\265\342\217\265 " T "*(" E "(0|4)m" T "*|" rgb T "*)*$"
+    # the Claude footer: the mode row, then the fields it may add after " · "
+    # (running shells, the PR, esc to interrupt), each in the style it draws
+    G = E "0m" E "38;2;153;153;153m"
+    mode = "(auto mode|don\047t ask|accept edits|bypass permissions) on"
+    field = "(esc to interrupt|\342\206\223 to manage|PR" E "0m " E "0m" E "4m" rgb "#[0-9]+(" G ")?|" E "0m" E "38;2;0;204;204m[0-9]+ shells?" G ")"
+    cfoot = "^  " E "0m" rgb "\342\217\265\342\217\265 " mode G "( [(]shift[+]tab to cycle[)])?( " dot " " field ")*" E "0m$"
   }
   { sub(/\r$/, ""); l[NR] = $0 }
   END {

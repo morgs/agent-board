@@ -323,6 +323,22 @@ check 'a Claude draft below an older empty box: exit 75' "$(poke)" "75/"
 screen "$(printf '❯\302\240\r')"
 printf '  \033[0m\033[38;2;255;193;7m⏵⏵ auto mode on\033[0m\033[7m \033[0m\n' >> "$AGENT_BOARD_DIR/screen"
 check 'a reverse-video cell in the Claude footer: exit 75' "$(poke)" "75/"
+# a row that opens like the mode row but goes on with other text is not the footer
+screen "$(printf '❯\302\240\r')"
+printf '  \033[0m\033[38;2;255;193;7m⏵⏵ \033[0m❯ unsent note\n' >> "$AGENT_BOARD_DIR/screen"
+check 'the mode-row prefix, then a draft: exit 75' "$(poke)" "75/"
+screen "$(printf '❯\302\240\r')"
+printf '  \033[0m❯ unsent note\n' >> "$AGENT_BOARD_DIR/screen"
+check 'a draft row below the Claude box: exit 75' "$(poke)" "75/"
+# the fields the mode row may carry, as live panes draw them
+for f in '\033[0m\033[38;2;153;153;153m (shift+tab to cycle)\033[0m' \
+         '\033[0m\033[38;2;153;153;153m · \033[0m\033[38;2;0;204;204m1 shell\033[0m\033[38;2;153;153;153m · ↓ to manage\033[0m' \
+         '\033[0m\033[38;2;153;153;153m (shift+tab to cycle) · esc to interrupt\033[0m'; do
+  screen "$(printf '❯\302\240\r')"
+  { printf '%s\n' "$RULE"; printf "  \033[0m\033[38;2;255;193;7m⏵⏵ auto mode on$f\n"; } > "$AGENT_BOARD_DIR/tail"
+  head -n 2 "$AGENT_BOARD_DIR/screen" > "$AGENT_BOARD_DIR/head"; cat "$AGENT_BOARD_DIR/head" "$AGENT_BOARD_DIR/tail" > "$AGENT_BOARD_DIR/screen"
+  check "a live Claude mode row is the footer: poked" "$(poke)" "$POKED"
+done
 screen "$(printf '❯ 1. Yes\r')"
 check 'a dialog open: not poked, exit 75' "$(poke)" "75/"
 printf '%s\n' "$LABELRULE" "$(printf '❯\302\240\033[0m\r')" > "$AGENT_BOARD_DIR/screen"

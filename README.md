@@ -900,7 +900,8 @@ means it cannot be poked at all (no pane, or an agent the poke does not know). `
   the empty box that agent draws; only the free text in it may vary. For Claude: a
   rule (its colour follows the permission mode; the session name may sit in it), the
   row `❯` and a no-break space, alone or with a dim suggestion, then a rule, with only
-  the `⏵⏵` mode row below it. For Codex, the last rows on screen: a blank row on the
+  the `⏵⏵` mode row below it (its mode, then the fields Claude adds: shells, the PR,
+  `esc to interrupt`). For Codex, the last rows on screen: a blank row on the
   box colour, the `›` row with the dim placeholder, a blank row, the status row
   (model, then ` · ` separators in their colour), and the shortcuts row with or
   without its warning hint. Anything else exits 75 and the board waits: a draft,
