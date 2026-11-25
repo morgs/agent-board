@@ -70,13 +70,17 @@ esac
 # in it may vary (a placeholder, a session name, the footer's model and path).
 # Anything else - a draft, a dialog, a cursor, another style or reset, a version
 # that draws its box another way - is 75, and the board tries again later.
+# The box must be the last thing on screen, so an older box higher up does not count.
 #   Claude  a rule (its colour follows the permission mode, and the session
-#           name may sit in it, plain or on a label colour), the row "❯" and a no-break space alone or with
-#           a dim suggestion, a rule. A draft cannot reach the rows below the box.
-#   Codex   the last rows on screen: a blank row on the box colour, the › row
-#           with the dim placeholder, a blank row, the status row, the
-#           shortcuts row. Codex has no rule under its box, so the footer is
-#           matched too.
+#           name may sit in it, plain or on a label colour), the row "❯" and a
+#           no-break space alone or with a dim suggestion, a rule; below it only
+#           the mode row(s) that start with ⏵⏵, in Claude's footer styles.
+#   Codex   a blank row on the box colour, the › row with the dim placeholder,
+#           a blank row, the status row, the shortcuts row (with or without the
+#           warning hint at its right).
+# The screen is read once and the prompt sent after it, so a human who starts to
+# type in that gap gets the poke appended to the draft and sent. Only herdr can
+# close that gap, with a prompt that it types only into an empty box.
 case "$agent" in
   claude|codex) ;;
   *) exit 1 ;;
@@ -98,14 +102,20 @@ printf '%s\n' "$screen" | LC_ALL=C awk -v agent="$agent" '
     prompt_x = "^" E "0m" E "1m" bg "\342\200\272" E "0m" bg " " E "0m" E "2m" bg T "*" E "0m" bg " +" E "0m$"
     sep = E "38;2;118;131;140m " dot " " E "0m"
     status = "^  " E "0m" E "38;2;246;226;183m" T "+" E "0m(" sep rgb T "+" E "0m)+$"
-    keys = "^  " E "0m" E "1m" E "38;2;179;201;215m\342\206\220" E "0m" E "38;2;118;131;140m for agents " dot " " E "0m" E "1m" E "38;2;179;201;215m[?]" E "0m" E "38;2;118;131;140m for shortcuts(" E "0m)?( +.*)?$"
+    key = E "0m" E "1m" E "38;2;179;201;215m"
+    grey = E "0m" E "38;2;118;131;140m"
+    warn = " +\342\232\240 " E "0m" E "38;2;196;167;103m[0-9]+ warnings?" grey " " dot " " key "f2" grey " to view"
+    keys = "^  " key "\342\206\220" grey " for agents " dot " " key "[?]" grey " for shortcuts(" warn ")?" E "0m$"
+    # the Claude footer: the mode row, in the colours and the underline it draws
+    cfoot = "^  " E "0m" rgb "\342\217\265\342\217\265 " T "*(" E "(0|4)m" T "*|" rgb T "*)*$"
   }
   { sub(/\r$/, ""); l[NR] = $0 }
   END {
     if (agent == "claude") {
-      for (n = NR; n >= 3; n--) if (l[n] ~ rule_bot) break
+      for (n = NR; n >= 1 && l[n] ~ /^ *$/; n--) ;
+      while (n >= 1 && l[n] ~ cfoot) n--
       if (n < 3) exit 3
-      exit !(l[n - 1] ~ prompt_c && l[n - 2] ~ rule_top)
+      exit !(l[n] ~ rule_bot && l[n - 1] ~ prompt_c && l[n - 2] ~ rule_top)
     }
     for (n = NR; n >= 1 && l[n] == ""; n--) ;
     if (n < 5) exit 3

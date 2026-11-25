@@ -280,12 +280,13 @@ agentinfo() { printf '{"result":{"agent":{"agent":"%s","agent_status":"%s","pane
 DASHES=$(printf '─%.0s' $(seq 1 40))
 RULE=$(printf '\033[0m\033[38;2;136;136;136m%s\033[0m\r' "$DASHES")
 LABELRULE=$(printf '\033[0m\033[38;2;136;136;136m%s GRC ─\033[0m\r' "$DASHES")
+CFOOT=$(printf '  \033[0m\033[38;2;255;193;7m⏵⏵ auto mode on\033[0m\033[38;2;153;153;153m (shift+tab to cycle) · PR\033[0m \033[0m\033[4m\033[38;2;255;193;7m#14\033[0m')
 # claude_screen <first row> [<continuation rows>...]
 claude_screen() {
   local first=$1; shift
   { printf '%s\n' "$LABELRULE" "$first"
     for r in "$@"; do printf '  %s\r\n' "$r"; done
-    printf '%s\n' "$RULE" '  ⏵⏵ auto mode on'; } > "$AGENT_BOARD_DIR/screen"
+    printf '%s\n' "$RULE" "$CFOOT"; } > "$AGENT_BOARD_DIR/screen"
 }
 screen() { claude_screen "$1"; }
 agentinfo claude idle
@@ -315,6 +316,13 @@ red=$(printf '\033[38;2;220;38;38m')
   printf '❯\302\240\r\n'
   printf '\033[0m%s%s\033[0m\r\n' "$red" "$DASHES"; } > "$AGENT_BOARD_DIR/screen"
 check 'the empty Claude box in red rules, with a label: poked' "$(poke)" "$POKED"
+# the box must be the last thing on screen: an older empty box does not count
+screen "$(printf '❯\302\240\r')"
+printf '%s\n' "$(printf '❯\302\240\033[0mhalf a thought\r')" >> "$AGENT_BOARD_DIR/screen"
+check 'a Claude draft below an older empty box: exit 75' "$(poke)" "75/"
+screen "$(printf '❯\302\240\r')"
+printf '  \033[0m\033[38;2;255;193;7m⏵⏵ auto mode on\033[0m\033[7m \033[0m\n' >> "$AGENT_BOARD_DIR/screen"
+check 'a reverse-video cell in the Claude footer: exit 75' "$(poke)" "75/"
 screen "$(printf '❯ 1. Yes\r')"
 check 'a dialog open: not poked, exit 75' "$(poke)" "75/"
 printf '%s\n' "$LABELRULE" "$(printf '❯\302\240\033[0m\r')" > "$AGENT_BOARD_DIR/screen"
@@ -346,7 +354,7 @@ cbg=$(printf '\033[48;2;52;52;52m')
 codex_footer_shortcuts_only() { codex_footer | tail -n 1; }
 codex_footer() {
   printf '  \033[0m\033[38;2;246;226;183mGPT high\033[0m\033[38;2;118;131;140m · \033[0m\033[38;2;171;223;167m~/work\033[0m\r\n'
-  printf '  \033[0m\033[1m\033[38;2;179;201;215m←\033[0m\033[38;2;118;131;140m for agents · \033[0m\033[1m\033[38;2;179;201;215m?\033[0m\033[38;2;118;131;140m for shortcuts\033[0m          \033[0m\033[38;2;118;131;140m⚠ hint\033[0m\r\n'
+  printf '  \033[0m\033[1m\033[38;2;179;201;215m←\033[0m\033[38;2;118;131;140m for agents · \033[0m\033[1m\033[38;2;179;201;215m?\033[0m\033[38;2;118;131;140m for shortcuts          ⚠ \033[0m\033[38;2;196;167;103m1 warning\033[0m\033[38;2;118;131;140m · \033[0m\033[1m\033[38;2;179;201;215mf2\033[0m\033[38;2;118;131;140m to view\033[0m%s\r\n' "${CTAIL-}"
 }
 codex_screen() {
   local first=$1; shift
@@ -364,6 +372,8 @@ PLACEHOLDER=$(printf '\033[2m%sAsk Codex to do anything' "$cbg")
 agentinfo codex idle
 codex_screen "$PLACEHOLDER"
 check "Codex's dim placeholder is not a draft: poked" "$(poke)" "$POKED"
+CTAIL=$(printf '\033[7m \033[0m') codex_screen "$PLACEHOLDER"
+check 'a reverse-video cell after the Codex hint: exit 75' "$(poke)" "75/"
 codex_screen "$(printf '%sdeploy brace after the che' "$cbg")"
 check 'a Codex draft: not poked, exit 75' "$(poke)" "75/"
 codex_screen "" "$(printf '%sthe draft starts on its second row' "$cbg")"
@@ -438,7 +448,7 @@ fi
 if [ -n "$inpane_sh" ]; then
   (HERDR_PANE_ID=w9:p9 exec -a codex "$inpane_sh" -c 'sleep 3000; true' --cd app-server) </dev/null >/dev/null 2>&1 & CDDIR=$!; disown $CDDIR 2>/dev/null; FAKES+=("$CDDIR")
   sleep 0.2
-  if [ -r "/proc/$CDDIR/cmdline" ]; then
+  if [ -r "${AGENT_BOARD_PROC:-/proc}/$CDDIR/cmdline" ]; then
     check 'codex --cd app-server is not the daemon: poked' "$(poke "$CDDIR")" "$POKED"
   fi
   check 'codex --cd app-server read through ps: exit 1, no prompt' "$(AGENT_BOARD_PROC=$AGENT_BOARD_DIR/noproc poke "$CDDIR")" "1/"

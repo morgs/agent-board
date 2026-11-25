@@ -899,13 +899,16 @@ means it cannot be poked at all (no pane, or an agent the poke does not know). `
   human has half typed. So it pokes only a pane whose screen ends, byte for byte, in
   the empty box that agent draws; only the free text in it may vary. For Claude: a
   rule (its colour follows the permission mode; the session name may sit in it), the
-  row `❯` and a no-break space, alone or with a dim suggestion, then a rule. For
-  Codex, the last rows on screen: a blank row on the box colour, the `›` row with the
-  dim placeholder, a blank row, the status row (model, then ` · ` separators in their
-  colour), and the shortcuts row. Anything else exits 75 and the board waits: a draft,
+  row `❯` and a no-break space, alone or with a dim suggestion, then a rule, with only
+  the `⏵⏵` mode row below it. For Codex, the last rows on screen: a blank row on the
+  box colour, the `›` row with the dim placeholder, a blank row, the status row
+  (model, then ` · ` separators in their colour), and the shortcuts row with or
+  without its warning hint. Anything else exits 75 and the board waits: a draft,
   a dialog, a cursor, any other style or reset, or a version of the agent that draws
   its box another way. A new version that changes the box stops the pokes until the
-  template is updated; it does not send a draft.
+  template is updated; it does not send a draft. One gap stays open: the screen is
+  read once and the prompt sent after it, so text typed in between is sent with the
+  poke. Only a herdr prompt that types into an empty box only can close it.
 
 ## Claude Code integration (automatic, via global hooks)
 
