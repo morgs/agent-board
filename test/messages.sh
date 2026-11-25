@@ -354,6 +354,14 @@ check 'a Codex draft that ends in the prompt glyph: exit 75' "$(poke)" "75/"
   printf 'draft text with no background\r\n'
   printf '  \033[0m\033[1m←\033[0m for agents · ? for shortcuts\r\n'; } > "$AGENT_BOARD_DIR/screen"
 check 'a blank Codex row over a draft with no background: exit 75' "$(poke)" "75/"
+# two newlines first: a blank continuation on the background looks like the
+# bottom row, and the draft row under it has no background
+{ printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+  printf '\033[0m\033[1m%s›\033[0m%s          \033[0m\r\n' "$cbg" "$cbg"
+  printf '\033[0m%s                    \033[0m\r\n' "$cbg"
+  printf '  draft text with no background\r\n'
+  printf '  \033[0m\033[1m←\033[0m for agents · ? for shortcuts\r\n'; } > "$AGENT_BOARD_DIR/screen"
+check 'a Codex draft after two newlines, no background on it: exit 75' "$(poke)" "75/"
 printf '%s\n' "$(printf '\033[0m\033[1m›\033[0m 1. Yes, proceed\r')" "  2. No" > "$AGENT_BOARD_DIR/screen"
 check 'a Codex dialog open: not poked, exit 75' "$(poke)" "75/"
 agentinfo codex working
@@ -361,8 +369,8 @@ codex_screen "$PLACEHOLDER"
 check 'a working Codex: not poked, exit 75' "$(poke)" "75/"
 agentinfo codex idle
 # A Codex app-server daemon carries the pane that started it, not each session's:
-# no poke, exit 1 (no pane), even with a clear box. It is any argument that is
-# exactly app-server; the word inside a --cd path is a normal Codex.
+# no poke, exit 1 (no pane), even with a clear box. It is the subcommand, the first
+# argument that is neither an option nor an option's value.
 # argv is then [codex, app-server], as the real daemon's is
 printf 'sleep 3000; true\n' > "$AGENT_BOARD_DIR/app-server"
 (cd "$AGENT_BOARD_DIR" && HERDR_PANE_ID=w9:p9 exec -a codex sh app-server) </dev/null >/dev/null 2>&1 & DAEMON=$!; disown $DAEMON 2>/dev/null; FAKES+=("$DAEMON")
@@ -372,6 +380,13 @@ check 'a Codex daemon pid: not poked, exit 1' "$(poke "$DAEMON")" "1/"
 (HERDR_PANE_ID=w9:p9 exec -a codex sh -c 'sleep 3000; true' app-server) </dev/null >/dev/null 2>&1 & DAEMON2=$!; disown $DAEMON2 2>/dev/null; FAKES+=("$DAEMON2")
 sleep 0.2
 check 'a Codex daemon with options before app-server: exit 1' "$(poke "$DAEMON2")" "1/"
+# app-server as the value of an option is a directory, not the subcommand:
+# argv is [codex, -c, <value>, --cd, app-server]
+if [ -n "$inpane_sh" ]; then
+  (HERDR_PANE_ID=w9:p9 exec -a codex "$inpane_sh" -c 'sleep 3000; true' --cd app-server) </dev/null >/dev/null 2>&1 & CDDIR=$!; disown $CDDIR 2>/dev/null; FAKES+=("$CDDIR")
+  sleep 0.2
+  check 'codex --cd app-server is not the daemon: poked' "$(poke "$CDDIR")" "$POKED"
+fi
 if [ -n "$inpane_sh" ]; then
   env HERDR_PANE_ID=w9:p9 "$inpane_sh" -c 'sleep 3000; true' codex --cd /work/app-server-ui </dev/null >/dev/null 2>&1 & CDARG=$!; disown $CDARG 2>/dev/null; FAKES+=("$CDARG")
   sleep 0.2

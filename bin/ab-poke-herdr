@@ -11,15 +11,23 @@ pid=$1
 # A Codex app-server daemon hosts several sessions under one pid, and its environment
 # names the pane that started it, not the session's own pane. A poke there would
 # wake the wrong agent, so a daemon pid has no pane. The daemon is the app-server
-# subcommand, which global options (-c key=value, --cd dir) may come before, so any
-# argument that is exactly app-server counts. A path that only contains the word
-# (--cd /work/app-server-ui) is a normal Codex.
+# subcommand: the first argument that is neither an option nor the value of one, so
+# `codex -c k=v app-server` is the daemon and `codex --cd app-server` is not.
 if [ -r /proc/"$pid"/cmdline ]; then
   args=$(tr "\0" "\n" < /proc/"$pid"/cmdline 2>/dev/null)
 else
   args=$(ps -o args= -p "$pid" 2>/dev/null | tr ' ' '\n')
 fi
-printf '%s\n' "$args" | grep -qx app-server && exit 1
+sub=$(printf '%s\n' "$args" | awk '
+  # the codex options that take a value
+  BEGIN { split("-c --config --enable --disable --remote --remote-auth-token-env -i --image -m --model --local-provider -p --profile -s --sandbox -C --cd --add-dir -a --ask-for-approval", o, " ")
+          for (k in o) val[o[k]] = 1 }
+  NR == 1 { next }
+  skip { skip = 0; next }
+  $0 == "--" { exit }
+  /^-/ { if (($0 in val) && index($0, "=") == 0) skip = 1; next }
+  { print; exit }')
+[ "$sub" = app-server ] && exit 1
 
 if [ -r /proc/"$pid"/environ ]; then
   pane=$(tr "\0" "\n" < /proc/"$pid"/environ 2>/dev/null | sed -n "s/^HERDR_PANE_ID=//p")
@@ -55,8 +63,9 @@ esac
 # this can prove is empty. Each agent frames its box in a way the screen shows:
 #   Claude  a ─── rule above and below, from the first column; the first row
 #           inside starts with ❯, and continuation rows are indented.
-#   Codex   a block of rows on a background colour (SGR 48), a blank row at its
-#           top and bottom, the › row below the top one, and the footer below.
+#   Codex   a block of three rows on a background colour (SGR 48): a blank row, the
+#           › row, a blank row. Below it only the footer, whose rows are blank or
+#           carry its " · " separators; any other row could be a draft, so 75.
 # Empty is the glyph and the agent's dim placeholder (SGR 2) on the first row, and
 # nothing on any other row. Anything else, or a box this cannot frame, is 75.
 case "$agent" in
@@ -67,7 +76,7 @@ esac
 esc=$(printf '\033')
 screen=$("$herdr" agent read "$pane" --source visible --format ansi 2>/dev/null) || exit 75
 printf '%s\n' "$screen" | LC_ALL=C awk -v g="$glyph" -v agent="$agent" -v e="$esc" \
-    -v rule='─' -v nbsp="$(printf '\302\240')" '
+    -v rule='─' -v nbsp="$(printf '\302\240')" -v dot="$(printf ' \302\267 ')" '
   function plain(s) { gsub(e "\\[[0-9;?]*[A-Za-z]", "", s); return s }
   function undim(s) { gsub(e "\\[2m(" e "\\[[0-9;]*m)*[^" e "]*", "", s); return s }
   function blank(s) { gsub(/[ \t\r]/, "", s); gsub(nbsp, "", s); return s == "" }
@@ -92,7 +101,8 @@ printf '%s\n' "$screen" | LC_ALL=C awk -v g="$glyph" -v agent="$agent" -v e="$es
       if (n < 1 || n == NR) exit 3
       bot = n
       for (top = n; top > 1 && bg(raw[top - 1]); top--) ;
-      if (bot - top < 2 || !blank(p[top]) || !blank(p[bot])) exit 3
+      if (bot - top != 2 || !blank(p[top]) || !blank(p[bot])) exit 3
+      for (n = bot + 1; n <= NR; n++) if (!blank(p[n]) && !index(p[n], dot)) exit 3
       top++; bot--
     }
     if (index(p[top], g) != 1) exit 3
